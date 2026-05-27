@@ -1,0 +1,21 @@
+# Loose design source images stay local — but the /assets/ folder
+# ships published icons (hosted via raw.githubusercontent for the userscript).
+*.png
+*.jpg
+*.jpeg
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Temp scratch files
+*.tmp
+*.bak
+*~
