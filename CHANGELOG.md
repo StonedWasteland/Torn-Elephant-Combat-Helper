@@ -2,7 +2,7 @@
 
 Full version history for **TECH — Torn Elephant Combat Helper**.
 
-The 8 most recent versions live inline at the top of `TornElephantCombatHelper.user.js` so the latest context is always one click away from the code. Everything older lives here.
+The most recent versions live inline at the top of `TornElephantCombatHelper.user.js` so the latest context is always one click away from the code. Everything older lives here.
 
 ---
 

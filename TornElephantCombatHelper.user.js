@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.58
+// @version      0.6.59
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,6 +16,33 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ─── UPDATE NOTES (0.6.59) ──────────────────────────────────────────
+// Stability sweep — five findings from the post-v0.6.58 code review,
+// none ship-blocking but all worth tightening before Tier 1.
+//
+//   F1. `store()` and `load()` used to silently swallow GM storage
+//       failures. Now both `console.warn` on catch and stash the
+//       error to a module-level `lastStoreError` for future surface
+//       in the Settings tab. Most relevant when the `fights` blob
+//       approaches the Tampermonkey storage quota.
+//   F2. Removed unused `escapeHtml()` helper. The `el()` DOM builder
+//       routes all dynamic content through `.text → textContent`,
+//       which is XSS-safe by construction, so escapeHtml was dead
+//       code masking the actual safety story.
+//   F3. `factionChainCache` is now included in the 30-day TTL sweep
+//       alongside `spyCache` and `scoutData`. Practical impact tiny
+//       (bounded by drills opened) but symmetry with the other
+//       keyed-by-id caches.
+//   F4. `domSeenUnknown` Set now caps at 200 entries. Was unbounded;
+//       in practice fills very slowly with unique unrecognized DOM
+//       verbs, but the cap removes the "what if Torn rewords every
+//       log line" failure mode.
+//   F5. The `bodyObs` MutationObserver inside `attachLogObserver()`
+//       now self-disconnects after 30s if the log selector never
+//       appears. Defensive against a future Torn DOM change that
+//       would otherwise leave a permanent body-subtree observer
+//       running on attack pages.
+//
 // ─── UPDATE NOTES (0.6.58) ──────────────────────────────────────────
 // Cache hygiene: 30-day TTL sweep for `spyCache` and `scoutData`. Both
 // keyed-by-id caches had no eviction beyond explicit user actions
@@ -276,7 +303,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.58';
+  const SCRIPT_VERSION    = '0.6.59';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -388,8 +415,21 @@
   };
 
   // ─── STORAGE ────────────────────────────────────────────────────────────
+  // v0.6.59 — module-level error surface. `store()` and `load()` used to
+  // swallow GM storage errors entirely; now both `console.warn` loudly and
+  // record the last failure here so a future Settings-tab line item can
+  // surface "Storage error: …" without us having to re-trace why fight
+  // ingest mysteriously stopped persisting. Most relevant when the
+  // `fights` blob approaches Tampermonkey's storage quota — that's where
+  // a silent failure would hurt most.
+  let lastStoreError = null;
   function store(key, val) {
-    try { GM_setValue(SCRIPT_KEY + key, JSON.stringify(val)); } catch (e) {}
+    try {
+      GM_setValue(SCRIPT_KEY + key, JSON.stringify(val));
+    } catch (e) {
+      lastStoreError = { key, at: Date.now(), msg: String(e && e.message ? e.message : e) };
+      try { console.warn('[TECH] Storage write failed for ' + SCRIPT_KEY + key + ':', e); } catch (e2) {}
+    }
   }
   function load(key, def) {
     try {
@@ -400,7 +440,11 @@
       if (def !== null && typeof def === 'object' && !Array.isArray(def) && typeof parsed !== 'object') return def;
       return parsed;
     } catch (e) {
-      try { GM_setValue(SCRIPT_KEY + key, JSON.stringify(def)); } catch (e2) {}
+      lastStoreError = { key, at: Date.now(), msg: 'load: ' + String(e && e.message ? e.message : e) };
+      try {
+        console.warn('[TECH] Storage parse failed for ' + SCRIPT_KEY + key + ', resetting to default:', e);
+      } catch (e2) {}
+      try { GM_setValue(SCRIPT_KEY + key, JSON.stringify(def)); } catch (e3) {}
       return def;
     }
   }
@@ -587,9 +631,23 @@
         }
       }
       if (scoutDropped > 0) store('scoutData', scoutData);
-      if (spyDropped + scoutDropped > 0) {
+      // v0.6.59 — also sweep factionChainCache for symmetry with the other
+      // keyed-by-id caches. Practical impact tiny (entries only land when
+      // the user drills into a faction), but a long-tail of war-prep drills
+      // would otherwise accumulate forever.
+      let chainDropped = 0;
+      for (const id in factionChainCache) {
+        const c = factionChainCache[id];
+        if (c && c.fetchedAt && c.fetchedAt < cutoff) {
+          delete factionChainCache[id];
+          chainDropped++;
+        }
+      }
+      if (chainDropped > 0) store('factionChainCache', factionChainCache);
+      if (spyDropped + scoutDropped + chainDropped > 0) {
         console.log('[TECH] Cache sweep dropped ' + spyDropped + ' spy + '
-                  + scoutDropped + ' scout entries older than 30 days.');
+                  + scoutDropped + ' scout + ' + chainDropped
+                  + ' faction-chain entries older than 30 days.');
       }
     } catch (e) {
       console.warn('[TECH] Cache sweep skipped:', e);
@@ -672,11 +730,12 @@
     return s + Math.abs(n).toFixed(2);
   }
 
-  function escapeHtml(s) {
-    return String(s == null ? '' : s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
+  // v0.6.59 — escapeHtml() was removed. It was defined but never called.
+  // All dynamic content in the script routes through the `el()` helper's
+  // `.text` setter (= textContent), which is XSS-safe by construction.
+  // Re-add only if we ever start setting `.html` from user-controlled
+  // input — currently the single `html:` site (launcher mark SVG) is
+  // script-controlled.
 
   // Tiny DOM helper. `attrs` accepts plain attrs plus `style`, `class`, `on:event`.
   function el(tag, attrs, ...children) {
@@ -1044,6 +1103,10 @@
   let domLogSeenNodes = new WeakSet();  // dedup by DOM-node identity (cheap, exact)
   // v0.6.49 — dedup console-log of unrecognised lines by raw text so DevTools
   // doesn't drown in repeated samples of the same line. Reset on page reload.
+  // v0.6.59 — bounded at DOM_SEEN_UNKNOWN_MAX. Was unbounded; in practice the
+  // Set fills slowly with unique unrecognised verb shapes, but a future Torn
+  // log-line rewrite could explode it. Cap protects against the worst case.
+  const DOM_SEEN_UNKNOWN_MAX = 200;
   let domSeenUnknown = new Set();
 
   function getOpponentIdFromUrl() {
@@ -1164,7 +1227,8 @@
     // share real samples for the next regex pass. Damage-bearing lines we
     // failed to parse are the MOST useful (unlisted verb, known shape), so
     // we log them too. DevTools console only — no UI noise.
-    if (kind === 'unknown' && !domSeenUnknown.has(raw)) {
+    if (kind === 'unknown' && !domSeenUnknown.has(raw)
+        && domSeenUnknown.size < DOM_SEEN_UNKNOWN_MAX) {
       domSeenUnknown.add(raw);
       try { console.log('[TECH-DOM] Unrecognised line:', raw); } catch (e) {}
     }
@@ -1199,6 +1263,10 @@
     if (domLogObserver) return;
     const ul = document.querySelector(DOM_LOG_SELECTOR);
     if (!ul) {
+      // Watch the body for the log <ul> to appear, then re-enter. v0.6.59 —
+      // self-disconnect after 30s so a future Torn DOM change that retires
+      // DOM_LOG_SELECTOR doesn't leave us with a permanent body-subtree
+      // observer running on every attack page.
       const bodyObs = new MutationObserver(() => {
         if (document.querySelector(DOM_LOG_SELECTOR)) {
           bodyObs.disconnect();
@@ -1206,6 +1274,7 @@
         }
       });
       bodyObs.observe(document.body, { childList: true, subtree: true });
+      setTimeout(function () { try { bodyObs.disconnect(); } catch (e) {} }, 30000);
       return;
     }
 
