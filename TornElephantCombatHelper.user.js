@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.59
+// @version      0.6.60
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,6 +16,39 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ─── UPDATE NOTES (0.6.60) ──────────────────────────────────────────
+// Quick Wins panel — chain-fight optimizer. New Dashboard section
+// between Targets and Build Coherence that ranks opponents from your
+// fight history by a composite "chain efficiency" score:
+//
+//   score = winRate²
+//         × respectPerFight
+//         × (60 / max(avgDurationSec, 30))   // reward short fights
+//         × stalenessPenalty                  // ½ past 30d, ¼ past 90d
+//
+// Eligibility: you were the attacker, ≥3 outgoing fights, win rate
+// ≥ 50%, usable timing data, last seen within a year. Top 8 candidates.
+//
+// Each row surfaces win rate, sample size, avg fight duration,
+// respect/fight, last-seen age, and a STALE tag when the staleness
+// penalty has kicked in. Click any row → Opponent Intel drill, where
+// you can pin them to the Targets queue for live status tracking.
+//
+// Design choice — DATA-DRIVEN ONLY. The panel doesn't poll live
+// online/hospital status for non-pinned candidates. Live status is
+// the Targets panel's job; Quick Wins is the discovery tool that
+// surfaces opponents you might've forgotten you can reliably farm.
+// Zero new API calls, instant render, plays alongside the existing
+// rate-limit-aware target refresh cadence without adding load.
+//
+// Silent on fresh installs (no outgoing fights yet). Shows a thin-
+// data hint when you have some outgoing fights but no opponent has
+// crossed the 3-fight floor — actionable signal that ranking is
+// pending more samples.
+//
+// New constants: QUICK_WIN_MIN_FIGHTS=3, QUICK_WIN_MIN_WINRATE=0.5,
+// QUICK_WIN_AGE_CUTOFF_SEC=365 days. Tweakable if calibration drifts.
+//
 // ─── UPDATE NOTES (0.6.59) ──────────────────────────────────────────
 // Stability sweep — five findings from the post-v0.6.58 code review,
 // none ship-blocking but all worth tightening before Tier 1.
@@ -303,7 +336,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.59';
+  const SCRIPT_VERSION    = '0.6.60';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -2272,6 +2305,104 @@
       if (v.tsEnded > row.lastTs) row.lastTs = v.tsEnded;
     }
     return [...map.values()].sort((a, b) => b.fights - a.fights).slice(0, limit);
+  }
+
+  // ─── QUICK WINS (v0.6.60) ───────────────────────────────────────────────
+  // Chain-fight optimizer. Walks every stored fight (not windowed — old
+  // dominance is still signal, staleness penalty handles drift) and ranks
+  // opponents by a composite "chain efficiency" score:
+  //
+  //   score = winRate²                          // squared so coin flips don't make the list
+  //         × respectPerFight                   // weight by gain
+  //         × (60 / max(avgDurationSec, 30))    // reward short fights, floor at 30s
+  //         × stalenessPenalty                  // ½ past 30d, ¼ past 90d
+  //
+  // Eligibility:
+  //   - You were the attacker (incoming fights don't tell you who you can hit)
+  //   - ≥3 outgoing fights against this opponent (sample size)
+  //   - winRate ≥ 0.5 (it's "Quick Wins" — losses don't qualify)
+  //   - avgDurationSec > 0 (need usable timing data)
+  //   - lastTs within 1 year (older than that is "they've moved on" noise)
+  //
+  // Doesn't poll live status. Per data-driven-only design choice (v0.6.60):
+  // the panel is a DISCOVERY tool, the Targets queue is the live-status
+  // tool. Click any Quick Win row → Opponent Intel drill → pin if you
+  // want tracking. Keeps the optimizer fast + the API budget intact.
+  const QUICK_WIN_MIN_FIGHTS = 3;
+  const QUICK_WIN_MIN_WINRATE = 0.5;
+  const QUICK_WIN_AGE_CUTOFF_SEC = 365 * 86400;
+  function computeQuickWins(limit) {
+    if (!meta.userId) return [];
+    limit = limit || 8;
+    const myId = meta.userId;
+    const map = new Map();
+    for (const code in fights) {
+      const raw = fights[code];
+      if (raw.attacker_id !== myId) continue;     // outgoing only
+      const v = deriveFightView(raw, myId);
+      if (!v.opponentId) continue;
+      let row = map.get(v.opponentId);
+      if (!row) {
+        row = {
+          id: v.opponentId,
+          name: v.opponentName || ('Player ' + v.opponentId),
+          factionName: v.opponentFactionName || '',
+          level: v.opponentLevel,
+          fights: 0, wins: 0, losses: 0,
+          respectSum: 0,
+          durationSum: 0, durationN: 0,
+          lastTs: 0,
+        };
+        map.set(v.opponentId, row);
+      }
+      row.fights++;
+      if (v.outcome.win)  row.wins++;
+      if (v.outcome.loss) row.losses++;
+      row.respectSum += v.respectDelta || 0;
+      if (v.durationSec > 0) {
+        row.durationSum += v.durationSec;
+        row.durationN++;
+      }
+      if (v.tsEnded > row.lastTs) row.lastTs = v.tsEnded;
+      // Keep the freshest level we have on file.
+      if (v.opponentLevel != null) row.level = v.opponentLevel;
+    }
+    const now = nowSec();
+    const candidates = [];
+    for (const row of map.values()) {
+      if (row.fights < QUICK_WIN_MIN_FIGHTS) continue;
+      const winRate = row.wins / row.fights;
+      if (winRate < QUICK_WIN_MIN_WINRATE) continue;
+      if (row.durationN === 0) continue;
+      const avgDuration = row.durationSum / row.durationN;
+      const respectPerFight = row.respectSum / row.fights;
+      const age = now - row.lastTs;
+      if (age > QUICK_WIN_AGE_CUTOFF_SEC) continue;
+      let stale = 1.0;
+      if (age > 90 * 86400)      stale = 0.25;
+      else if (age > 30 * 86400) stale = 0.5;
+      const speed = 60 / Math.max(avgDuration, 30);
+      // respectPerFight can be ≤0 for ranked-war contexts with respect_loss
+      // wash — guard against zero/negative inputs so we don't produce
+      // bogus high scores via flipped signs.
+      const respectFactor = Math.max(respectPerFight, 0.01);
+      const score = (winRate * winRate) * respectFactor * speed * stale;
+      candidates.push({
+        id: row.id,
+        name: row.name,
+        factionName: row.factionName,
+        level: row.level,
+        fights: row.fights,
+        winRate,
+        avgDuration,
+        respectPerFight,
+        lastTs: row.lastTs,
+        stale,
+        score,
+      });
+    }
+    candidates.sort(function (a, b) { return b.score - a.score; });
+    return candidates.slice(0, limit);
   }
 
   // Opponent Intelligence v0.1 — vision feature #6. Walks every stored
@@ -4667,6 +4798,97 @@
     host.appendChild(sec);
   }
 
+  // ─── QUICK WINS PANEL (v0.6.60) ────────────────────────────────────────
+  // Dashboard panel that surfaces opponents ranked by chain efficiency.
+  // Click any row to drill into Opponent Intel; pin from there to add live
+  // status tracking. This is the DISCOVERY tool — the Targets panel above
+  // is the live-status tool. Two distinct jobs, two distinct panels.
+  //
+  // Renders nothing when there's no usable signal (no outgoing fights
+  // yet, or no opponent passes the eligibility floor). Renders a thin-data
+  // hint when the user has SOME outgoing fights but no candidate passes
+  // the 3-fight floor — that's actionable information.
+  function renderQuickWins(host) {
+    if (!meta.userId) return;
+    const wins = computeQuickWins(8);
+    // Count any outgoing fights so the empty state can distinguish
+    // "you've never attacked" (silent) from "you've attacked but no
+    // opponent has enough samples yet" (thin-data hint).
+    let outgoingTotal = 0;
+    for (const code in fights) {
+      if (fights[code].attacker_id === meta.userId) {
+        outgoingTotal++;
+        if (outgoingTotal >= 5) break;
+      }
+    }
+    if (wins.length === 0 && outgoingTotal === 0) return;  // silent
+
+    const sec = el('div', { class: 'tech-section tech-quickwins' });
+    sec.appendChild(el('div', { class: 'tech-section-title tech-targets-title' },
+      el('span', {}, 'Quick Wins'),
+      el('span', { class: 'tech-targets-count' },
+        wins.length + ' candidate' + (wins.length === 1 ? '' : 's')),
+    ));
+
+    if (wins.length === 0) {
+      sec.appendChild(el('div', { class: 'tech-targets-hint' },
+        'Need 3+ outgoing fights against the same opponent (with timing data) to surface a candidate. Keep attacking; the list will fill in as patterns emerge.'));
+      host.appendChild(sec);
+      return;
+    }
+
+    function fmtDur(s) {
+      if (!s || s < 1) return '—';
+      if (s < 60) return Math.round(s) + 's';
+      const m = Math.floor(s / 60);
+      const r = Math.round(s % 60);
+      return r > 0 ? (m + 'm ' + r + 's') : (m + 'm');
+    }
+
+    for (const w of wins) {
+      const subBits = [
+        (w.winRate * 100).toFixed(0) + '% over ' + w.fights + 'f',
+        'avg ' + fmtDur(w.avgDuration),
+        fmtRespect(w.respectPerFight) + ' resp/f',
+        fmtAgo(w.lastTs),
+      ];
+
+      const nameDiv = el('div', { class: 'tech-target-name' }, w.name);
+      if (w.level != null) {
+        nameDiv.appendChild(el('span', { class: 'tech-level' }, 'L' + w.level));
+      }
+      if (w.stale < 1) {
+        nameDiv.appendChild(el('span', {
+          class: 'tech-tag',
+          title: 'Last fought ' + fmtAgo(w.lastTs) + ' — their build may have shifted; score is penalised',
+        }, 'STALE'));
+      }
+
+      const row = el('div', {
+        class: 'tech-target-row verdict-fav',
+        title: 'Open Opponent Intel for ' + w.name,
+      },
+        el('span', { class: 'tech-target-dot online',
+                     title: 'Quick Win — historical chain target' }),
+        el('div', { class: 'tech-target-main' },
+          nameDiv,
+          el('div', { class: 'tech-target-sub' },
+            el('span', { class: 'tech-target-meta' }, subBits.join(' · ')),
+          ),
+        ),
+      );
+      row.addEventListener('click', function () {
+        openOpponentDrill(w.id, w.name);
+      });
+      sec.appendChild(row);
+    }
+
+    sec.appendChild(el('div', { class: 'tech-targets-hint' },
+      'Ranked from your fight history. Click a row to drill into Opponent Intel; pin from there to add live status tracking.'));
+
+    host.appendChild(sec);
+  }
+
   // ─── TAB: DASHBOARD ─────────────────────────────────────────────────────
   function renderDashboard(host) {
     if (!settings.apiKey) return renderNoKey(host);
@@ -4694,6 +4916,12 @@
     // v0.6.39 — Target queue panel. Above the empty-state check (like Build
     // Coherence) so it's visible even before any fights are ingested.
     renderTargetQueue(host);
+
+    // v0.6.60 — Quick Wins panel. Chain-fight optimizer: ranked list of
+    // opponents from your fight history scored by win rate, fight speed,
+    // respect/fight, and recency. Discovery tool; the Targets panel above
+    // is the live-status tool. Silent until you have outgoing fight data.
+    renderQuickWins(host);
 
     // Build Coherence card (above the empty-state check so it's visible even
     // for fresh installs with no fights yet — it's stat-driven, not fight-driven).
