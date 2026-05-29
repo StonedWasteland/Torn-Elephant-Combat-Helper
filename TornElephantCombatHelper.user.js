@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.63
+// @version      0.6.64
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -406,7 +406,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.63';
+  const SCRIPT_VERSION    = '0.6.64';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -3209,6 +3209,108 @@
     };
   }
 
+  // v0.6.64 — Personal Weapon Performance. Aggregates the DOM-hook per-hit
+  // events captured on the attack page (the only place per-hit damage and
+  // weapon name exist; the v2 attacks API gives end-of-fight summary only).
+  // Filters to direction === 'out' so we count YOUR hits, not the opponent's.
+  // Buckets by weapon string verbatim from the combat log (no normalisation —
+  // Torn's log spelling IS the canonical name for our purposes). 'fist' kind
+  // is synthesised as "Bare Fists" since the log never names a weapon there.
+  // Terminal kinds (hospitalize / mug / leave / coma / loot / stalemate /
+  // escape) and 'init' / 'unknown' are excluded — they represent fight-level
+  // outcomes, not weapon hits.
+  function computeWeaponPerformance(views) {
+    const stats = {};
+    let totalEvents = 0;
+    let fightsWithDom = 0;
+
+    for (const v of views) {
+      if (!v.dom || !Array.isArray(v.dom.events)) continue;
+      fightsWithDom++;
+      for (const ev of v.dom.events) {
+        if (ev.direction !== 'out') continue;
+        if (ev.kind === 'init' || ev.kind === 'unknown') continue;
+        if (DOM_TERMINAL_KINDS.has(ev.kind)) continue;
+        let name;
+        if (ev.kind === 'fist') name = 'Bare Fists';
+        else if (ev.weapon) name = String(ev.weapon).trim();
+        else continue;
+
+        let s = stats[name];
+        if (!s) {
+          s = stats[name] = {
+            name, kind: ev.kind,
+            hits: 0, damageTotal: 0, damageMax: 0, damageHits: 0,
+            roundsTotal: 0, roundsCount: 0,
+            bodyParts: {},
+            opponentIds: new Set(),
+            lastUsedTs: 0,
+          };
+        }
+        s.hits++;
+        totalEvents++;
+        if (typeof ev.damage === 'number' && ev.damage > 0) {
+          s.damageTotal += ev.damage;
+          s.damageHits++;
+          if (ev.damage > s.damageMax) s.damageMax = ev.damage;
+        }
+        if (typeof ev.rounds === 'number' && ev.rounds > 0) {
+          s.roundsTotal += ev.rounds;
+          s.roundsCount++;
+        }
+        if (ev.bodyPart) {
+          const bp = String(ev.bodyPart).trim();
+          s.bodyParts[bp] = (s.bodyParts[bp] || 0) + 1;
+        }
+        if (v.opponentId) s.opponentIds.add(v.opponentId);
+        if (ev.ts && ev.ts > s.lastUsedTs) s.lastUsedTs = ev.ts;
+      }
+    }
+
+    if (totalEvents === 0) {
+      return {
+        ready: false,
+        reason: fightsWithDom === 0 ? 'no-dom-fights' : 'no-out-events',
+        fightsWithDom,
+      };
+    }
+
+    const weapons = Object.values(stats).map(function (s) {
+      const avgDamage = s.damageHits > 0 ? s.damageTotal / s.damageHits : 0;
+      const avgRounds = s.roundsCount > 0 ? s.roundsTotal / s.roundsCount : 0;
+      let topBodyPart = null, topCount = 0;
+      for (const bp in s.bodyParts) {
+        if (s.bodyParts[bp] > topCount) { topBodyPart = bp; topCount = s.bodyParts[bp]; }
+      }
+      return {
+        name: s.name,
+        kind: s.kind,
+        hits: s.hits,
+        damageTotal: s.damageTotal,
+        damageMax: s.damageMax,
+        damageHits: s.damageHits,
+        avgDamage,
+        avgRounds,
+        fightsUsed: s.opponentIds.size,
+        topBodyPart,
+        topBodyPartCount: topCount,
+        lastUsedTs: s.lastUsedTs,
+      };
+    });
+    weapons.sort(function (a, b) { return b.damageTotal - a.damageTotal; });
+
+    let totalDamage = 0;
+    for (const w of weapons) totalDamage += w.damageTotal;
+
+    return {
+      ready: true,
+      fightsWithDom,
+      totalEvents,
+      totalDamage,
+      weapons,
+    };
+  }
+
   // ─── EXPORT / IMPORT ────────────────────────────────────────────────────
   function exportFights() {
     // v0.6.49 — include the live dom_buffer in exports so unmerged DOM events
@@ -3962,6 +4064,26 @@
       border:1px solid #a16207;vertical-align:middle;}
     .tech-level.farm{color:#fca5a5;background:#3f1d1d;border-color:#dc2626;
       box-shadow:0 0 5px rgba(220,38,38,.5);}
+
+    /* Your Weapons card (v0.6.64). Compact table of per-weapon performance
+       sourced from DOM-hook captures. */
+    .tech-weapons-sub{font-size:11px;color:#9ca3af;margin:4px 0 8px;line-height:1.4;}
+    .tech-weapons-grid{display:flex;flex-direction:column;gap:1px;background:#374151;
+      border:1px solid #4b5563;border-radius:4px;overflow:hidden;}
+    .tech-weapons-head,.tech-weapons-row{display:grid;
+      grid-template-columns:1.7fr .6fr .8fr .7fr 1.1fr;
+      gap:6px;padding:6px 8px;align-items:center;background:#1f2937;
+      font:600 10.5px/1.2 system-ui,sans-serif;}
+    .tech-weapons-head{background:#111827;color:#94a3b8;text-transform:uppercase;
+      letter-spacing:.5px;font-size:9.5px;}
+    .tech-weapons-row .col-name{color:#e5e7eb;font-weight:700;}
+    .tech-weapons-row .col-kind{font-size:9px;color:#6b7280;text-transform:uppercase;
+      letter-spacing:.5px;display:block;margin-top:1px;}
+    .tech-weapons-row .col-hits,.tech-weapons-row .col-dmg,
+    .tech-weapons-row .col-avg{font-variant-numeric:tabular-nums;color:#cbd5e1;}
+    .tech-weapons-row .col-bp{color:#9ca3af;font-size:10px;}
+    .tech-weapons-headline{font-size:11px;color:#cbd5e1;margin-top:8px;line-height:1.4;}
+    .tech-weapons-headline strong{color:#fde047;}
 
     /* Clickable row affordance — set on fight rows + top-opponent rows that
        have a known opponentId, so clicking drills into Opponent Intel. */
@@ -5329,6 +5451,63 @@
         el('div', { class: 'tech-section-title' }, 'Difficulty Roadmap'),
         el('div', { class: 'tech-roadmap-hint' },
           `Need 5+ outgoing fights with fair-fight data — have ${rm.outgoingTotal || 0}. Keep attacking; the bracket map will appear here.`),
+      ));
+    }
+
+    // Your Weapons (v0.6.64) — per-weapon hit/damage table from DOM-hook
+    // captures. Silent until there's at least one damage-bearing outgoing
+    // event; shows a quiet hint when DOM is wired but no out-hits landed yet
+    // (incoming-only window).
+    const wp = computeWeaponPerformance(views);
+    if (wp.ready) {
+      const card = el('div', { class: 'tech-section' });
+      card.appendChild(el('div', { class: 'tech-section-title' }, 'Your Weapons'));
+      card.appendChild(el('div', { class: 'tech-weapons-sub' },
+        `From combat-log capture across ${wp.fightsWithDom} fight${wp.fightsWithDom === 1 ? '' : 's'}. `,
+        `Per-hit damage isn't in the v2 API — these numbers come from the live attack page.`,
+      ));
+      const grid = el('div', { class: 'tech-weapons-grid' });
+      grid.appendChild(el('div', { class: 'tech-weapons-head' },
+        el('div', { class: 'col-name' }, 'Weapon'),
+        el('div', { class: 'col-hits' }, 'Hits'),
+        el('div', { class: 'col-dmg'  }, 'Total dmg'),
+        el('div', { class: 'col-avg'  }, 'Avg/hit'),
+        el('div', { class: 'col-bp'   }, 'Top body part'),
+      ));
+      for (const w of wp.weapons) {
+        const bpLabel = w.topBodyPart
+          ? `${w.topBodyPart} (${w.topBodyPartCount})`
+          : '—';
+        grid.appendChild(el('div', { class: 'tech-weapons-row' },
+          el('div', { class: 'col-name' },
+            w.name,
+            el('span', { class: 'col-kind' }, w.kind),
+          ),
+          el('div', { class: 'col-hits' }, fmtNum(w.hits, 0)),
+          el('div', { class: 'col-dmg'  }, fmtNum(w.damageTotal, 0)),
+          el('div', { class: 'col-avg'  }, w.damageHits > 0 ? fmtNum(w.avgDamage, 0) : '—'),
+          el('div', { class: 'col-bp'   }, bpLabel),
+        ));
+      }
+      card.appendChild(grid);
+
+      // Headline: biggest damage dealer.
+      const top = wp.weapons[0];
+      if (top && top.damageTotal > 0) {
+        card.appendChild(el('div', { class: 'tech-weapons-headline' },
+          'Top damage dealer: ',
+          el('strong', {}, top.name),
+          ` — ${fmtNum(top.damageTotal, 0)} damage across ${top.hits} hits (${fmtNum(top.avgDamage, 0)} avg).`,
+        ));
+      }
+      host.appendChild(card);
+    } else if (wp.fightsWithDom > 0) {
+      // DOM data exists but no out-direction hits in this window (e.g. WAR
+      // window before any user-initiated attack).
+      host.appendChild(el('div', { class: 'tech-section' },
+        el('div', { class: 'tech-section-title' }, 'Your Weapons'),
+        el('div', { class: 'tech-weapons-sub' },
+          `${wp.fightsWithDom} fight${wp.fightsWithDom === 1 ? '' : 's'} with combat-log data in this window, but no outgoing hits to aggregate yet.`),
       ));
     }
 
