@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.70
+// @version      0.6.75
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,6 +16,65 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ─── UPDATE NOTES (0.6.75) ──────────────────────────────────────────
+// Equipped Loadout normaliser audited against the live /v2/user/
+// equipment response and fixed. The truncated v2 swagger schema led
+// v0.6.71 to treat `item.slot` as a string slot-name; the actual
+// payload encodes it as integer 1-9 (with the temporary slot wedged
+// non-intuitively between body and helmet). v0.6.75 adds an explicit
+// EQUIPMENT_SLOT_BY_NUMBER lookup, prefers `sub_type` over `type` for
+// the inline label (so the card reads "Shotgun" / "Pistol" / "Body"
+// instead of the broad "Weapon" / "Armor"), and drops the v0.6.73
+// in-panel debug block + first-fetch console diagnostic now that the
+// shape is verified.
+//
+// No new API calls. No behaviour change for any other tab.
+//
+// ─── UPDATE NOTES (0.6.72) ──────────────────────────────────────────
+// Bug fix: War Scorecard elapsed-time clock + every WAR-pill stat were
+// silently including ranked-war fights from PRIOR wars, not just the
+// current one. Symptom: scorecard reads "191h 54m elapsed" four hours
+// into a fresh war, because the oldest ranked-war fight in storage
+// dates back to the last war 8 days ago.
+//
+// Root cause: WAR window's rawFilter only checked `r.ranked_war`. No
+// timestamp floor. The v0.6.70 active-war detection already gives us
+// the current war's exact start time via meta.activeWarTarget.warStart,
+// but nothing was using it for scoping.
+//
+// Fix:
+//   - WAR rawFilter now also requires r.timestamp_ended >= warStart
+//     when an active war target is detected. Prior-war fights drop
+//     out of every WAR-scoped view (Dashboard cards, Fights tab,
+//     Roadmap, Trap detector, War Scorecard).
+//   - computeWarScorecard now uses warStart for the elapsed clock
+//     with the earliest-fight fallback only when no active war target
+//     is cached (war ended + 5-min refresh cleared it).
+//
+// Zero new API calls. Pure filter-tightening on data we already had.
+//
+// ─── UPDATE NOTES (0.6.71) ──────────────────────────────────────────
+// Phase 1 of the v0.7 Build Coherence rewrite — Equipped Loadout card
+// on the Dashboard. Polls /v2/user/equipment every 5 minutes and
+// surfaces your currently equipped weapons + armor below the existing
+// Build Coherence verdict.
+//
+// Each weapon slot (Primary / Secondary / Melee / Temp) renders the
+// equipped item's name, type, and — when the name matches an entry in
+// the WEAPONS wiki table — an inline "dmg X · acc Y" readout pulled
+// from the wiki midpoints (same table that powers the TEST sim). The
+// armor row packs Helmet / Body / Pants / Boots / Gloves into a single
+// dash-separated line so the card stays vertically tight.
+//
+// Phase 2 will add a loadout-archetype classifier (Dodge / Sniper /
+// Brawler / Burner / Bleeder / Suppressor / Critter / Counter) so the
+// card detects which fighting style your gear maps to. Phase 3
+// replaces the single-axis Build Coherence card with a 2-axis verdict
+// (stat-shape × loadout-archetype) using soft scoring + confidence
+// dots, comparing goal vs actual side-by-side.
+//
+// Cost: +1 API call per 5 minutes. Modest against TECH's idle budget.
+//
 // ─── UPDATE NOTES (0.6.70) ──────────────────────────────────────────
 // Dual chain pills on the Dashboard during an active ranked war. TECH
 // now auto-detects your faction's current ranked-war target via the
@@ -467,7 +526,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.70';
+  const SCRIPT_VERSION    = '0.6.75';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -514,7 +573,19 @@
     { key: '7d',  label: '7D',   ms:   7 * 86400e3 },
     { key: '30d', label: '30D',  ms:  30 * 86400e3 },
     { key: 'all', label: 'All',  ms: Infinity },
-    { key: 'war', label: 'WAR',  ms: Infinity, rawFilter: r => !!r.ranked_war },
+    // v0.6.72 — narrow WAR to fights from the CURRENT war's time range when
+    // we've detected one (meta.activeWarTarget.warStart, populated by the
+    // v0.6.70 /faction/?selections=basic poll). Without this floor, ranked-
+    // war fights from prior wars sit in the same WAR bucket and skew every
+    // war-scoped stat — most visibly the elapsed-time clock on the War
+    // Scorecard, which used to read days when the current war was hours old.
+    { key: 'war', label: 'WAR',  ms: Infinity,
+      rawFilter: r => {
+        if (!r.ranked_war) return false;
+        const war = meta.activeWarTarget;
+        if (war && war.warStart && (r.timestamp_ended || 0) < war.warStart) return false;
+        return true;
+      } },
   ];
 
   // Build archetypes for the Build Coherence Checker (feature #3 v0.1).
@@ -2335,6 +2406,103 @@
     }
   }
 
+  // ─── EQUIPPED LOADOUT (v0.6.71 — phase 1 of v0.7 Build Coherence rewrite) ──
+  // Polls /v2/user/equipment for the user's currently equipped weapons +
+  // armor. Phase 1 surfaces this as an info-only Dashboard card; Phase 2
+  // adds a loadout-archetype classifier (Dodge / Sniper / Brawler / Burner
+  // / Bleeder / Suppressor / Critter / Counter); Phase 3 wires it into a
+  // new 2-axis Build Coherence card (stat-shape × loadout-archetype) with
+  // soft scoring and confidence dots.
+  //
+  // Throttled to 5 minutes because equipment changes are user-initiated
+  // and infrequent — there's no reason to re-pull every poll. Failure is
+  // non-fatal; the card just shows "Loadout unavailable" until next poll.
+  //
+  // Response shape (verified live 2026-05-29):
+  //   { equipment: [{ id, name, type:"Weapon"|"Armor", sub_type, slot:Number,
+  //                    stats, bonuses, rarity, ammo, mods, ... }, ...],
+  //     clothing: [...] }
+  // `slot` is an integer 1-9 — see EQUIPMENT_SLOT_BY_NUMBER. The object-
+  // shaped branch is retained only as a defensive fallback.
+  const EQUIPMENT_INTERVAL_SEC = 300;
+  async function fetchEquipment() {
+    if (meta.equipment && meta.equipment.fetchedAt
+        && (nowSec() - meta.equipment.fetchedAt) < EQUIPMENT_INTERVAL_SEC) {
+      return;
+    }
+    if (!settings.apiKey) return;
+    if (isRateLimited()) return;
+    try {
+      const data = await apiGet(v2Url('/user/equipment'), v2AuthHeaders());
+      if (!data) return;
+      meta.equipment = normalizeEquipment(data);
+      store('meta', meta);
+    } catch (e) {
+      // Quiet — same rationale as fetchBattleStats.
+    }
+  }
+
+  const EQUIPMENT_SLOTS = ['primary', 'secondary', 'melee', 'temporary',
+                           'helmet', 'body', 'pants', 'boots', 'gloves'];
+
+  // v0.6.74 — verified against the live /v2/user/equipment payload: each
+  // item carries `slot` as an integer 1-9. Note `temporary` sits at 5
+  // between body (4) and helmet (6), which is non-obvious — Torn ordered
+  // these by equip-screen layout, not by weapon-vs-armor grouping.
+  const EQUIPMENT_SLOT_BY_NUMBER = {
+    1: 'primary', 2: 'secondary', 3: 'melee',
+    4: 'body',    5: 'temporary', 6: 'helmet',
+    7: 'pants',   8: 'boots',     9: 'gloves',
+  };
+
+  function normalizeEquipment(data) {
+    const out = {
+      primary: null, secondary: null, melee: null, temporary: null,
+      helmet: null, body: null, pants: null, boots: null, gloves: null,
+      fetchedAt: nowSec(),
+      rawShape: null,
+    };
+    // Live shape (verified 2026-05-29): { equipment: [...], clothing: [...] }
+    // where each item has { id, name, type, sub_type, slot:Number, ... }.
+    // Kept the slot-keyed object fallback for resilience in case Torn ever
+    // changes the wrapper shape.
+    const eq = (data && data.equipment) || data;
+    if (Array.isArray(eq)) {
+      out.rawShape = 'array';
+      for (const item of eq) {
+        if (!item) continue;
+        let slot = null;
+        if (typeof item.slot === 'number') {
+          slot = EQUIPMENT_SLOT_BY_NUMBER[item.slot] || null;
+        } else {
+          const tag = String(item.equipped || item.slot || '').toLowerCase();
+          if (EQUIPMENT_SLOTS.indexOf(tag) !== -1) slot = tag;
+        }
+        if (!slot) continue;
+        out[slot] = {
+          id:   item.id || item.item_id || item.ID || null,
+          name: item.name || '',
+          // Prefer sub_type ("Shotgun", "Pistol", "Body", ...) for the
+          // inline label; fall back to the broad "Weapon"/"Armor" type.
+          type: item.sub_type || item.type || '',
+        };
+      }
+    } else if (eq && typeof eq === 'object') {
+      out.rawShape = 'object';
+      for (const slot of EQUIPMENT_SLOTS) {
+        const v = eq[slot];
+        if (v && typeof v === 'object') {
+          out[slot] = {
+            id:   v.id || v.item_id || v.ID || null,
+            name: v.name || '',
+            type: v.sub_type || v.type || '',
+          };
+        }
+      }
+    }
+    return out;
+  }
+
   // v0.6.40 — Self-state poll. Pulls our own energy + status so the Target
   // queue "HIT NOW" badge knows whether we can actually attack. Combined
   // selections (bars + basic) is one v1 call: bars gives the energy meter,
@@ -2455,6 +2623,11 @@
       // and my-own-status gating stay current. Non-blocking — failure here
       // just hides the badge until next poll.
       await fetchSelfState();
+      // v0.6.71 — fetch equipped loadout. Throttled to 5 min internally;
+      // powers the Equipped Loadout Dashboard card and will feed the
+      // Phase 2 loadout-archetype classifier + Phase 3 2-axis Build
+      // Coherence rewrite.
+      await fetchEquipment();
       // v0.6.70 — detect active ranked war so the Dashboard chain pill can
       // render side-by-side with the enemy faction's chain. Throttled to
       // 5 minutes internally, fire-and-forget.
@@ -2585,12 +2758,26 @@
   // denominator so a fresh war with 1 fight doesn't divide by zero.
   function computeWarScorecard(views, overview) {
     if (!views || views.length === 0) return null;
-    let earliestTs = Infinity;
-    for (const v of views) {
-      if (v.tsEnded && v.tsEnded < earliestTs) earliestTs = v.tsEnded;
+    // v0.6.72 — prefer the official war start time from
+    // meta.activeWarTarget.warStart (populated by /faction/?selections=basic
+    // in v0.6.70). Fall back to the earliest fight ts only when no active
+    // war target is detected — typically because the war ended and the
+    // 5-min refresh cleared the target. Without this preference the clock
+    // mis-anchored to whichever ranked-war fight in storage was oldest,
+    // which during back-to-back wars produced days-long readings.
+    let startTs;
+    const war = meta.activeWarTarget;
+    if (war && war.warStart) {
+      startTs = war.warStart;
+    } else {
+      let earliestTs = Infinity;
+      for (const v of views) {
+        if (v.tsEnded && v.tsEnded < earliestTs) earliestTs = v.tsEnded;
+      }
+      if (!Number.isFinite(earliestTs)) return null;
+      startTs = earliestTs;
     }
-    if (!Number.isFinite(earliestTs)) return null;
-    const elapsedSec = Math.max(0, nowSec() - earliestTs);
+    const elapsedSec = Math.max(0, nowSec() - startTs);
     // Pace divides over a 60s minimum so a single fresh fight yields a
     // meaningful number rather than NaN/Infinity. Once you've been in
     // war for >1 hour, the floor is irrelevant.
@@ -3952,6 +4139,26 @@
     return WEAPONS_BY_CLASS[classKey] || [];
   }
 
+  // v0.6.71 — fuzzy name lookup. Torn's equipment API returns the weapon's
+  // display name, but our WEAPONS table is keyed by an internal slug.
+  // Normalise both sides to a-z0-9 only so "Ithaca 37" matches the row
+  // labelled "Ithaca 37", "S&W M29" matches "swm29", etc. Cached on first
+  // call to keep the hot path cheap.
+  let _weaponsByNormName = null;
+  function lookupWeaponByName(name) {
+    if (!name) return null;
+    if (!_weaponsByNormName) {
+      _weaponsByNormName = {};
+      for (const id in WEAPONS_BY_ID) {
+        const w = WEAPONS_BY_ID[id];
+        const key = String(w.label).toLowerCase().replace(/[^a-z0-9]/g, '');
+        _weaponsByNormName[key] = w;
+      }
+    }
+    const norm = String(name).toLowerCase().replace(/[^a-z0-9]/g, '');
+    return _weaponsByNormName[norm] || null;
+  }
+
   // Specific weapon overrides class. weapon obj wins when present, class is
   // the fallback, and a numeric fallback is the last resort (kept for the
   // sanity-check harness which passes opts.weaponDmg directly).
@@ -4759,6 +4966,33 @@
     .tech-build-violation{color:#fca5a5;font-size:11px;margin-top:2px;}
     .tech-build-action{color:#fde047;font-size:12px;margin-top:6px;}
     .tech-build-action strong{color:#fbbf24;}
+
+    /* v0.6.71 — Equipped Loadout card (Phase 1 of v0.7 Build Coherence
+       rewrite). Compact stacked list of weapon slots with optional
+       wiki-derived dmg/acc readout; armor pieces packed into a single
+       line so the card stays vertically tight. */
+    .tech-loadout{}
+    .tech-loadout-meta{color:#6b7280;font-weight:500;text-transform:none;
+      letter-spacing:.5px;font-size:10px;margin-left:6px;}
+    .tech-loadout-row{display:flex;align-items:baseline;gap:8px;
+      font-size:12px;padding:3px 0;}
+    .tech-loadout-row.empty{opacity:.55;}
+    .tech-loadout-slot{flex:0 0 64px;color:#a78bfa;font:700 10px/1 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:1px;}
+    .tech-loadout-name{flex:1;color:#e5e7eb;font-weight:600;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+    .tech-loadout-row.empty .tech-loadout-name{color:#6b7280;font-style:italic;
+      font-weight:400;}
+    .tech-loadout-type{color:#6b7280;font-size:10px;
+      text-transform:uppercase;letter-spacing:.5px;}
+    .tech-loadout-wiki{color:#fbbf24;font-size:10px;
+      font-variant-numeric:tabular-nums;text-shadow:0 0 4px rgba(251,191,36,.25);}
+    .tech-loadout-armor-row{display:flex;align-items:baseline;gap:8px;
+      font-size:11px;padding:5px 0 2px;margin-top:4px;
+      border-top:1px dashed #2a1f2e;}
+    .tech-loadout-armor-line{color:#cbd5e1;flex:1;
+      font-variant-numeric:tabular-nums;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
 
     /* Leveling Roadmap — v0.6.0 feature #9 */
     .tech-roadmap{border-left:3px solid #4b5563;padding-left:10px;}
@@ -5820,6 +6054,73 @@
     host.appendChild(sec);
   }
 
+  // ─── EQUIPPED LOADOUT CARD (v0.6.71) ───────────────────────────────────
+  // Phase 1 of the v0.7 Build Coherence rewrite. Pure info card — surfaces
+  // your currently equipped weapons + armor pulled from /v2/user/equipment.
+  // When a weapon's name matches an entry in the WEAPONS table (wiki data)
+  // the row gains an inline dmg/acc readout from the wiki midpoints so the
+  // user can see at a glance what their loadout's hit/damage profile is.
+  //
+  // Phase 2 will layer a loadout-archetype classifier on top of this card
+  // (Dodge / Sniper / Brawler / Burner / Bleeder / Suppressor / Critter /
+  // Counter). Phase 3 replaces the existing single-axis Build Coherence
+  // card with a 2-axis (stat-shape × loadout-archetype) verdict.
+  function renderEquippedLoadout(host) {
+    const eq = meta.equipment;
+    if (!eq || !eq.fetchedAt) return;   // silent until first fetch lands
+
+    const card = el('div', { class: 'tech-section tech-loadout' });
+    card.appendChild(el('div', { class: 'tech-section-title' },
+      el('span', {}, 'Equipped Loadout'),
+      el('span', { class: 'tech-loadout-meta' },
+        '· polled ' + fmtAgo(eq.fetchedAt)),
+    ));
+
+    function buildSlotRow(slotKey, slotLabel) {
+      const item = eq[slotKey];
+      if (!item || !item.name) {
+        return el('div', { class: 'tech-loadout-row empty' },
+          el('span', { class: 'tech-loadout-slot' }, slotLabel),
+          el('span', { class: 'tech-loadout-name' }, '— empty —'),
+        );
+      }
+      const w = lookupWeaponByName(item.name);
+      const children = [
+        el('span', { class: 'tech-loadout-slot' }, slotLabel),
+        el('span', { class: 'tech-loadout-name' }, item.name),
+      ];
+      if (item.type) {
+        children.push(el('span', { class: 'tech-loadout-type' }, item.type));
+      }
+      if (w) {
+        children.push(el('span', {
+          class: 'tech-loadout-wiki',
+          title: 'Wiki midpoints from the WEAPONS table — drives the TEST sim',
+        }, 'dmg ' + w.dmg.toFixed(0) + ' · acc ' + w.acc.toFixed(0)));
+      }
+      return el('div', { class: 'tech-loadout-row' }, ...children);
+    }
+
+    card.appendChild(buildSlotRow('primary',   'Primary'));
+    card.appendChild(buildSlotRow('secondary', 'Secondary'));
+    card.appendChild(buildSlotRow('melee',     'Melee'));
+    card.appendChild(buildSlotRow('temporary', 'Temp'));
+
+    // Armor row — five pieces stacked into one line. Empty pieces show as
+    // a dash so the user notices coverage gaps.
+    const armorPieces = [];
+    for (const slot of ['helmet', 'body', 'pants', 'boots', 'gloves']) {
+      const item = eq[slot];
+      armorPieces.push(item && item.name ? item.name : '—');
+    }
+    card.appendChild(el('div', { class: 'tech-loadout-armor-row' },
+      el('span', { class: 'tech-loadout-slot' }, 'Armor'),
+      el('span', { class: 'tech-loadout-armor-line' }, armorPieces.join(' · ')),
+    ));
+
+    host.appendChild(card);
+  }
+
   // ─── QUICK WINS PANEL (v0.6.60) ────────────────────────────────────────
   // Dashboard panel that surfaces opponents ranked by chain efficiency.
   // Click any row to drill into Opponent Intel; pin from there to add live
@@ -6005,6 +6306,11 @@
       }
       host.appendChild(card);
     }
+
+    // v0.6.71 — Equipped Loadout (Phase 1 of v0.7 Build Coherence rewrite).
+    // Sits right after Build Coherence so the stat-shape verdict and the
+    // actual gear cluster visually. Silent until first equipment poll lands.
+    renderEquippedLoadout(host);
 
     if (o.total === 0) {
       const isWarPill = settings.windowKey === 'war';
