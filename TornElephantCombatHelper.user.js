@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.66
+// @version      0.6.70
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,6 +16,67 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ─── UPDATE NOTES (0.6.70) ──────────────────────────────────────────
+// Dual chain pills on the Dashboard during an active ranked war. TECH
+// now auto-detects your faction's current ranked-war target via the
+// /faction/?selections=basic endpoint (throttled to 5 minutes); when a
+// war is in progress, the chain pill at the top of the Dashboard
+// splits into a side-by-side pair — your chain on the left, the enemy
+// faction's chain on the right. Both pills tick independently, both
+// urgency-color the same way (green safe / amber <120s / red pulse
+// <60s), so a glance at the Dashboard answers "should we be chaining"
+// AND "are they vulnerable" simultaneously.
+//
+// In dual-pill mode both sides always render — including an idle "No
+// active chain" placeholder when one side has nothing going. That's
+// deliberate: "you have no chain, but they're at 47" is itself
+// actionable war intel ("we need to start chaining now"). When no
+// active war is detected, the Dashboard falls back to the original
+// single-pill behavior (idle = no pill at all, no clutter during
+// regular play).
+//
+// Implementation:
+//   - New fetchActiveRankedWar() hits /faction/?selections=basic with
+//     the user's key (no faction ID needed — returns their own faction).
+//     Scans ranked_wars for an entry whose war.end === 0, picks the
+//     non-self faction in war.factions as the opponent.
+//   - maybeRefreshActiveWar() handles the 5-minute throttle with a
+//     separate 2-minute error retry. Wired into the poll cycle as a
+//     fire-and-forget call after fetchSelfState.
+//   - meta.activeWarTarget caches the detected war so the dashboard
+//     doesn't re-fetch on every render.
+//   - renderChainPill and renderFactionChainPill both gained an opts
+//     parameter (label / forceIdle / compact / skipMargin); signatures
+//     stay backward-compatible. The Faction Intel drill view is
+//     untouched — it still gets the full header row + refresh button.
+//
+// Cost: +1 API call per 5 minutes when not throttled and no error.
+// Negligible against the ~1-2/min idle TECH budget.
+//
+// ─── UPDATE NOTES (0.6.69) ──────────────────────────────────────────
+// Scout tab hospital tracker. Each roster row now leads with a colored
+// status dot (locked/abroad/online/idle/offline) matching the Targets
+// queue, and locked rows render a live "Hosp 14:23" / "Jail 2h 14m" /
+// "Fed 5h 12m" countdown that ticks every second. Two new sort options:
+//
+//   - Hospital (out soonest) — locked rows ranked by closest release,
+//     hittable + abroad rows sink to the end. War-prep queue at a
+//     glance.
+//   - Status (hittable first) — Okay > Hospital/Jail/Fed (soonest out)
+//     > Traveling/Abroad. Mirrors the Targets queue's tier ordering.
+//
+// Implementation: fetchFactionRoster() now captures status.until and
+// last_action.status alongside the existing state field. Row layout
+// stacks name + verdict in a tech-scout-main column wrapper so the
+// status dot has a fixed seat on the left. The 1Hz ticker is
+// self-cancelling on disconnect — tab switch / panel close / drill
+// open all stop it without a manual clear. When a countdown elapses
+// the badge greys out and reads "out" until the next roster fetch
+// reconfirms the live state.
+//
+// Same rate-limit posture as before — uses already-cached roster data;
+// no new API calls.
+//
 // ─── UPDATE NOTES (0.6.63) ──────────────────────────────────────────
 // Bugfix on v0.6.62: the HIT badge linked to /loader.php?sid=attack
 // but Torn has migrated attack pages to /page.php?sid=attack. The old
@@ -406,7 +467,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.66';
+  const SCRIPT_VERSION    = '0.6.70';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -647,6 +708,11 @@
   // the drill is opened while the user's own chain pill is ticking on
   // a separate render.
   let factionChainTickerInterval = null;
+  // v0.6.69 — Scout tab hospital/jail countdown ticker. Re-ticks every
+  // `.tech-scout-countdown` span in the rendered list each second so
+  // release timings count down live during war prep. Same self-cancel-
+  // on-disconnect pattern as the chain tickers.
+  let scoutCountdownInterval = null;
 
   // fights: { [code]: rawFightObject } — raw shape preserved so we can recompute
   // derived fields if our normalisation logic changes later.
@@ -1495,7 +1561,11 @@
         level: (typeof m.level === 'number') ? m.level : null,
         position: m.position || '',
         lastActionTs: (typeof la.timestamp === 'number') ? la.timestamp : 0,
+        lastActionStatus: la.status || null,
         statusState: st.state || null,
+        // v0.6.69 — capture hospital/jail release timestamp so Scout can
+        // render a live "Hosp 14:23" countdown matching the Targets queue.
+        statusUntil: (typeof st.until === 'number') ? st.until : 0,
       };
     });
     return {
@@ -1546,11 +1616,24 @@
     return {
       current:    chain.current,
       max:        chain.max || 0,
-      timeoutAt:  typeof chain.timeout === 'number' ? chain.timeout : 0,
+      timeoutAt:  resolveChainTimeoutAt(chain.timeout),
       modifier:   typeof chain.modifier === 'number' ? chain.modifier : 1.0,
       cooldownAt: cd > 0 ? nowSec() + cd : 0,
       fetchedAt:  nowSec(),
     };
+  }
+
+  // v0.6.68 — chain.timeout format detector. The v0.6.45 comment in
+  // fetchSelfState claimed timeout is an absolute Unix timestamp, but
+  // Torn's /faction/{id}?selections=chain endpoint clearly returns it as
+  // SECONDS REMAINING (matched the cooldown convention), which caused the
+  // Faction Intel drill to show "No active chain" even when the target
+  // faction was mid-chain. Symmetric with cooldown handling: small values
+  // are relative seconds, anything over a day is already absolute.
+  // Returns 0 when timeout is unset/zero (no chain).
+  function resolveChainTimeoutAt(rawTimeout) {
+    if (typeof rawTimeout !== 'number' || rawTimeout <= 0) return 0;
+    return rawTimeout < 86400 ? nowSec() + rawTimeout : rawTimeout;
   }
 
   // Refresh-throttled wrapper. Fire-and-forget — the result lands in
@@ -1589,6 +1672,97 @@
           && panelEl && contentEl) {
         renderActive();
       }
+    });
+  }
+
+  // ─── ACTIVE RANKED WAR DETECTION (v0.6.70) ─────────────────────────────
+  // Auto-detect whether the user's faction is currently in a ranked war,
+  // and if so, which faction is the opponent. Powers the Dashboard's
+  // dual chain pill — your chain alongside theirs.
+  //
+  // Hits `/faction/?selections=basic` with the user's key (no faction ID
+  // → returns the user's own faction). Scans `ranked_wars` for an entry
+  // whose `war.end === 0` (still active), picks the non-self faction as
+  // the opponent. Throttled to 5 minutes since wars don't start often,
+  // and once one is detected we just keep using it.
+  //
+  // Graceful no-ops when:
+  //   - user isn't in a faction (faction API returns no ID)
+  //   - faction has no active war
+  //   - API errors out (separate shorter retry throttle)
+  const ACTIVE_WAR_REFRESH_SEC = 300;
+  const ACTIVE_WAR_ERROR_RETRY_SEC = 120;
+
+  async function fetchActiveRankedWar() {
+    if (!settings.apiKey) return null;
+    if (isRateLimited()) {
+      throw new Error('Rate-limited · retry in ' + rateLimitRemainingSec() + 's');
+    }
+    const qs = new URLSearchParams({
+      selections: 'basic',
+      key: settings.apiKey,
+      comment: 'TECH',
+      _: String(Date.now()),
+    });
+    const url = 'https://api.torn.com/faction/?' + qs.toString();
+    const data = await apiGet(url, { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' });
+    if (!data || typeof data !== 'object') return null;
+    const ourFactionId = data.ID;
+    if (!ourFactionId) return null;       // user isn't in a faction
+    const wars = data.ranked_wars || {};
+    for (const warIdStr in wars) {
+      const w = wars[warIdStr];
+      if (!w || !w.war) continue;
+      if (w.war.end && w.war.end !== 0) continue;   // war already ended
+      const factions = w.factions || {};
+      for (const fIdStr in factions) {
+        const fid = parseInt(fIdStr, 10);
+        if (!Number.isFinite(fid) || fid === ourFactionId) continue;
+        return {
+          warId: parseInt(warIdStr, 10),
+          ourFactionId,
+          ourFactionName: data.name || '',
+          factionId: fid,
+          factionName: (factions[fIdStr] && factions[fIdStr].name) || ('Faction ' + fid),
+          warStart: w.war.start || 0,
+          refreshedAt: nowSec(),
+        };
+      }
+    }
+    return null;   // no active war
+  }
+
+  function maybeRefreshActiveWar(force) {
+    if (!settings.apiKey) return;
+    if (isRateLimited()) return;
+    const now = nowSec();
+    if (!force) {
+      const cached = meta.activeWarTarget;
+      if (cached && cached.refreshedAt
+          && (now - cached.refreshedAt) < ACTIVE_WAR_REFRESH_SEC) {
+        return;
+      }
+      if (meta.activeWarCheckedAt
+          && (now - meta.activeWarCheckedAt) < ACTIVE_WAR_REFRESH_SEC) {
+        return;
+      }
+      if (meta.activeWarError && meta.activeWarError.at
+          && (now - meta.activeWarError.at) < ACTIVE_WAR_ERROR_RETRY_SEC) {
+        return;
+      }
+    }
+    fetchActiveRankedWar().then(function (war) {
+      meta.activeWarTarget = war;
+      meta.activeWarCheckedAt = nowSec();
+      meta.activeWarError = null;
+      store('meta', meta);
+      if (war) maybeRefreshFactionChain(war.factionId);
+      if (panelEl && contentEl && settings.activeTab === 'dashboard' && !currentDrill) {
+        renderActive();
+      }
+    }).catch(function (e) {
+      meta.activeWarError = { at: nowSec(), msg: String(e && e.message ? e.message : e) };
+      store('meta', meta);
     });
   }
 
@@ -2201,7 +2375,12 @@
         meta.chain = {
           current:    chain.current,
           max:        chain.maximum || 0,
-          timeoutAt:  typeof chain.timeout === 'number' ? chain.timeout : 0,
+          // v0.6.68 — same chain.timeout format-detection fix as the
+          // faction endpoint. Masked here in normal play because the
+          // chain pill prefers readChainFromTornDom() over meta.chain;
+          // only the rare DOM-scrape-fallback path would have shown the
+          // bug. Symmetric fix keeps both endpoints aligned.
+          timeoutAt:  resolveChainTimeoutAt(chain.timeout),
           modifier:   typeof chain.modifier === 'number' ? chain.modifier : 1.0,
           cooldownAt: cd > 0 ? nowSec() + cd : 0,
           fetchedAt:  nowSec(),
@@ -2276,6 +2455,10 @@
       // and my-own-status gating stay current. Non-blocking — failure here
       // just hides the badge until next poll.
       await fetchSelfState();
+      // v0.6.70 — detect active ranked war so the Dashboard chain pill can
+      // render side-by-side with the enemy faction's chain. Throttled to
+      // 5 minutes internally, fire-and-forget.
+      maybeRefreshActiveWar();
 
       // v0.6.2 — always fetch the newest 100 on page 1 (no bounds, DESC).
       // Page 1 thus catches every recent fight regardless of what
@@ -3398,6 +3581,79 @@
     };
   }
 
+  // v0.6.67 — Weekly Digest. Bucketed week-over-week comparison: last 7
+  // days vs the 7 days before that. Independent of the window pill so the
+  // user always gets a fixed "what changed this week" read regardless of
+  // which pill they're on (24H / 7D / 30D / All / WAR).
+  //
+  // Each metric carries a "betterDirection" hint that the render layer uses
+  // to colour the delta (green=better, red=worse, grey=neutral). That logic
+  // lives here so the UI doesn't have to know about combat semantics:
+  //   fights        → neutral (more activity isn't intrinsically better)
+  //   winRate       → up
+  //   respectNet    → up
+  //   incoming      → down (less heat = better)
+  //   hospThem      → up
+  //   hospMe        → down
+  //   avgAtkLevel   → down (higher-level attackers = bigger threat)
+  function computeWeeklyDigest() {
+    if (!meta.userId) return { ready: false, reason: 'no-user' };
+
+    const now = nowSec();
+    const day = 86400;
+    const thisStart = now - 7  * day;
+    const lastStart = now - 14 * day;
+    const lastEnd   = now - 7  * day;
+
+    function bucket(startTs, endTs) {
+      const s = {
+        total: 0, attCount: 0, defCount: 0,
+        wins: 0, losses: 0,
+        respectGain: 0, respectLoss: 0,
+        hospThem: 0, hospMe: 0,
+        koThem: 0, koMe: 0,
+        attackerLevelSum: 0, attackerLevelN: 0,
+      };
+      for (const code in fights) {
+        const raw = fights[code];
+        const ts = raw.timestamp_ended || 0;
+        if (ts < startTs || ts >= endTs) continue;
+        const v = deriveFightView(raw, meta.userId);
+        if (!v.iAm) continue;
+        s.total++;
+        if (v.iAm === 'attacker') s.attCount++;
+        else                       s.defCount++;
+        if (v.outcome.win)  s.wins++;
+        if (v.outcome.loss) s.losses++;
+        if (v.iAm === 'attacker' && v.outcome.win)  s.koThem++;
+        if (v.iAm === 'defender' && v.outcome.loss) s.koMe++;
+        if (v.outcomeKey === 'hosp_them') s.hospThem++;
+        if (v.outcomeKey === 'hosp_me')   s.hospMe++;
+        if (v.respectDelta > 0) s.respectGain += v.respectDelta;
+        if (v.respectDelta < 0) s.respectLoss += v.respectDelta;
+        if (v.iAm === 'defender' && v.attackerLevel != null) {
+          s.attackerLevelSum += v.attackerLevel;
+          s.attackerLevelN++;
+        }
+      }
+      s.winRate = s.total > 0 ? s.wins / s.total : null;
+      s.respectNet = s.respectGain + s.respectLoss;
+      s.avgAttackerLevel = s.attackerLevelN > 0
+        ? s.attackerLevelSum / s.attackerLevelN
+        : null;
+      return s;
+    }
+
+    const thisWeek = bucket(thisStart, now);
+    const lastWeek = bucket(lastStart, lastEnd);
+
+    if (thisWeek.total === 0 && lastWeek.total === 0) {
+      return { ready: false, reason: 'no-data', thisWeek, lastWeek };
+    }
+
+    return { ready: true, thisWeek, lastWeek };
+  }
+
   // ─── EXPORT / IMPORT ────────────────────────────────────────────────────
   function exportFights() {
     // v0.6.49 — include the live dom_buffer in exports so unmerged DOM events
@@ -4414,6 +4670,24 @@
       text-transform:uppercase;letter-spacing:1px;color:#9ca3af;
       margin:6px 0 4px;}
 
+    /* Weekly Digest card (v0.6.67). Compact week-over-week comparison
+       table with delta arrows tinted by direction-of-improvement. */
+    .tech-digest-table{width:100%;border-collapse:collapse;font-size:11px;
+      margin-top:4px;}
+    .tech-digest-table th{font:600 9px/1 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:.5px;color:#6b7280;
+      text-align:right;padding:4px 6px 5px;border-bottom:1px solid #2a1f2e;}
+    .tech-digest-table th:first-child{text-align:left;color:#94a3b8;}
+    .tech-digest-table td{padding:4px 6px;text-align:right;
+      color:#cbd5e1;font-variant-numeric:tabular-nums;}
+    .tech-digest-table td:first-child{text-align:left;color:#e5e7eb;font-weight:600;}
+    .tech-digest-table tr:not(:last-child) td{border-bottom:1px solid #15101a;}
+    .tech-digest-table .last{color:#6b7280;}
+    .tech-digest-table .delta.good{color:#34d399;}
+    .tech-digest-table .delta.bad {color:#fca5a5;}
+    .tech-digest-table .delta.flat{color:#9ca3af;}
+    .tech-digest-table .delta .arrow{margin-right:2px;font-weight:700;}
+
     /* Clickable row affordance — set on fight rows + top-opponent rows that
        have a known opponentId, so clicking drills into Opponent Intel. */
     .tech-row.clickable,.tech-oprow.clickable{cursor:pointer;}
@@ -4739,13 +5013,24 @@
     .tech-scout-row.verdict-neutral   {border-left-color:#4b5563;}
     .tech-scout-row.verdict-unknown   {border-left-color:#4b5563;}
     .tech-scout-row.verdict-nohistory {border-left-color:#1f2937;}
-    .tech-scout-name{flex:1;color:#e5e7eb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    .tech-scout-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;}
+    .tech-scout-name{color:#e5e7eb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
       display:flex;align-items:center;gap:4px;min-width:0;}
     .tech-scout-name a{color:#c4b5fd;text-decoration:none;font-weight:600;
       overflow:hidden;text-overflow:ellipsis;}
     .tech-scout-name a:hover{color:#fde047;}
     .tech-scout-verdict{font-size:10px;color:#9ca3af;font-variant-numeric:tabular-nums;
-      flex-shrink:0;text-align:right;}
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    /* v0.6.69 — hospital/jail/fed countdown badge on Scout rows.
+       Locked rows render "Hosp 14:23" in a slightly hotter color so it
+       reads at a glance during war prep. The .tech-scout-countdown-elapsed
+       state takes over once the countdown ticks to zero — greys out so the
+       user knows the row's state is provisional until next poll. */
+    .tech-scout-countdown{color:#fca5a5;font-weight:600;
+      text-shadow:0 0 4px rgba(220,38,38,.35);}
+    .tech-scout-countdown-elapsed{color:#6b7280 !important;font-weight:400 !important;
+      text-shadow:none !important;font-style:italic;}
+    .tech-scout-status-tag{color:#60a5fa;font-weight:600;}
     .tech-scout-verdict .verdict{font-weight:700;letter-spacing:.5px;margin-right:2px;}
     .tech-scout-row.verdict-danger    .tech-scout-verdict .verdict{color:#fca5a5;
       text-shadow:0 0 4px rgba(220,38,38,.5);}
@@ -4872,6 +5157,27 @@
     .tech-chain-pill.cooldown{border-color:#1e3a5f;color:#9ca3af;}
     .tech-chain-pill.cooldown .tech-chain-icon{color:#60a5fa;}
     .tech-chain-pill.cooldown .tech-chain-timer{color:#93c5fd;}
+    /* v0.6.70 — dual chain pill (Dashboard war mode). Two pills side-by-
+       side, each flexes to fill its column. Idle/error states render as
+       muted variants so the pair stays visually balanced when one side
+       has nothing going. */
+    .tech-chain-pair{display:flex;gap:8px;margin-bottom:11px;}
+    .tech-chain-pair > .tech-chain-pill{flex:1;min-width:0;margin-bottom:0;}
+    .tech-chain-pill.nopair{margin-bottom:0;}
+    .tech-chain-pill.idle{border-color:#2a1f2e;background:#0c0a0f;}
+    .tech-chain-pill.idle .tech-chain-icon{color:#6b7280;}
+    .tech-chain-pill.idle .tech-chain-label{color:#9ca3af;}
+    .tech-chain-pill.idle .tech-chain-idle-text{color:#6b7280;font-style:italic;
+      font-size:11px;}
+    .tech-chain-pill.error{border-color:#7f1d1d;background:#1a0a0a;}
+    .tech-chain-pill.error .tech-chain-icon{color:#fca5a5;}
+    .tech-chain-pill.error .tech-chain-error-text{color:#fca5a5;font-size:11px;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+    /* In paired mode the body needs to wrap tighter (~200px per pill). */
+    .tech-chain-pair .tech-chain-body{flex-wrap:wrap;row-gap:2px;}
+    .tech-chain-pair .tech-chain-label{font-size:10px;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+      max-width:140px;}
     .tech-chain-body{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
     .tech-chain-icon{font-size:14px;line-height:1;}
     .tech-chain-label{color:#cbd5e1;font-weight:700;letter-spacing:.5px;
@@ -4978,7 +5284,12 @@
   //   - idle:      nothing (don't clutter the Dashboard with "no chain")
   // The countdown is updated every second by a setInterval that
   // self-cancels when the timer node leaves the DOM (tab switch / drill).
-  function renderChainPill(host) {
+  function renderChainPill(host, opts) {
+    opts = opts || {};
+    const label = opts.label || 'Chain';
+    const forceIdle = !!opts.forceIdle;     // v0.6.70 — render idle placeholder
+    const skipMargin = !!opts.skipMargin;   // v0.6.70 — drop margin-bottom when in pair
+
     // Clear any prior ticker so we don't stack callbacks when the panel
     // re-renders (poll cycle, settings change, etc.).
     if (chainTickerInterval) {
@@ -4986,18 +5297,37 @@
       chainTickerInterval = null;
     }
 
+    function buildIdleState(text) {
+      const cls = 'tech-chain-pill idle' + (skipMargin ? ' nopair' : '');
+      host.appendChild(el('div', { class: cls },
+        el('div', { class: 'tech-chain-body' },
+          el('span', { class: 'tech-chain-icon' }, '⛓'),
+          el('span', { class: 'tech-chain-label' }, label),
+          el('span', { class: 'tech-chain-sep' }, '·'),
+          el('span', { class: 'tech-chain-idle-text' }, text),
+        ),
+      ));
+    }
+
     // v0.6.46 — prefer Torn's sidebar over the cached API state. The
     // sidebar updates every second and works during API rate-limits;
     // meta.chain is the fallback for pages where the sidebar isn't
     // rendered (rare, but happens on some Torn views).
     const c = readChainFromTornDom() || meta.chain;
-    if (!c) return;
+    if (!c) {
+      if (forceIdle) buildIdleState('No active chain');
+      return;
+    }
     const now = nowSec();
     const isActive   = c.current > 0 && c.timeoutAt > now;
     const isCooldown = !isActive && c.cooldownAt > now;
-    if (!isActive && !isCooldown) return;  // idle — no pill
+    if (!isActive && !isCooldown) {
+      if (forceIdle) buildIdleState('No active chain');
+      return;  // idle — no pill
+    }
 
     let pillClass = 'tech-chain-pill';
+    if (skipMargin) pillClass += ' nopair';
     let body;
     let targetTs;
     let suffix;
@@ -5019,7 +5349,7 @@
 
       body = el('div', { class: 'tech-chain-body' },
         el('span', { class: 'tech-chain-icon' }, '⛓'),
-        el('span', { class: 'tech-chain-label' }, 'Chain'),
+        el('span', { class: 'tech-chain-label' }, label),
         el('span', { class: 'tech-chain-count' }, String(c.current)),
         el('span', { class: 'tech-chain-sep' }, '·'),
         el('span', { class: 'tech-chain-timer' }, initial + suffix),
@@ -5037,7 +5367,7 @@
       const initial = fmtCountdown(targetTs) || '0:00';
       body = el('div', { class: 'tech-chain-body' },
         el('span', { class: 'tech-chain-icon' }, '⛓'),
-        el('span', { class: 'tech-chain-label' }, 'Chain cooldown'),
+        el('span', { class: 'tech-chain-label' }, label + ' cooldown'),
         el('span', { class: 'tech-chain-sep' }, '·'),
         el('span', { class: 'tech-chain-timer' }, initial + suffix),
       );
@@ -5099,7 +5429,12 @@
   // Self-cancelling tick: same pattern as renderChainPill — the interval
   // checks `.isConnected` every second and clears itself when the timer
   // node leaves the DOM (tab switch, drill close, etc.).
-  function renderFactionChainPill(host, factionId) {
+  function renderFactionChainPill(host, factionId, opts) {
+    opts = opts || {};
+    const compact = !!opts.compact;          // v0.6.70 — skip header row
+    const skipMargin = !!opts.skipMargin;    // v0.6.70 — drop margin-bottom
+    const label = opts.label || 'Enemy chain';
+
     if (factionChainTickerInterval) {
       clearInterval(factionChainTickerInterval);
       factionChainTickerInterval = null;
@@ -5107,34 +5442,49 @@
 
     const cached = factionChainCache[factionId];
 
-    // Header row — title + manual refresh button. Always rendered so the
-    // refresh control is available even in error / idle states.
-    const fetchedAge = (cached && cached.fetchedAt)
-      ? fmtAgo(cached.fetchedAt)
-      : 'never';
-    const headerRow = el('div', {
-      style: { display: 'flex', alignItems: 'center', gap: '8px',
-               marginBottom: '6px', fontSize: '10px',
-               textTransform: 'uppercase', letterSpacing: '1.2px',
-               color: '#a855f7', fontWeight: '700' },
-    },
-      el('span', {}, 'Enemy chain'),
-      el('span', { style: { color: '#6b7280', fontWeight: '500',
-                            textTransform: 'none', letterSpacing: '.5px' } },
-        '· last poll ' + fetchedAge),
-      el('button', {
-        type: 'button',
-        class: 'tech-targets-refresh',
-        title: 'Refresh enemy chain now',
-        style: { marginLeft: 'auto' },
-        'on:click': function () {
-          maybeRefreshFactionChain(factionId, true);
-        },
-      }, '↻'),
-    );
-    host.appendChild(headerRow);
+    function buildStatePill(stateClass, text) {
+      const cls = 'tech-chain-pill ' + stateClass + (skipMargin ? ' nopair' : '');
+      host.appendChild(el('div', { class: cls },
+        el('div', { class: 'tech-chain-body' },
+          el('span', { class: 'tech-chain-icon' }, '⛓'),
+          el('span', { class: 'tech-chain-label' }, label),
+          el('span', { class: 'tech-chain-sep' }, '·'),
+          el('span', { class: 'tech-chain-' + stateClass + '-text' }, text),
+        ),
+      ));
+    }
+
+    if (!compact) {
+      // Header row — title + manual refresh button. Standalone (drill) mode
+      // only; compact mode drops it for the side-by-side dashboard pair.
+      const fetchedAge = (cached && cached.fetchedAt)
+        ? fmtAgo(cached.fetchedAt)
+        : 'never';
+      const headerRow = el('div', {
+        style: { display: 'flex', alignItems: 'center', gap: '8px',
+                 marginBottom: '6px', fontSize: '10px',
+                 textTransform: 'uppercase', letterSpacing: '1.2px',
+                 color: '#a855f7', fontWeight: '700' },
+      },
+        el('span', {}, 'Enemy chain'),
+        el('span', { style: { color: '#6b7280', fontWeight: '500',
+                              textTransform: 'none', letterSpacing: '.5px' } },
+          '· last poll ' + fetchedAge),
+        el('button', {
+          type: 'button',
+          class: 'tech-targets-refresh',
+          title: 'Refresh enemy chain now',
+          style: { marginLeft: 'auto' },
+          'on:click': function () {
+            maybeRefreshFactionChain(factionId, true);
+          },
+        }, '↻'),
+      );
+      host.appendChild(headerRow);
+    }
 
     if (!cached) {
+      if (compact) { buildStatePill('idle', 'loading…'); return; }
       host.appendChild(el('div', {
         style: { fontSize: '11px', color: '#6b7280', fontStyle: 'italic',
                  marginBottom: '11px' },
@@ -5143,6 +5493,7 @@
     }
 
     if (cached.error) {
+      if (compact) { buildStatePill('error', '⚠ ' + cached.error); return; }
       host.appendChild(el('div', {
         style: { fontSize: '11px', color: '#f87171', marginBottom: '11px' },
       }, '⚠ ' + cached.error));
@@ -5154,6 +5505,7 @@
     const isCooldown = !isActive && cached.cooldownAt > now;
 
     if (!isActive && !isCooldown) {
+      if (compact) { buildStatePill('idle', 'No active chain'); return; }
       host.appendChild(el('div', {
         style: { fontSize: '11px', color: '#6b7280', marginBottom: '11px' },
       }, 'No active chain.'));
@@ -5161,6 +5513,7 @@
     }
 
     let pillClass = 'tech-chain-pill';
+    if (skipMargin) pillClass += ' nopair';
     let body;
     let targetTs;
     let suffix;
@@ -5185,7 +5538,7 @@
 
       body = el('div', { class: 'tech-chain-body' },
         el('span', { class: 'tech-chain-icon' }, '⛓'),
-        el('span', { class: 'tech-chain-label' }, 'Enemy chain'),
+        el('span', { class: 'tech-chain-label' }, label),
         el('span', { class: 'tech-chain-count' }, countText),
         el('span', { class: 'tech-chain-sep' }, '·'),
         el('span', { class: 'tech-chain-timer' }, initial + suffix),
@@ -5199,7 +5552,7 @@
       const initial = fmtCountdown(targetTs) || '0:00';
       body = el('div', { class: 'tech-chain-body' },
         el('span', { class: 'tech-chain-icon' }, '⛓'),
-        el('span', { class: 'tech-chain-label' }, 'Enemy cooldown'),
+        el('span', { class: 'tech-chain-label' }, label + ' cooldown'),
         el('span', { class: 'tech-chain-sep' }, '·'),
         el('span', { class: 'tech-chain-timer' }, initial + suffix),
       );
@@ -5238,6 +5591,55 @@
         }
       }
     }, 1000);
+  }
+
+  // ─── DASHBOARD CHAIN PAIR (v0.6.70) ────────────────────────────────────
+  // Wrapper that decides single-pill vs dual-pill render based on whether
+  // TECH has auto-detected an active ranked war for the user's faction.
+  //
+  //   - No active war → fall through to renderChainPill (single pill,
+  //     historical behaviour: idle = no pill at all).
+  //   - Active war   → render TWO pills side-by-side. Both forced to
+  //     render even when idle, so the user always sees both at a glance
+  //     during war prep (e.g. "you have no chain, but they're at 47" is
+  //     itself actionable). Left = your chain, right = enemy chain.
+  //
+  // The own-chain pill ticker (chainTickerInterval) and enemy-chain pill
+  // ticker (factionChainTickerInterval) are independent module-level
+  // handles, so the two countdowns tick in parallel without clashing.
+  function renderDashboardChain(host) {
+    // Throttled internally — usually a no-op (every 5min budget).
+    maybeRefreshActiveWar();
+
+    const war = meta.activeWarTarget;
+    if (!war) {
+      renderChainPill(host);
+      return;
+    }
+
+    // Kick the enemy chain fetch so the pair has fresh data. Throttled
+    // by FACTION_CHAIN_REFRESH_SEC = 30s.
+    maybeRefreshFactionChain(war.factionId);
+
+    const pair = el('div', { class: 'tech-chain-pair' });
+    host.appendChild(pair);
+
+    renderChainPill(pair, {
+      label: 'You',
+      forceIdle: true,
+      skipMargin: true,
+    });
+
+    // Enemy label — truncate factionName to keep the pill compact when
+    // both sit at ~200px wide. Tooltip carries the full name.
+    const enemyLabel = war.factionName && war.factionName.length > 14
+      ? war.factionName.slice(0, 13) + '…'
+      : (war.factionName || 'Enemy');
+    renderFactionChainPill(pair, war.factionId, {
+      label: enemyLabel,
+      compact: true,
+      skipMargin: true,
+    });
   }
 
   // ─── TARGET QUEUE PANEL (v0.6.39) ──────────────────────────────────────
@@ -5531,7 +5933,10 @@
     // your chain is about to break, that beats everything else. Idle
     // (no chain + no cooldown) renders nothing so the Dashboard stays
     // clean during regular play.
-    renderChainPill(host);
+    // v0.6.70 — Now routed through renderDashboardChain which auto-detects
+    // active ranked wars and renders the enemy chain side-by-side when
+    // one is in progress.
+    renderDashboardChain(host);
 
     // v0.6.39 — Target queue panel. Above the empty-state check (like Build
     // Coherence) so it's visible even before any fights are ingested.
@@ -5697,6 +6102,80 @@
         el('div', { class: 'sub'   }, `${fmtNum(o.respectPerEnergy, 3)} per energy`),
       ),
     ));
+
+    // Weekly Digest (v0.6.67) — fixed 7-day window comparison vs the
+    // prior 7 days, independent of which window pill is active. Sits
+    // right after the stats grids so the "current snapshot" and
+    // "week-over-week trend" reads cluster together at the top.
+    const wd = computeWeeklyDigest();
+    if (wd.ready) {
+      const card = el('div', { class: 'tech-section' });
+      card.appendChild(el('div', { class: 'tech-section-title' }, 'Weekly Digest'));
+
+      // Direction-of-improvement hints. "up" = positive delta is good,
+      // "down" = negative delta is good, "flat" = neutral magnitude.
+      // Used by renderRow to colour the arrow + delta cell.
+      function renderRow(label, thisVal, lastVal, formatter, betterDir) {
+        const fmtVal = function (v) {
+          if (v == null) return '—';
+          return formatter(v);
+        };
+        let deltaCell;
+        if (thisVal == null || lastVal == null) {
+          deltaCell = el('td', { class: 'delta flat' }, '—');
+        } else {
+          const d = thisVal - lastVal;
+          if (Math.abs(d) < 1e-9) {
+            deltaCell = el('td', { class: 'delta flat' },
+              el('span', { class: 'arrow' }, '·'), formatter(0));
+          } else {
+            let goodness = 'flat';
+            if (betterDir === 'up')   goodness = d > 0 ? 'good' : 'bad';
+            if (betterDir === 'down') goodness = d < 0 ? 'good' : 'bad';
+            const arrow = d > 0 ? '▲' : '▼';
+            const sign = d > 0 ? '+' : '−';
+            deltaCell = el('td', { class: 'delta ' + goodness },
+              el('span', { class: 'arrow' }, arrow),
+              sign + formatter(Math.abs(d)));
+          }
+        }
+        return el('tr', {},
+          el('td', {}, label),
+          el('td', {}, fmtVal(thisVal)),
+          el('td', { class: 'last' }, fmtVal(lastVal)),
+          deltaCell,
+        );
+      }
+
+      const fmtInt = function (n) { return fmtNum(Math.round(n), 0); };
+      const fmtPctRow = function (n) { return (n * 100).toFixed(0) + '%'; };
+      const fmtRespRow = function (n) { return n.toFixed(2); };
+      const fmtLvlRow  = function (n) { return 'L' + n.toFixed(0); };
+
+      const t = wd.thisWeek, l = wd.lastWeek;
+      const table = el('table', { class: 'tech-digest-table' },
+        el('thead', {},
+          el('tr', {},
+            el('th', {}, 'Metric'),
+            el('th', {}, 'This week'),
+            el('th', {}, 'Last week'),
+            el('th', {}, 'Δ'),
+          ),
+        ),
+        el('tbody', {},
+          renderRow('Fights',           t.total,            l.total,            fmtInt,     'flat'),
+          renderRow('Outgoing',         t.attCount,         l.attCount,         fmtInt,     'flat'),
+          renderRow('Incoming',         t.defCount,         l.defCount,         fmtInt,     'down'),
+          renderRow('Win rate',         t.winRate,          l.winRate,          fmtPctRow,  'up'),
+          renderRow('Respect net',      t.respectNet,       l.respectNet,       fmtRespRow, 'up'),
+          renderRow('Hosp\'d them',     t.hospThem,         l.hospThem,         fmtInt,     'up'),
+          renderRow('Got hosp\'d',      t.hospMe,           l.hospMe,           fmtInt,     'down'),
+          renderRow('Avg attacker lvl', t.avgAttackerLevel, l.avgAttackerLevel, fmtLvlRow,  'down'),
+        ),
+      );
+      card.appendChild(table);
+      host.appendChild(card);
+    }
 
     // Leveling Trap Detector v0.1 — only renders once we have ≥3 incoming
     // fights with attacker_level (i.e., non-stealthed, post-v0.3.0). Silent
@@ -7443,6 +7922,8 @@
     // until a roster is rendered (no point sorting nothing).
     const SCOUT_SORTS = [
       { key: 'verdict',   label: 'Verdict (danger first)' },
+      { key: 'hospSoon',  label: 'Hospital (out soonest)' },
+      { key: 'status',    label: 'Status (hittable first)' },
       { key: 'levelDesc', label: 'Level (high → low)' },
       { key: 'levelAsc',  label: 'Level (low → high)' },
       { key: 'spyDesc',   label: 'Spy total (high → low)' },
@@ -7614,6 +8095,47 @@
           }
           return nameCmp(a, b);
         }
+        if (sortKey === 'hospSoon') {
+          // v0.6.69 — surface members closest to leaving hospital/jail/fed
+          // first. Non-locked rows sink to the end so the war-prep use case
+          // (queue up release timings) stays clean. Within locked rows,
+          // soonest-out wins; absent statusUntil (rare API edge) treats as
+          // "infinite remaining" so it ranks below known countdowns.
+          function untilOrInf(m) {
+            const s = m.statusState;
+            if (s !== 'Hospital' && s !== 'Jail' && s !== 'Federal') return null;
+            return m.statusUntil || Infinity;
+          }
+          const au = untilOrInf(a.member);
+          const bu = untilOrInf(b.member);
+          if (au == null && bu == null) return nameCmp(a, b);
+          if (au == null) return 1;
+          if (bu == null) return -1;
+          if (au !== bu) return au - bu;
+          return nameCmp(a, b);
+        }
+        if (sortKey === 'status') {
+          // v0.6.69 — hittable-first ordering. Tier 0 = Okay,
+          // tier 1 = Hospital/Jail/Federal (sub-sorted by soonest out),
+          // tier 2 = Traveling/Abroad. Mirrors the Targets queue's tier
+          // pattern (without the can-hit-energy check, which Scout doesn't
+          // know about — energy is a self-state thing).
+          function tier(m) {
+            const s = m.statusState;
+            if (s === 'Hospital' || s === 'Jail' || s === 'Federal') return 1;
+            if (s === 'Traveling' || s === 'Abroad') return 2;
+            return 0;
+          }
+          const at = tier(a.member);
+          const bt = tier(b.member);
+          if (at !== bt) return at - bt;
+          if (at === 1) {
+            const au = a.member.statusUntil || Infinity;
+            const bu = b.member.statusUntil || Infinity;
+            if (au !== bu) return au - bu;
+          }
+          return nameCmp(a, b);
+        }
         if (sortKey === 'levelDesc' || sortKey === 'levelAsc') {
           const al = a.member.level, bl = b.member.level;
           if (al == null && bl == null) return nameCmp(a, b);
@@ -7712,9 +8234,37 @@
         const lastBit = m.lastActionTs > 0
           ? ' · last ' + fmtAgo(m.lastActionTs)
           : '';
-        const statusBit = (m.statusState && m.statusState !== 'Okay')
-          ? ' · ' + m.statusState
-          : '';
+        // v0.6.69 — status dot + countdown, matching the Targets queue
+        // pattern. Locked rows render "Hosp 14:23" / "Jail 2h 14m" /
+        // "Fed 5h 12m"; abroad rows show "Abroad"; everyone else falls
+        // through. The countdown text lives in a span tagged with
+        // tech-scout-countdown + the Unix-seconds release timestamp so a
+        // 1s ticker can rewrite the label in-place without a full rerender.
+        const state = m.statusState || null;
+        const lastStat = m.lastActionStatus || null;
+        let dotClass = 'offline';
+        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') dotClass = 'locked';
+        else if (state === 'Traveling' || state === 'Abroad') dotClass = 'abroad';
+        else if (lastStat === 'Online') dotClass = 'online';
+        else if (lastStat === 'Idle')   dotClass = 'idle';
+        const dotTitle = (state && state !== 'Okay' ? state + ' · ' : '')
+                       + (lastStat || 'Unknown')
+                       + (m.lastActionTs ? ' (' + fmtAgo(m.lastActionTs) + ')' : '');
+        let statusEl = null;
+        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') {
+          const tag = state === 'Hospital' ? 'Hosp' : state === 'Jail' ? 'Jail' : 'Fed';
+          const cd = fmtCountdown(m.statusUntil);
+          statusEl = el('span', {
+            class: 'tech-scout-countdown',
+            'data-until': String(m.statusUntil || 0),
+            'data-tag': tag,
+            title: state + (m.statusUntil
+              ? ' until ' + new Date(m.statusUntil * 1000).toLocaleString()
+              : ''),
+          }, cd ? (tag + ' ' + cd) : state);
+        } else if (state === 'Traveling' || state === 'Abroad') {
+          statusEl = el('span', { class: 'tech-scout-status-tag' }, state);
+        }
         // v0.6.54 — spy total badge. Populated rows show "spy 1.2M";
         // no-data rows show "spy —" (greyed via fontStyle italic in CSS
         // would be cleaner but the verdict column is plain text — keep
@@ -7734,19 +8284,24 @@
           class: 'tech-scout-row clickable verdict-' + vk,
           title: 'Open Opponent Intel for ' + m.name,
         },
-          el('div', { class: 'tech-scout-name' },
-            el('a', {
-              href: 'https://www.torn.com/profiles.php?XID=' + m.id,
-              target: '_blank', rel: 'noopener',
-            }, m.name),
-            (m.level != null ? el('span', { class: 'tech-level' }, 'L' + m.level) : null),
-          ),
-          el('div', { class: 'tech-scout-verdict' },
-            el('span', { class: 'verdict' }, vlabel),
-            ffBit,
-            fightsBit,
-            spyBit,
-            lastBit + statusBit,
+          el('span', { class: 'tech-target-dot ' + dotClass, title: dotTitle }),
+          el('div', { class: 'tech-scout-main' },
+            el('div', { class: 'tech-scout-name' },
+              el('a', {
+                href: 'https://www.torn.com/profiles.php?XID=' + m.id,
+                target: '_blank', rel: 'noopener',
+              }, m.name),
+              (m.level != null ? el('span', { class: 'tech-level' }, 'L' + m.level) : null),
+            ),
+            el('div', { class: 'tech-scout-verdict' },
+              el('span', { class: 'verdict' }, vlabel),
+              ffBit,
+              fightsBit,
+              spyBit,
+              lastBit,
+              statusEl ? document.createTextNode(' · ') : null,
+              statusEl,
+            ),
           ),
         );
         memberRow.addEventListener('click', function (e) {
@@ -7755,6 +8310,43 @@
         });
         listHost.appendChild(memberRow);
       }
+
+      // v0.6.69 — start (or restart) the per-second countdown ticker. Each
+      // tick rewrites every live `.tech-scout-countdown` node from its
+      // `data-until` attribute. Self-cancels when the list host leaves the
+      // DOM (tab switch, drill, panel close) or when no countdowns remain
+      // (everyone's out / no one was hospitalised to begin with).
+      if (scoutCountdownInterval) {
+        clearInterval(scoutCountdownInterval);
+        scoutCountdownInterval = null;
+      }
+      scoutCountdownInterval = setInterval(function () {
+        if (!listHost.isConnected) {
+          clearInterval(scoutCountdownInterval);
+          scoutCountdownInterval = null;
+          return;
+        }
+        const nodes = listHost.querySelectorAll('.tech-scout-countdown');
+        if (!nodes.length) {
+          clearInterval(scoutCountdownInterval);
+          scoutCountdownInterval = null;
+          return;
+        }
+        for (const n of nodes) {
+          const until = parseInt(n.getAttribute('data-until'), 10) || 0;
+          const tag   = n.getAttribute('data-tag') || '';
+          const cd    = fmtCountdown(until);
+          if (cd) {
+            n.textContent = tag + ' ' + cd;
+          } else {
+            // Countdown elapsed — strip the badge so the row visually
+            // promotes from "locked" to "out". A subsequent roster refetch
+            // (manual refresh / poll) will fully recompute state.
+            n.textContent = 'out';
+            n.classList.add('tech-scout-countdown-elapsed');
+          }
+        }
+      }, 1000);
     }
 
     // Render cached roster if we have one for the typed ID
