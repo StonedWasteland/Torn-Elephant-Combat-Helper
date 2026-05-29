@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.65
+// @version      0.6.66
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -406,7 +406,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.65';
+  const SCRIPT_VERSION    = '0.6.66';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -3311,6 +3311,93 @@
     };
   }
 
+  // v0.6.66 — Incoming Activity. Defender-side counterpart to Personal
+  // Weapon Performance: surfaces patterns from fights where YOU were the
+  // defender. Two questions answered:
+  //   1. WHEN do you get hit? — 24-bucket hour-of-day histogram so you can
+  //      time hospital/jail/abroad to dodge peak attack hours.
+  //   2. WHO keeps coming back? — top recurring attackers across the
+  //      window, sorted by hit count.
+  // Hours bucket by LOCAL timezone — most users mentally track "when do I
+  // get hit" in local time. Stealthed attacks count for hour patterns
+  // (the timing data is still valid) but are excluded from the persistent-
+  // attackers list since opponentId/name are anonymous on stealthed hits.
+  function computeIncomingActivity(views) {
+    let totalIncoming = 0;
+    const hourBuckets = new Array(24).fill(0);
+    const attackerMap = new Map();
+    let winsAsDefender = 0, lossesAsDefender = 0;
+
+    for (const v of views) {
+      if (v.iAm !== 'defender') continue;
+      totalIncoming++;
+
+      const ts = v.tsStarted || v.tsEnded;
+      if (ts) {
+        const d = new Date(ts * 1000);
+        hourBuckets[d.getHours()]++;
+      }
+
+      if (v.outcome.win)  winsAsDefender++;
+      if (v.outcome.loss) lossesAsDefender++;
+
+      if (v.opponentId && !v.stealthed) {
+        let row = attackerMap.get(v.opponentId);
+        if (!row) {
+          row = {
+            id: v.opponentId,
+            name: v.opponentName || ('Player ' + v.opponentId),
+            level: v.attackerLevel,
+            count: 0, wins: 0, losses: 0,
+            lastTs: 0,
+          };
+          attackerMap.set(v.opponentId, row);
+        }
+        row.count++;
+        if (v.outcome.win)  row.wins++;
+        if (v.outcome.loss) row.losses++;
+        if (v.tsEnded > row.lastTs) row.lastTs = v.tsEnded;
+        if (v.attackerLevel != null) row.level = v.attackerLevel;
+      }
+    }
+
+    if (totalIncoming < 3) {
+      return { ready: false, reason: 'thin-data', totalIncoming };
+    }
+
+    // Peak hour — ties resolved by earliest hour (first index hit).
+    let peakHour = 0, peakCount = 0;
+    for (let h = 0; h < 24; h++) {
+      if (hourBuckets[h] > peakCount) {
+        peakHour = h;
+        peakCount = hourBuckets[h];
+      }
+    }
+
+    // Persistent: opponents who attacked you ≥2 times in the window.
+    // Sorted by hit count desc, capped at 5 so the card stays compact.
+    const persistent = Array.from(attackerMap.values())
+      .filter(function (r) { return r.count >= 2; })
+      .sort(function (a, b) { return b.count - a.count; })
+      .slice(0, 5);
+
+    const defenseRate = (winsAsDefender + lossesAsDefender) > 0
+      ? winsAsDefender / (winsAsDefender + lossesAsDefender)
+      : null;
+
+    return {
+      ready: true,
+      totalIncoming,
+      hourBuckets,
+      peakHour,
+      peakCount,
+      persistent,
+      winsAsDefender,
+      lossesAsDefender,
+      defenseRate,
+    };
+  }
+
   // ─── EXPORT / IMPORT ────────────────────────────────────────────────────
   function exportFights() {
     // v0.6.49 — include the live dom_buffer in exports so unmerged DOM events
@@ -4305,6 +4392,27 @@
     .tech-weapons-row .col-bp{color:#9ca3af;font-size:10px;}
     .tech-weapons-headline{font-size:11px;color:#cbd5e1;margin-top:8px;line-height:1.4;}
     .tech-weapons-headline strong{color:#fde047;}
+
+    /* Incoming Activity card (v0.6.66). Hour-of-day heatmap + persistent
+       attackers list. The heatmap is 24 vertical bars; peak hour gets the
+       ember accent so it reads at a glance. */
+    .tech-incoming-sub{font-size:11px;color:#9ca3af;margin:4px 0 8px;line-height:1.4;}
+    .tech-incoming-sub strong{color:#fde047;}
+    .tech-hour-heatmap{display:flex;align-items:flex-end;gap:1px;height:52px;
+      background:#08070b;border:1px solid #2a1f2e;border-radius:3px;
+      padding:3px;margin-bottom:4px;}
+    .tech-hour-bar{flex:1;min-width:0;background:#7c3aed;border-radius:1px 1px 0 0;
+      min-height:2px;transition:filter .15s;}
+    .tech-hour-bar.empty{background:#15101a;min-height:0;}
+    .tech-hour-bar.peak{background:linear-gradient(180deg,#fb923c 0%,#ea580c 100%);
+      box-shadow:0 0 6px rgba(249,115,22,.5);}
+    .tech-hour-bar:hover{filter:brightness(1.3);}
+    .tech-hour-axis{display:flex;font-size:9px;color:#6b7280;
+      font-variant-numeric:tabular-nums;letter-spacing:.5px;margin-bottom:8px;}
+    .tech-hour-axis-tick{flex:1;text-align:left;}
+    .tech-incoming-persistent-title{font:600 10px/1 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:1px;color:#9ca3af;
+      margin:6px 0 4px;}
 
     /* Clickable row affordance — set on fight rows + top-opponent rows that
        have a known opponentId, so clicking drills into Opponent Intel. */
@@ -5620,6 +5728,86 @@
       }
       trapChildren.push(el('div', { class: 'tech-trap-hint' }, hint));
       host.appendChild(el('div', { class: 'tech-section tech-trap ' + lt.severity }, ...trapChildren));
+    }
+
+    // Incoming Activity (v0.6.66) — defender-side patterns. Hour-of-day
+    // heatmap shows WHEN you get hit (local time); persistent-attackers
+    // list shows WHO keeps coming back. Sits right after Leveling Trap so
+    // all defender-side analytics group together visually.
+    const ia = computeIncomingActivity(views);
+    if (ia.ready) {
+      const card = el('div', { class: 'tech-section' });
+      card.appendChild(el('div', { class: 'tech-section-title' }, 'Incoming Activity'));
+
+      const pad2 = function (n) { return n < 10 ? '0' + n : String(n); };
+      const defenseBit = (ia.defenseRate != null)
+        ? `, defended ${(ia.defenseRate * 100).toFixed(0)}% (${ia.winsAsDefender}W / ${ia.lossesAsDefender}L)`
+        : '';
+      card.appendChild(el('div', { class: 'tech-incoming-sub' },
+        el('strong', {}, String(ia.totalIncoming)),
+        ` attack${ia.totalIncoming === 1 ? '' : 's'} taken in window. Peak hour: `,
+        el('strong', {}, pad2(ia.peakHour) + ':00 local'),
+        ` (${ia.peakCount} hit${ia.peakCount === 1 ? '' : 's'})${defenseBit}.`,
+      ));
+
+      // 24-bar hour heatmap. Heights scale to peak count; peak hour gets
+      // the ember accent. Tooltips show exact counts on hover.
+      const heat = el('div', { class: 'tech-hour-heatmap' });
+      const maxCount = Math.max.apply(null, ia.hourBuckets) || 1;
+      for (let h = 0; h < 24; h++) {
+        const count = ia.hourBuckets[h];
+        const heightPx = count > 0 ? Math.max(2, Math.round((count / maxCount) * 44)) : 0;
+        const cls = 'tech-hour-bar'
+          + (count === 0 ? ' empty' : '')
+          + (h === ia.peakHour && count > 0 ? ' peak' : '');
+        heat.appendChild(el('div', {
+          class: cls,
+          style: { height: heightPx + 'px' },
+          title: pad2(h) + ':00 — ' + count + ' attack' + (count === 1 ? '' : 's'),
+        }));
+      }
+      card.appendChild(heat);
+
+      // Axis ticks every 6 hours so users can read the X-axis without
+      // hovering every bar. Flex 1/24 per tick aligns with the bars above.
+      const axis = el('div', { class: 'tech-hour-axis' });
+      for (let h = 0; h < 24; h++) {
+        axis.appendChild(el('div', { class: 'tech-hour-axis-tick' },
+          (h % 6 === 0) ? pad2(h) : ''));
+      }
+      card.appendChild(axis);
+
+      // Persistent attackers list. Only renders when at least one opponent
+      // hit you ≥2 times in the window — single-hit attackers are noise,
+      // not pattern. Clickable rows drill into Opponent Intel.
+      if (ia.persistent.length > 0) {
+        card.appendChild(el('div', { class: 'tech-incoming-persistent-title' },
+          'Repeat attackers (' + ia.persistent.length + ')'));
+        for (const a of ia.persistent) {
+          const wlStr = a.count > 0
+            ? a.wins + 'W / ' + a.losses + 'L'
+            : '—';
+          const row = el('div', { class: 'tech-oprow clickable' },
+            el('div', { class: 'name' },
+              el('a', {
+                href: 'https://www.torn.com/profiles.php?XID=' + a.id,
+                target: '_blank', rel: 'noopener',
+              }, a.name),
+              a.level != null
+                ? el('span', { class: 'tech-level' }, 'L' + a.level)
+                : null,
+            ),
+            el('div', { class: 'wl' }, a.count + ' hit' + (a.count === 1 ? '' : 's') + ' · ' + wlStr),
+            el('div', { class: 'resp' }, fmtAgo(a.lastTs)),
+          );
+          row.addEventListener('click', function (e) {
+            if (e.target.closest('a')) return;
+            openOpponentDrill(a.id, a.name);
+          });
+          card.appendChild(row);
+        }
+      }
+      host.appendChild(card);
     }
 
     // Difficulty Roadmap v0.2 — vision feature #9. Where you should hunt.
