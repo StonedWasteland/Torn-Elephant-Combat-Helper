@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.64
+// @version      0.6.65
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -406,7 +406,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.64';
+  const SCRIPT_VERSION    = '0.6.65';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -3403,12 +3403,223 @@
   };
   const WEAPON_CLASS_ORDER = ['generic', 'pistol', 'smg', 'rifle', 'shotgun', 'melee_light', 'melee_medium', 'melee_heavy', 'melee_elite', 'heavy'];
 
-  function _resolveWeaponDmg(classKey, fallback) {
+  // v0.6.65 — Per-weapon damage + accuracy table for the TEST sim's
+  // named-weapon picker. Wiki data from reference-torn-wiki-weapons memory,
+  // captured 2026-05-26 from in-game tables. Each row is the wiki LOW + HIGH
+  // for damage and accuracy; midpoints get computed at lookup time.
+  // Compact array shape: [id, label, class, dmgLow, dmgHigh, accLow, accHigh].
+  //
+  // Class mapping rules:
+  //   Primary → rifle / smg / shotgun / heavy (Machine Gun + Heavy Artillery)
+  //   Secondary → pistol / smg / shotgun / heavy (Heavy Artillery)
+  //     Secondary slot piercing/clubbing/mechanical (Blowgun, Crossbow,
+  //     Slingshot, Taser, etc.) map to 'pistol' — that's the slot they
+  //     occupy; the damage TYPE is a separate engine concern not modeled yet.
+  //   Melee → melee_light / _medium / _heavy / _elite by damage midpoint:
+  //     <22 = light, 22–40 = medium, 40–60 = heavy, 60+ = elite.
+  //
+  // Excluded: "?? - ??" entries (China Lake, SMAW Launcher) and "Coming Soon"
+  // (Tranquilizer Gun, Scalpel) — no usable stats. Everything else is
+  // included including loot/exotic/dual/event weapons; per-weapon picker
+  // means the user gets fine-grained control regardless of source rarity.
+  const WEAPONS = [
+    // ── PRIMARY ────────────────────────────────────────────────────────
+    ['uzi_9mm',           '9mm Uzi',              'smg',     65, 70, 43, 48],
+    ['ak47',              'AK-47',                'rifle',   56, 61, 52, 57],
+    ['ak74u',             'AK74U',                'smg',     46, 51, 41, 46],
+    ['armalite_m15a4',    'ArmaLite M-15A4',      'rifle',   68, 73, 57, 62],
+    ['benelli_m1_tac',    'Benelli M1 Tactical',  'shotgun', 39, 44, 65, 70],
+    ['benelli_m4_super',  'Benelli M4 Super',     'shotgun', 59, 64, 55, 60],
+    ['bushmaster_c15',    'Bushmaster Carbon 15', 'smg',     50, 55, 57, 62],
+    ['dual_bushmasters',  'Dual Bushmasters',     'smg',     76, 81, 47, 52],
+    ['dual_mp5s',         'Dual MP5s',            'smg',     78, 83, 46, 51],
+    ['dual_p90s',         'Dual P90s',            'smg',     77, 82, 45, 50],
+    ['dual_tmps',         'Dual TMPs',            'smg',     79, 84, 40, 45],
+    ['dual_uzis',         'Dual Uzis',            'smg',     80, 85, 36, 41],
+    ['egg_launcher',      'Egg Propelled Launcher','heavy',  64, 69, 24, 29],
+    ['enfield_sa80',      'Enfield SA-80',        'rifle',   63, 68, 55, 60],
+    ['gold_ak47',         'Gold Plated AK-47',    'rifle',   75, 80, 62, 67],
+    ['hk_sl8',            'Heckler & Koch SL8',   'rifle',   60, 65, 46, 51],
+    ['ithaca_37',         'Ithaca 37',            'shotgun', 49, 54, 62, 67],
+    ['jackhammer',        'Jackhammer',           'shotgun', 69, 74, 52, 57],
+    ['m16_a2',            'M16 A2 Rifle',         'rifle',   61, 66, 47, 52],
+    ['m249_saw',          'M249 SAW',             'heavy',   67, 72, 41, 46],
+    ['m4a1_colt',         'M4A1 Colt Carbine',    'rifle',   55, 60, 47, 52],
+    ['mag7',              'Mag 7',                'shotgun', 56, 61, 62, 67],
+    ['minigun',           'Minigun',              'heavy',   72, 77, 28, 33],
+    ['mp40',              'MP 40',                'smg',     37, 42, 41, 46],
+    ['mp5_navy',          'MP5 Navy',             'smg',     45, 50, 51, 56],
+    ['negev_ng5',         'Negev NG-5',           'heavy',   69, 74, 35, 40],
+    ['neutrilux_2000',    'Neutrilux 2000',       'heavy',   59, 64, 25, 30],
+    ['nock_gun',          'Nock Gun',             'shotgun', 95,100, 45, 50],
+    ['p90',               'P90',                  'smg',     48, 53, 51, 56],
+    ['pkm',               'PKM',                  'heavy',   76, 79, 49, 51],
+    ['prototype',         'Prototype',            'heavy',   68, 73, 36, 41],
+    ['rheinmetall_mg3',   'Rheinmetall MG 3',     'heavy',   66, 71, 36, 41],
+    ['sawed_off',         'Sawed-Off Shotgun',    'shotgun', 41, 46, 63, 68],
+    ['sig_550',           'SIG 550',              'rifle',   62, 67, 50, 55],
+    ['sig_552',           'SIG 552',              'rifle',   69, 74, 50, 55],
+    ['sks_carbine',       'SKS Carbine',          'rifle',   46, 51, 47, 52],
+    ['snow_cannon',       'Snow Cannon',          'heavy',   52, 57, 24, 29],
+    ['steyr_aug',         'Steyr AUG',            'rifle',   64, 69, 45, 50],
+    ['stoner_96',         'Stoner 96',            'heavy',   69, 74, 49, 54],
+    ['tavor_tar21',       'Tavor TAR-21',         'rifle',   65, 70, 52, 57],
+    ['thompson',          'Thompson',             'smg',     39, 44, 43, 48],
+    ['vektor_cr21',       'Vektor CR-21',         'rifle',   50, 55, 48, 53],
+    ['xm8',               'XM8 Rifle',            'rifle',   50, 55, 56, 61],
+    // ── SECONDARY ──────────────────────────────────────────────────────
+    ['type98_at',         'Type 98 Anti Tank',    'heavy',   78, 83, 25, 30],
+    ['beretta_92fs',      'Beretta 92FS',         'pistol',  48, 53, 51, 56],
+    ['beretta_m9',        'Beretta M9',           'pistol',  36, 41, 54, 59],
+    ['beretta_pico',      'Beretta Pico',         'pistol',  54, 59, 53, 58],
+    ['blowgun',           'Blowgun',              'pistol',  15, 20, 39, 44],
+    ['blunderbuss',       'Blunderbuss',          'shotgun', 46, 51, 24, 29],
+    ['bt_mp9',            'BT MP9',               'smg',     61, 66, 55, 60],
+    ['cobra_derringer',   'Cobra Derringer',      'pistol',  61, 66, 53, 58],
+    ['crossbow',          'Crossbow',             'pistol',  35, 40, 63, 68],
+    ['desert_eagle',      'Desert Eagle',         'pistol',  59, 64, 36, 41],
+    ['dual_92g',          'Dual 92G Berettas',    'pistol',  64, 69, 30, 35],
+    ['fiveseven',         'Fiveseven',            'pistol',  52, 57, 49, 54],
+    ['flamethrower',      'Flamethrower',         'heavy',   67, 72, 39, 44],
+    ['flare_gun',         'Flare Gun',            'pistol',  18, 23, 22, 27],
+    ['glock_17',          'Glock 17',             'pistol',  28, 33, 53, 58],
+    ['harpoon',           'Harpoon',              'pistol',  47, 52, 63, 68],
+    ['hh_pocket_shotgun', 'Homemade Pocket Shotgun','shotgun',63,68, 60, 65],
+    ['lorcin_380',        'Lorcin 380',           'pistol',  27, 32, 41, 46],
+    ['luger',             'Luger',                'pistol',  35, 40, 48, 53],
+    ['magnum',            'Magnum',               'pistol',  55, 60, 38, 43],
+    ['milkor_mgl',        'Milkor MGL',           'heavy',   74, 79, 39, 44],
+    ['mp5k',              'MP5k',                 'smg',     42, 47, 52, 57],
+    ['pink_mac10',        'Pink Mac-10',          'smg',     74, 79, 45, 50],
+    ['qsz_92',            'Qsz-92',               'pistol',  62, 67, 53, 58],
+    ['raven_mp25',        'Raven MP25',           'pistol',  29, 34, 52, 57],
+    ['rpg_launcher',      'RPG Launcher',         'heavy',   77, 82, 39, 44],
+    ['ruger_57',          'Ruger 57',             'pistol',  32, 37, 56, 61],
+    ['sw_m29',            'S&W M29',              'pistol',  47, 52, 52, 57],
+    ['sw_revolver',       'S&W Revolver',         'pistol',  42, 47, 54, 59],
+    ['skorpion',          'Skorpion',             'smg',     40, 45, 54, 59],
+    ['slingshot',         'Slingshot',            'pistol',  14, 18, 54, 59],
+    ['springfield_1911',  'Springfield 1911',     'pistol',  33, 38, 57, 62],
+    ['taser',             'Taser',                'pistol',   1,  5, 54, 59],
+    ['taurus',            'Taurus',               'pistol',  30, 35, 57, 62],
+    ['tmp',               'TMP',                  'smg',     38, 43, 45, 50],
+    ['usp',               'USP',                  'pistol',  44, 49, 58, 63],
+    // ── MELEE ──────────────────────────────────────────────────────────
+    // Bucketed by damage midpoint per the rules above. Same dmg/acc the
+    // wiki publishes; class lookup just controls which dropdown shows it.
+    ['axe',               'Axe',                  'melee_medium', 34, 39, 52, 57],
+    ['baseball_bat',      'Baseball Bat',         'melee_light',  16, 21, 57, 62],
+    ['blood_sickle',      'Blood Spattered Sickle','melee_medium',36, 41, 55, 60],
+    ['bone_saw',          'Bone Saw',             'melee_heavy',  54, 58, 52, 56],
+    ['bo_staff',          'Bo Staff',             'melee_light',  13, 18, 55, 60],
+    ['bread_knife',       'Bread Knife',          'melee_heavy',  41, 43, 65, 70],
+    ['bug_swatter',       'Bug Swatter',          'melee_light',   5, 10, 59, 64],
+    ['butterfly_knife',   'Butterfly Knife',      'melee_medium', 24, 29, 55, 60],
+    ['cattle_prod',       'Cattle Prod',          'melee_light',   1,  6, 59, 64],
+    ['chain_whip',        'Chain Whip',           'melee_medium', 31, 36, 52, 57],
+    ['chainsaw',          'Chainsaw',             'melee_elite',  61, 66, 23, 28],
+    ['claymore_sword',    'Claymore Sword',       'melee_heavy',  57, 62, 49, 54],
+    ['cleaver',           'Cleaver',              'melee_heavy',  51, 56, 56, 61],
+    ['cricket_bat',       'Cricket Bat',          'melee_light',  18, 23, 42, 47],
+    ['crowbar',           'Crowbar',              'melee_medium', 20, 25, 52, 57],
+    ['dagger',            'Dagger',               'melee_medium', 28, 33, 60, 65],
+    ['devils_pitchfork',  "Devil's Pitchfork",    'melee_elite',  61, 66, 41, 46],
+    ['diamond_knife',     'Diamond Bladed Knife', 'melee_elite',  60, 65, 62, 67],
+    ['diamond_icicle',    'Diamond Icicle',       'melee_heavy',  45, 50, 48, 53],
+    ['dual_axes',         'Dual Axes',            'melee_elite',  70, 75, 54, 59],
+    ['dual_hammers',      'Dual Hammers',         'melee_elite',  70, 75, 54, 59],
+    ['dual_samurai',      'Dual Samurai Swords',  'melee_elite',  70, 75, 54, 59],
+    ['dual_scimitars',    'Dual Scimitars',       'melee_elite',  70, 75, 54, 59],
+    ['dukes_hammer',      "Duke's Hammer",        'melee_light',  18, 18, 55, 55],
+    ['fine_chisel',       'Fine Chisel',          'melee_light',  16, 21, 50, 55],
+    ['flail',             'Flail',                'melee_elite',  71, 76, 28, 33],
+    ['frying_pan',        'Frying Pan',           'melee_light',  19, 24, 43, 48],
+    ['golden_broomstick', 'Golden Broomstick',    'melee_elite',  60, 65, 48, 53],
+    ['golf_club',         'Golf Club',            'melee_medium', 29, 32, 59, 63],
+    ['guandao',           'Guandao',              'melee_elite',  63, 68, 35, 40],
+    ['hammer',            'Hammer',               'melee_light',  17, 22, 55, 60],
+    ['handbag',           'Handbag',              'melee_elite',  67, 72, 63, 68],
+    ['ice_pick',          'Ice Pick',             'melee_heavy',  51, 56, 60, 65],
+    ['ivory_cane',        'Ivory Walking Cane',   'melee_heavy',  53, 58, 57, 62],
+    ['kama',              'Kama',                 'melee_medium', 35, 40, 55, 60],
+    ['katana',            'Katana',               'melee_heavy',  52, 57, 55, 60],
+    ['kitchen_knife',     'Kitchen Knife',        'melee_medium', 25, 30, 55, 60],
+    ['knuckle_dusters',   'Knuckle Dusters',      'melee_light',  11, 16, 62, 67],
+    ['kodachi',           'Kodachi',              'melee_elite',  62, 67, 56, 61],
+    ['lead_pipe',         'Lead Pipe',            'melee_medium', 26, 31, 33, 38],
+    ['leather_bullwhip',  'Leather Bullwhip',     'melee_medium', 27, 32, 52, 57],
+    ['macana',            'Macana',               'melee_heavy',  57, 62, 65, 70],
+    ['madball',           'Madball',              'melee_elite',  60, 65, 45, 50],
+    ['meat_hook',         'Meat Hook',            'melee_elite',  62, 67, 39, 44],
+    ['metal_nunchakus',   'Metal Nunchakus',      'melee_elite',  61, 66, 60, 65],
+    ['naval_cutlass',     'Naval Cutlass',        'melee_elite',  64, 69, 52, 57],
+    ['ninja_claws',       'Ninja Claws',          'melee_heavy',  39, 44, 51, 56],
+    ['high_heels',        'Pair of High Heels',   'melee_heavy',  40, 45, 63, 68],
+    ['ice_skates',        'Pair of Ice Skates',   'melee_heavy',  43, 48, 45, 50],
+    ['pen_knife',         'Pen Knife',            'melee_medium', 21, 26, 45, 50],
+    ['penelope',          'Penelope',             'melee_light',  17, 17, 57, 57],
+    ['petrified_humerus', 'Petrified Humerus',    'melee_heavy',  48, 53, 48, 53],
+    ['pillow',            'Pillow',               'melee_light',   1,  5, 63, 68],
+    ['plastic_sword',     'Plastic Sword',        'melee_light',   5, 10, 29, 34],
+    ['poison_umbrella',   'Poison Umbrella',      'melee_medium', 35, 40, 49, 54],
+    ['riding_crop',       'Riding Crop',          'melee_medium', 21, 26, 54, 59],
+    ['rusty_sword',       'Rusty Sword',          'melee_medium', 22, 27, 15, 20],
+    ['sai',               'Sai',                  'melee_medium', 29, 34, 52, 57],
+    ['samurai_sword',     'Samurai Sword',        'melee_elite',  58, 63, 52, 57],
+    ['scimitar',          'Scimitar',             'melee_heavy',  40, 45, 58, 63],
+    ['sledgehammer',      'Sledgehammer',         'melee_elite',  58, 63, 50, 55],
+    ['spear',             'Spear',                'melee_heavy',  38, 43, 48, 53],
+    ['swiss_army_knife',  'Swiss Army Knife',     'melee_medium', 23, 28, 52, 57],
+    ['twin_tiger_hooks',  'Twin Tiger Hooks',     'melee_heavy',  50, 55, 53, 58],
+    ['wand_of_destr',     'Wand of Destruction',  'melee_elite',  60, 65, 26, 31],
+    ['wooden_nunchaku',   'Wooden Nunchaku',      'melee_medium', 22, 27, 59, 64],
+    ['wushu_double_axes', 'Wushu Double Axes',    'melee_heavy',  53, 58, 51, 56],
+    ['yasukuni_sword',    'Yasukuni Sword',       'melee_elite',  65, 70, 49, 54],
+  ];
+
+  // Lookup index built once at module load. The TEST UI hits getWeaponsForClass
+  // every time the class dropdown changes (rebuilding the second dropdown), so
+  // pre-sorting + indexing here keeps that path zero-allocation.
+  const WEAPONS_BY_ID = {};
+  const WEAPONS_BY_CLASS = {};
+  (function buildWeaponIndex() {
+    for (const row of WEAPONS) {
+      const id = row[0], label = row[1], klass = row[2];
+      const dl = row[3], dh = row[4], al = row[5], ah = row[6];
+      const obj = {
+        id, label, class: klass,
+        dmg: (dl + dh) / 2,
+        acc: (al + ah) / 2,
+        dmgLow: dl, dmgHigh: dh,
+        accLow: al, accHigh: ah,
+      };
+      WEAPONS_BY_ID[id] = obj;
+      if (!WEAPONS_BY_CLASS[klass]) WEAPONS_BY_CLASS[klass] = [];
+      WEAPONS_BY_CLASS[klass].push(obj);
+    }
+    for (const klass in WEAPONS_BY_CLASS) {
+      WEAPONS_BY_CLASS[klass].sort(function (a, b) { return a.label.localeCompare(b.label); });
+    }
+  })();
+
+  function getWeaponById(id) {
+    return id ? (WEAPONS_BY_ID[id] || null) : null;
+  }
+  function getWeaponsForClass(classKey) {
+    return WEAPONS_BY_CLASS[classKey] || [];
+  }
+
+  // Specific weapon overrides class. weapon obj wins when present, class is
+  // the fallback, and a numeric fallback is the last resort (kept for the
+  // sanity-check harness which passes opts.weaponDmg directly).
+  function _resolveWeaponDmg(classKey, fallback, weapon) {
+    if (weapon && typeof weapon.dmg === 'number') return weapon.dmg;
     if (classKey && WEAPON_CLASSES[classKey]) return WEAPON_CLASSES[classKey].dmg;
     return (typeof fallback === 'number') ? fallback : TEST_DEFAULTS.weaponDmg;
   }
 
-  function _resolveWeaponAcc(classKey) {
+  function _resolveWeaponAcc(classKey, weapon) {
+    if (weapon && typeof weapon.acc === 'number') return weapon.acc;
     if (classKey && WEAPON_CLASSES[classKey]) return WEAPON_CLASSES[classKey].acc;
     return 50;
   }
@@ -3632,15 +3843,16 @@
   // directly, or be derived from a.level / b.level (or opts.level as a fallback
   // shared default). Returns winner + final HP + turns.
   function testRunMatch(a, b, opts, rng) {
-    // v0.2: weapon class per side, falling back to the shared opts.weaponDmg
-    // override (kept for harness compat), falling back to the stat-only 50.
-    const wpnA = _resolveWeaponDmg(opts.weaponClassA, opts.weaponDmg);
-    const wpnB = _resolveWeaponDmg(opts.weaponClassB, opts.weaponDmg);
-    // v0.4: weapon accuracy biases hit chance. Generic class → acc 50
-    // (neutral), so v0.1/v0.2 generic-only matchups still resolve at the
-    // pure Spd/Dex curve.
-    const accA = _resolveWeaponAcc(opts.weaponClassA);
-    const accB = _resolveWeaponAcc(opts.weaponClassB);
+    // v0.6.65: opts.weaponA / weaponB are weapon-object overrides from the
+    // named-weapon picker (id → WEAPONS_BY_ID lookup). When set, they win
+    // over the class default; when null, falls through to the class lookup
+    // (v0.2 behaviour) and then to opts.weaponDmg (harness compat).
+    const wpnObjA = opts.weaponA || null;
+    const wpnObjB = opts.weaponB || null;
+    const wpnA = _resolveWeaponDmg(opts.weaponClassA, opts.weaponDmg, wpnObjA);
+    const wpnB = _resolveWeaponDmg(opts.weaponClassB, opts.weaponDmg, wpnObjB);
+    const accA = _resolveWeaponAcc(opts.weaponClassA, wpnObjA);
+    const accB = _resolveWeaponAcc(opts.weaponClassB, wpnObjB);
     // v0.3: armor preset per defender. Each landed hit rolls a body region
     // and applies the defender's preset reduction; naked = no-op so v0.2
     // matchups produce identical numbers under the same rngSeed.
@@ -3773,6 +3985,15 @@
         };
       });
     }
+    // v0.6.65: named-weapon label takes precedence over the class label
+    // when a specific weapon is picked. The class label still appears as
+    // a paren-suffix on the result footer so users see "Ithaca 37 (Shotgun)".
+    const weaponLabelA = opts.weaponA && opts.weaponA.label
+      ? opts.weaponA.label + ' (' + WEAPON_CLASSES[keyA].label + ')'
+      : WEAPON_CLASSES[keyA].label;
+    const weaponLabelB = opts.weaponB && opts.weaponB.label
+      ? opts.weaponB.label + ' (' + WEAPON_CLASSES[keyB].label + ')'
+      : WEAPON_CLASSES[keyB].label;
     return {
       trials,
       winRateA: winsA / trials,
@@ -3780,8 +4001,8 @@
       drawRate: draws / trials,
       avgTurns: turnsSum / trials,
       turnsHist,
-      weaponA: WEAPON_CLASSES[keyA].label,
-      weaponB: WEAPON_CLASSES[keyB].label,
+      weaponA: weaponLabelA,
+      weaponB: weaponLabelB,
       armorA: ARMOR_PRESETS[armKeyA].label,
       armorB: ARMOR_PRESETS[armKeyB].label,
       drugA: DRUGS[drugKeyA].label,
@@ -6708,6 +6929,49 @@
       wpnRow.appendChild(wpnSel);
       col.appendChild(wpnRow);
 
+      // v0.6.65: named-weapon picker. Second dropdown lists the specific
+      // weapons that fall under the current class, sourced from the wiki
+      // table (WEAPONS_BY_CLASS). "(class average)" is the default option
+      // → preserves v0.6.x behavior where the class dropdown alone drove
+      // dmg/acc. When a specific weapon is picked, its exact wiki dmg+acc
+      // overrides the class midpoint inside testRunMatch.
+      const wpnPickRow = el('div', { class: 'tech-test-wpnrow' });
+      wpnPickRow.appendChild(el('label', {}, 'Specific'));
+      const wpnPickSel = el('select', {
+        class: 'wpn-select',
+        title: 'Pick a named weapon from the wiki table to override the class average',
+      });
+      function repopulateWeaponPicker(classKey, preserveValue) {
+        const prev = preserveValue ? wpnPickSel.value : '';
+        wpnPickSel.innerHTML = '';
+        const defaultOpt = el('option', { value: '' }, '(class average)');
+        wpnPickSel.appendChild(defaultOpt);
+        const list = getWeaponsForClass(classKey);
+        for (const w of list) {
+          const opt = el('option', { value: w.id },
+            w.label + '  · dmg ' + w.dmg.toFixed(1) + ' · acc ' + w.acc.toFixed(0));
+          wpnPickSel.appendChild(opt);
+        }
+        // Restore prior selection if it still exists in the new list
+        // (class didn't actually change, or we crossed between classes
+        // and the same id happens to be in both — very unlikely).
+        if (prev && WEAPONS_BY_ID[prev] && WEAPONS_BY_ID[prev].class === classKey) {
+          wpnPickSel.value = prev;
+        }
+      }
+      repopulateWeaponPicker(wpnSel.value, false);
+      // Class dropdown change → reset picker to "(class average)" and
+      // repopulate with the new class's weapons. We deliberately do NOT
+      // preserve a picked weapon across class changes — if the user
+      // switches Shotgun→Rifle, picking Ithaca 37 again doesn't make
+      // sense; we want them to see the new class's options fresh.
+      wpnSel.addEventListener('change', function () {
+        repopulateWeaponPicker(wpnSel.value, false);
+      });
+      refs.weapon = wpnPickSel;
+      wpnPickRow.appendChild(wpnPickSel);
+      col.appendChild(wpnPickRow);
+
       // v0.6.15: drug stat multiplier. Defaults to 'none' so existing
       // users see identical numbers to v0.3 under the same rngSeed.
       const drugRow = el('div', { class: 'tech-test-wpnrow' });
@@ -6758,7 +7022,13 @@
           oppRefs[k].value = youRefs[k].value;
           oppRefs[k].dispatchEvent(new Event('input', { bubbles: true }));
         }
-        if (oppRefs.weaponClass) oppRefs.weaponClass.value = youRefs.weaponClass.value;
+        if (oppRefs.weaponClass) {
+          oppRefs.weaponClass.value = youRefs.weaponClass.value;
+          // Fire change so the opponent's named-weapon picker repopulates
+          // with the mirrored class's options before we set its value.
+          oppRefs.weaponClass.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        if (oppRefs.weapon && youRefs.weapon) oppRefs.weapon.value = youRefs.weapon.value;
         if (oppRefs.drug)        oppRefs.drug.value        = youRefs.drug.value;
         if (oppRefs.armor)       oppRefs.armor.value       = youRefs.armor.value;
       },
@@ -6777,6 +7047,7 @@
         level:     parseInt(refs.level.value, 10)     || TEST_DEFAULTS.defaultLevel,
         hp:        parseInt(refs.hp && refs.hp.value, 10) || 0,
         weaponClass: (refs.weaponClass && refs.weaponClass.value) || 'generic',
+        weaponId:    (refs.weapon      && refs.weapon.value)      || '',
         armor:       (refs.armor       && refs.armor.value)       || 'naked',
         drug:        (refs.drug        && refs.drug.value)        || 'none',
       };
@@ -6909,6 +7180,8 @@
         iterations: iterations,
         weaponClassA: A.weaponClass,
         weaponClassB: B.weaponClass,
+        weaponA:     getWeaponById(A.weaponId),
+        weaponB:     getWeaponById(B.weaponId),
         armorA:      A.armor,
         armorB:      B.armor,
         drugA:       A.drug,
