@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.60
+// @version      0.6.63
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,6 +16,76 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ─── UPDATE NOTES (0.6.63) ──────────────────────────────────────────
+// Bugfix on v0.6.62: the HIT badge linked to /loader.php?sid=attack
+// but Torn has migrated attack pages to /page.php?sid=attack. The old
+// URL now returns:
+//   "This endpoint is no longer available. Please use the new
+//    endpoints instead (page.php)."
+//
+// Three call sites touch this URL — all updated:
+//   1. The HIT badge link (renderTargetQueue) — now points at /page.php.
+//      Outgoing only, /loader.php is dead.
+//   2. getActiveOpponentFromUrl() (Active-Page Banner) — now accepts
+//      BOTH /page.php and /loader.php so stale links still trigger
+//      the banner. Banner is URL-based intel, doesn't depend on the
+//      page actually loading.
+//   3. isAttackPage() (DOM hook gate) — same: accept both so the
+//      hook attaches on the new URL going forward. On the legacy
+//      /loader.php URL Torn shows an error page with no combat log,
+//      so parseLogRow returns null and nothing breaks.
+//
+// Caught by user the first time the HIT badge was clicked in v0.6.62.
+//
+// ─── UPDATE NOTES (0.6.62) ──────────────────────────────────────────
+// UX fix: the ⚡ HIT badge on Targets queue rows now actually attacks.
+// Previously it was a visual marker only — clicking it triggered the
+// row's drill-into-intel handler, same as clicking anywhere else on
+// the row. Bad UX: badge says "hittable now" but doesn't get you any
+// closer to actually hitting.
+//
+// Now the badge is an <a> element linking to
+// /loader.php?sid=attack&user2ID={id}. Click → go straight to attack
+// page. stopPropagation keeps the row's drill handler from firing too,
+// so the row-vs-badge distinction is preserved: badge = attack, row
+// elsewhere = open Opponent Intel.
+//
+// Right-click → "open in new tab" works naturally because it's a real
+// anchor. CSS adds `text-decoration:none` and a hover brightness bump
+// so the badge keeps its existing look but reads as clickable.
+//
+// ─── UPDATE NOTES (0.6.61) ──────────────────────────────────────────
+// Chain-break browser notification. Opt-in via Settings. Background
+// watcher runs every 5 seconds reading the chain state from Torn's
+// sidebar (same zero-API-cost path the chain pill uses) and fires a
+// browser notification when an active chain drops below 60s remaining.
+//
+// Runs independent of the panel — the existing chain pill ticker only
+// ticks while the Dashboard is rendered, so a user with TECH minimized
+// scrolling Reddit wouldn't otherwise catch a chain about to break.
+// The watcher closes that gap with one ping when it matters.
+//
+// Dedup: fires ONCE per critical dip. State resets when chain bounces
+// back above 90s (i.e., a fresh hit landed) so consecutive critical-low
+// events on the same chain re-arm naturally without spam.
+//
+// Doesn't fire when:
+//   - User hasn't opted in
+//   - Browser hasn't granted notification permission
+//   - No active chain (current = 0)
+//   - Chain is in cooldown (not active)
+//   - Chain is already broken (remaining <= 0)
+//   - Already warned for this dip and chain hasn't bounced back
+//
+// Same notification plumbing as v0.6.43 target-ready. New constants:
+// CHAIN_WATCH_INTERVAL_MS = 5000, CHAIN_BREAK_WARN_SEC = 60,
+// CHAIN_BREAK_REARM_SEC = 90. New setting: notifyChainBreak (default
+// false).
+//
+// Zero new API calls. The DOM scrape is the same one already used for
+// the chain pill — runs more often (every 5s vs the pill's 1s tick)
+// but only ever reads sidebar text, no network.
+//
 // ─── UPDATE NOTES (0.6.60) ──────────────────────────────────────────
 // Quick Wins panel — chain-fight optimizer. New Dashboard section
 // between Targets and Build Coherence that ranks opponents from your
@@ -336,7 +406,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.60';
+  const SCRIPT_VERSION    = '0.6.63';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -524,6 +594,7 @@
     scoutHideTraveling: false,             // v0.6.35 — hide Traveling / Abroad members
     targetIds: [],                         // v0.6.39 — pinned opponent IDs for the Dashboard target queue
     notifyTargetReady: false,              // v0.6.43 — fire browser notification when a pinned target becomes hittable
+    notifyChainBreak: false,               // v0.6.61 — fire browser notification when chain timer drops under 60s
   });
 
   // v0.6.34 — Scout cache. Last roster fetch per faction ID. We keep
@@ -1153,7 +1224,8 @@
 
   // Broader URL parser for the Active-Page Banner (v0.6.24). Detects when
   // the user is on a Torn surface that names a specific opponent — profile
-  // page (/profiles.php?XID=) or attack page (/loader.php?sid=attack&user2ID=).
+  // page (/profiles.php?XID=) or attack page (/page.php?sid=attack&user2ID=,
+  // or the legacy /loader.php?sid=attack&user2ID= retained for stale links).
   // Returns { id, source } where source labels which surface so the banner
   // can pick its wording ("Looking at" vs "Attacking").
   //
@@ -1173,7 +1245,13 @@
           return { id: xid, source: 'profile' };
         }
       }
-      if (path.startsWith('/loader.php') && qs.get('sid') === 'attack') {
+      // v0.6.63 — Torn migrated attack pages from /loader.php to /page.php.
+      // Accept both so the active-page banner still fires on stale URLs
+      // (e.g. someone clicks a year-old link); the dead /loader.php just
+      // shows Torn's error page, but the banner reading was always
+      // URL-based, not DOM-based, so the verdict still surfaces correctly.
+      if ((path.startsWith('/page.php') || path.startsWith('/loader.php'))
+          && qs.get('sid') === 'attack') {
         const u = parseInt(qs.get('user2ID'), 10);
         if (Number.isFinite(u)) {
           if (meta.userId && u === meta.userId) return null;
@@ -1185,7 +1263,12 @@
   }
 
   function isAttackPage() {
-    if (!location.pathname.startsWith('/loader.php')) return false;
+    // v0.6.63 — Same /page.php migration. Accept both paths so the DOM
+    // hook attaches on the new URL going forward; the legacy /loader.php
+    // path silently no-ops since Torn's error page has no combat log to
+    // observe (parseLogRow returns null on missing selectors).
+    const path = location.pathname || '';
+    if (!path.startsWith('/page.php') && !path.startsWith('/loader.php')) return false;
     try {
       return new URLSearchParams(location.search).get('sid') === 'attack';
     } catch (e) { return false; }
@@ -1832,6 +1915,82 @@
     if (oldState === 'Okay') return;                 // already available — no flip
     if (newState !== 'Okay') return;                 // still locked / abroad
     fireTargetReadyNotification(id, name);
+  }
+
+  // ─── CHAIN-BREAK WATCHER (v0.6.61) ─────────────────────────────────────
+  // Background ticker that fires a browser notification when an active
+  // chain drops under 60s. Runs independently of the panel — the existing
+  // chain pill ticker only runs while the Dashboard is rendered, so a
+  // user scrolling Reddit with TECH minimized wouldn't catch a chain
+  // about to break without this.
+  //
+  // Cost is essentially zero: every 5s we scrape the chain from Torn's
+  // sidebar (same readChainFromTornDom path the pill uses — free, no API
+  // call). When the active chain dips below 60s, fire once. Reset the
+  // "fired" flag when the chain bounces back above 90s (i.e., a fresh
+  // hit landed), so consecutive critical-low events on the same chain
+  // re-arm naturally.
+  //
+  // Doesn't fire when:
+  //   - User hasn't opted in (settings.notifyChainBreak === false)
+  //   - Browser hasn't granted permission
+  //   - No active chain (current === 0 or no timeoutAt)
+  //   - Chain is in cooldown (not active)
+  //   - Chain is already broken (remaining <= 0)
+  //   - We've already fired for this dip and chain hasn't bounced back
+  const CHAIN_WATCH_INTERVAL_MS = 5000;
+  const CHAIN_BREAK_WARN_SEC    = 60;
+  const CHAIN_BREAK_REARM_SEC   = 90;
+  let chainWatchInterval = null;
+  let chainWarningFired  = false;
+
+  function fireChainBreakNotification(chainCount, remainingSec) {
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission !== 'granted') return;
+    try {
+      const n = new Notification(SCRIPT_NAME + ': Chain ' + chainCount + ' breaking in ' + remainingSec + 's', {
+        body: 'Hit something to keep the chain alive.',
+        icon: LAUNCHER_MARK_DATA_URL,
+        tag:  'tech-chain-break',     // dedupe browser-side too
+      });
+      n.onclick = function (e) {
+        try { e.preventDefault(); } catch (err) {}
+        try { window.focus(); } catch (err) {}
+        try { n.close(); } catch (err) {}
+      };
+    } catch (e) { /* notification creation failed — silent */ }
+  }
+
+  function checkChainBreakWarning() {
+    if (!settings.notifyChainBreak) return;
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission !== 'granted') return;
+
+    const c = readChainFromTornDom() || meta.chain;
+    if (!c || !c.current || c.current === 0 || !c.timeoutAt) {
+      // No chain — reset state so the next chain starts fresh.
+      chainWarningFired = false;
+      return;
+    }
+    const remaining = c.timeoutAt - nowSec();
+    if (remaining > CHAIN_BREAK_REARM_SEC) {
+      // Chain bounced back above the rearm threshold — re-enable warning
+      // for the next dip on this same chain.
+      chainWarningFired = false;
+      return;
+    }
+    if (remaining <= 0)                      return;  // already broken
+    if (remaining > CHAIN_BREAK_WARN_SEC)    return;  // not yet critical
+    if (chainWarningFired)                   return;  // already warned for this dip
+
+    fireChainBreakNotification(c.current, remaining);
+    chainWarningFired = true;
+  }
+
+  function startChainWatcher() {
+    if (chainWatchInterval) return;
+    chainWatchInterval = setInterval(checkChainBreakWarning, CHAIN_WATCH_INTERVAL_MS);
+    checkChainBreakWarning();   // run once immediately on start
   }
 
   // v0.6.47 — Adaptive target refresh cadence. The brute force "ping every
@@ -4214,9 +4373,11 @@
       margin-left:6px;border-radius:3px;
       font:800 9px/1.4 system-ui,sans-serif;letter-spacing:1.2px;
       color:#0a2e1f;background:linear-gradient(180deg,#34d399 0%,#10b981 100%);
-      border:1px solid #059669;text-shadow:none;
+      border:1px solid #059669;text-shadow:none;text-decoration:none;
+      cursor:pointer;
       box-shadow:0 0 8px rgba(52,211,153,.55);
       animation:tech-hit-pulse 2s ease-in-out infinite;}
+    .tech-hit-badge:hover{filter:brightness(1.1);text-decoration:none;color:#0a2e1f;}
     @keyframes tech-hit-pulse{
       0%,100%{box-shadow:0 0 6px rgba(52,211,153,.45);}
       50%    {box-shadow:0 0 12px rgba(52,211,153,.85);}
@@ -4748,10 +4909,18 @@
       const nameDiv = el('div', { class: 'tech-target-name' }, name);
       if (level != null) nameDiv.appendChild(el('span', { class: 'tech-level' }, 'L' + level));
       if (canHit) {
-        nameDiv.appendChild(el('span', {
+        // v0.6.62 — badge is now a direct link to the Torn attack page for
+        // this opponent. stopPropagation keeps the row's drill-into-intel
+        // click from firing too, so HIT → attack page, row click → intel.
+        // v0.6.63 — URL is now /page.php (Torn migrated off /loader.php and
+        // the old endpoint returns "This endpoint is no longer available").
+        const hitLink = el('a', {
           class: 'tech-hit-badge',
-          title: 'Hittable now — they\'re Okay and you have ≥' + ATTACK_ENERGY_COST + ' energy',
-        }, '⚡ HIT'));
+          href: 'https://www.torn.com/page.php?sid=attack&user2ID=' + id,
+          title: 'Attack ' + name + ' now (' + ATTACK_ENERGY_COST + ' energy)',
+        }, '⚡ HIT');
+        hitLink.addEventListener('click', function (e) { e.stopPropagation(); });
+        nameDiv.appendChild(hitLink);
       }
 
       const unstarBtn = el('button', {
@@ -6110,6 +6279,53 @@
       store('settings', settings);
     });
 
+    // v0.6.61 — Chain-break notification toggle. Background watcher fires
+    // a notification when an active chain timer drops below 60s. Shares
+    // the browser-permission state with the target-ready toggle, so we
+    // can reuse requestNotificationPermission() and surface the same
+    // hint structure.
+    form.appendChild(el('label', {}, 'Chain-break notifications'));
+    const chainCb = el('input', { type: 'checkbox' });
+    chainCb.checked = !!settings.notifyChainBreak;
+    const chainLabel = el('label', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               textTransform: 'none', letterSpacing: '0', color: '#e5e7eb',
+               fontWeight: '500', cursor: 'pointer', margin: '0' },
+    },
+      chainCb,
+      el('span', {}, 'Ping me when my chain timer drops under 60 seconds'),
+    );
+    form.appendChild(chainLabel);
+    const chainHint = el('div', { class: 'hint' },
+      !notifySupported
+        ? 'Your browser does not support Notification API — TECH cannot ping you.'
+        : Notification.permission === 'denied'
+          ? 'Browser permission is DENIED. Re-enable Notifications for torn.com in your browser settings, then toggle this on.'
+          : Notification.permission === 'granted'
+            ? 'Permission granted. Watcher runs every 5 seconds reading the chain from Torn\'s sidebar — zero API cost.'
+            : 'Toggling on will ask your browser for permission to show notifications.',
+    );
+    form.appendChild(chainHint);
+    chainCb.addEventListener('change', async function () {
+      if (chainCb.checked) {
+        const perm = await requestNotificationPermission();
+        if (perm !== 'granted') {
+          chainCb.checked = false;
+          chainHint.textContent = (perm === 'denied')
+            ? 'Browser permission denied. Re-enable Notifications for torn.com in your browser settings.'
+            : 'Notifications not available in this browser context.';
+          settings.notifyChainBreak = false;
+          store('settings', settings);
+          return;
+        }
+        chainHint.textContent = 'Permission granted. Watcher will ping when the chain dips under 60 seconds.';
+      } else {
+        chainHint.textContent = 'Chain-break notifications off.';
+      }
+      settings.notifyChainBreak = chainCb.checked;
+      store('settings', settings);
+    });
+
     form.appendChild(el('div', { class: 'tech-btnrow' },
       el('button', {
         class: 'tech-btn primary',
@@ -7412,12 +7628,22 @@
       refreshTargets({ force: true }).catch(function () {});
     }
 
-    // v0.6.4 — Live-attack DOM hook. Only activates on /loader.php?sid=attack
-    // pages. Cleans up stale buffer entries (>30min old) on each activation.
+    // v0.6.4 — Live-attack DOM hook. Only activates on attack pages
+    // (/page.php?sid=attack as of v0.6.63; legacy /loader.php still
+    // recognised but returns Torn's "endpoint retired" error page).
+    // Cleans up stale buffer entries (>30min old) on each activation.
     if (isAttackPage()) {
       expireOldDomBuffer();
       attachLogObserver();
     }
+
+    // v0.6.61 — Background chain-break watcher. Runs independent of the
+    // panel so a user with TECH minimized still gets warned when their
+    // chain dips under 60s. Cheap: every 5s, one DOM scrape + regex.
+    // The check itself short-circuits when the toggle is off, so the
+    // watcher can run unconditionally — toggling Settings doesn't need
+    // to start/stop the interval.
+    startChainWatcher();
   }
 
   if (document.readyState === 'loading') {
