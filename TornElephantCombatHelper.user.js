@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.75
+// @version      0.6.80
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,6 +16,145 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ─── UPDATE NOTES (0.6.80) ──────────────────────────────────────────
+// Phase 2 archetypes get full personality. All seven mapped archetypes
+// now have alliterative male/female flavor names that pair with the
+// user's character gender, and a "General" fallback covers any combo
+// that doesn't map to a specific archetype — every loadout-with-bonuses
+// gets a label, no more dead-end "no match" notes.
+//
+// New stat-shape goal: SMASHER — all-offense Strength build with mid
+// Speed + Defense and low Dex (Str ≥45%, Dex ≤10%, Spd/Def within
+// ~10% of each other). Sits alongside Heavy Brawler as the "punchier
+// less-tanky cousin" — same general direction, more raw offense.
+//
+// Archetype map (male / female):
+//   Tank          × DoT             → DoT Dan / DoT Diana
+//   Glass Cannon  × Crit / Burst    → Critical Cody / Critical Candy
+//   Heavy Brawler × Debuff          → Crippler Chris / Crippler Christine
+//   Chain Fighter × Reward-on-KO    → Tricky Tony / Tricky Tammy
+//   Dodge/Evader  × Pure damage     → Dancer Donald / Dancer Donna
+//   Smasher       × Pure damage     → Powerhouse Paul / Powerhouse Paula
+//   Any shape     × Self-buff       → Snowball Samuel / Snowball Samantha
+//   (no specific combo)             → General George / General Georgia
+//
+// Implementation:
+//   - meta.gender captured from Torn's /user/?selections=basic on
+//     identifySelf. Existing installs without a cached gender refetch
+//     on next poll (added to the early-out check).
+//   - ARCHETYPES entries now { male, female, blurb } shape. New
+//     pickArchetypeName() helper picks the right variant; unknown /
+//     Enby falls back to the male form (most common in Torn).
+//   - detectArchetype now always returns an archetype for any detected
+//     family (mapped → that archetype, no map → General). The Loadout
+//     card's mismatch-note render branch is removed.
+//   - BUILD_GOALS.smasher entry: { str: 0.50, spd/def: 0.22 each,
+//     dex: 0.06 } with rules for Str ≥45%, Dex ≤10%, |spd-def| ≤10%.
+//
+// Zero new API calls — gender rides on the existing identifySelf basic
+// fetch.
+//
+// ─── UPDATE NOTES (0.6.79) ──────────────────────────────────────────
+// Phase 2 classifier fix: bonus names live under `b.title`, not `b.name`.
+// v0.6.76 assumed `name` based on a partial schema read; v0.6.78's
+// inline JSON debug surfaced the actual shape on user's Ithaca 37
+// (Powerful 17 + Specialist 33), Qsz-92 (Specialist 33), and Metal
+// Nunchakus (Empower 68). The classifier was silently dropping every
+// bonus because `b.name` was undefined on every entry.
+//
+// Fix: read `b.title || b.name` (defensive — both shapes work, so a
+// future Torn API rename in either direction stays compatible). Same
+// fallback applied to the family-evidence label so the Focus row shows
+// the right bonus name in the "·" list.
+//
+// Also stripped: v0.6.78's inline JSON debug span on every weapon row
+// and the console.log of the raw equipment payload in fetchEquipment.
+// Both served their purpose, both gone now.
+//
+// Expected result for the test loadout above: Focus row reads
+// "Pure damage · Specialist (Ithaca 37) · Powerful (Ithaca 37) ·
+// Specialist (Qsz-92)" with no archetype match note (Heavy Brawler +
+// Pure damage isn't one of the six v0.7 archetypes — Heavy Brawler
+// pairs with Debuff for "Crippler"). Future Phase 3 polish: add a
+// Heavy Brawler + Pure damage archetype, or rank Empower (Self-buff
+// 68%) high enough that it wins over Pure damage 83-total and surfaces
+// "Snowballer" (which matches any stat-shape).
+//
+// ─── UPDATE NOTES (0.6.77) ──────────────────────────────────────────
+// Bug fix: WAR Scorecard leaked prior-war fights once the active war
+// ended. Symptom: 13h 43m war ends, scorecard later reads "201h 26m
+// elapsed" with W/L counts mixing the just-finished war and every
+// ranked-war fight in storage (back to the prior war ~8 days earlier).
+//
+// Root cause: v0.6.72's fallback. When meta.activeWarTarget cleared
+// (Torn's /faction/?selections=basic stopped returning the war), the
+// WAR rawFilter dropped its time floor and the scorecard anchored on
+// the earliest fight in `views` — which for back-to-back-war players
+// is a prior war's first hit, not the current war's.
+//
+// Fix:
+//   - New meta.lastWarTarget snapshot. Captured automatically on the
+//     active → null transition (snapshotedFromActive=true, warEnd =
+//     now()). Also populated on cold start from the API's recently-
+//     ended wars within the 7-day TTL window, so users who install
+//     the fix POST-war still get the right scorecard back.
+//   - WAR rawFilter now reads activeWarTarget || lastWarTarget for
+//     both the warStart floor AND a new warEnd ceiling. Prior-war
+//     fights drop out of every WAR-scoped view.
+//   - computeWarScorecard returns isPostWar + warEndedAt so the
+//     render layer can flip the title to "Last War Scorecard" with
+//     an "ended Xh ago · vs Faction" subtitle.
+//   - lastWarTarget auto-purges after 7 days (LAST_WAR_TTL_SEC).
+//     Long enough to brag, short enough that the next war replaces
+//     the snapshot before context drifts.
+//
+// Zero new API calls. Pure refinement of the v0.6.72 active-war
+// detection layer.
+//
+// ─── UPDATE NOTES (0.6.76) ──────────────────────────────────────────
+// Phase 2 of the v0.7 Build Coherence rewrite — loadout-archetype
+// detection. The Equipped Loadout card now reads the `bonuses` array
+// on each equipped weapon, clusters the bonuses into six effect
+// families (DoT / Crit-burst / Debuff / Reward-on-KO / Self-buff /
+// Pure damage), and surfaces the dominant family + the 2-axis
+// archetype label when the family pairs with your stat-shape goal.
+//
+// Six recognized archetypes (user-validated 2026-05-29):
+//
+//   - Tank + DoT             → DOT Bill  (survive the fight while
+//                                          bleed/poison ticks them down)
+//   - Glass Cannon + Crit    → Crit Demon (kill before they react)
+//   - Heavy Brawler + Debuff → Crippler   (soak hits, strip their stats)
+//   - Chain Fighter + KO-rwd → Plunderer  (max payoff during chains)
+//   - Dodge + Pure damage    → Dancer     (untouchable, just keeps hitting)
+//   - Any  + Self-buff       → Snowballer (gets stronger as fight goes)
+//
+// Dodge is a new BUILD_GOALS entry alongside Glass Cannon / Tank /
+// Heavy Brawler / Chain / Grinder — pure-Dex evasion shape with a Dex
+// >= 35% rule and a Speed >= 20% floor (still need to land hits).
+//
+// When a family is detected but no archetype matches your selected
+// stat-shape goal, the card surfaces the mismatch as a quiet note
+// instead of hiding the signal. Phase 3 will turn that into a full
+// 2-axis verdict ("loadout says DoT, stats say Glass Cannon — pick
+// a side"). Phase 2 ships the building block; Phase 3 ships the
+// verdict.
+//
+// Bonus-name to family mapping covers 50+ entries from the Torn wiki
+// catalogue (see memory/reference_torn_weapon_bonuses.md). Body-part
+// hunters (Achilles / Crusher / Throttle etc.) and armor-bypass
+// (Penetrate / Puncture) are folded into Pure damage per user
+// feedback — real weapons but not a player identity. Pure-utility
+// bonuses (Storage / Parry / Hazardous / Sleep) are intentionally
+// unclassified.
+//
+// Existing v0.6.71 equipment cache lacks the bonuses array. The
+// 5-min poll throttle will refetch on the next cycle; users who
+// want the new card immediately can hit the panel header's poll-now
+// button (↻) once after installing.
+//
+// Zero new API calls. No behaviour change for any other tab.
+//
 // ─── UPDATE NOTES (0.6.75) ──────────────────────────────────────────
 // Equipped Loadout normaliser audited against the live /v2/user/
 // equipment response and fixed. The truncated v2 swagger schema led
@@ -526,7 +665,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.75';
+  const SCRIPT_VERSION    = '0.6.80';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -582,8 +721,15 @@
     { key: 'war', label: 'WAR',  ms: Infinity,
       rawFilter: r => {
         if (!r.ranked_war) return false;
-        const war = meta.activeWarTarget;
-        if (war && war.warStart && (r.timestamp_ended || 0) < war.warStart) return false;
+        // v0.6.77 — prefer activeWarTarget, fall back to lastWarTarget so
+        // the post-war WAR pill keeps showing the just-ended war's stats
+        // (not the union of every ranked-war fight in storage).
+        const war = meta.activeWarTarget || meta.lastWarTarget;
+        if (!war || !war.warStart) return true;
+        const ts = r.timestamp_ended || 0;
+        if (ts < war.warStart) return false;
+        // Ceiling only applies to ended wars — active wars set warEnd = 0.
+        if (war.warEnd && ts > war.warEnd) return false;
         return true;
       } },
   ];
@@ -627,6 +773,18 @@
         { msg: 'Dexterity should stay ≤10% (heavy-armor weight penalty is accepted)', check: s => s.dexterity / s.total <= 0.10 },
       ],
     },
+    smasher: {
+      label: 'Smasher',
+      blurb: 'All-offense bruiser. Maximum Strength damage with mid Speed + Defense to stay in the fight. Low Dex is by design — dump dodge, over-train the punch.',
+      targetShares: { strength: 0.50, speed: 0.22, defense: 0.22, dexterity: 0.06 },
+      alignedMaxL1: 0.22, driftMaxL1: 0.44,
+      rules: [
+        { msg: 'Strength should be ≥45% of total', check: s => s.strength / s.total >= 0.45 },
+        { msg: 'Dexterity should stay ≤10% of total', check: s => s.dexterity / s.total <= 0.10 },
+        { msg: 'Speed and Defense should stay within ~10% spread of each other',
+          check: s => Math.abs(s.speed/s.total - s.defense/s.total) <= 0.10 },
+      ],
+    },
     chain: {
       label: 'Chain Fighter',
       blurb: 'Balanced spread, slight Speed lean. Fast wins, energy-efficient, predictable.',
@@ -640,6 +798,16 @@
           } },
       ],
     },
+    dodge: {
+      label: 'Dodge / Evader',
+      blurb: 'Untouchable. Pure-Dex evasion build with enough Speed to land hits. Take little, give consistent.',
+      targetShares: { dexterity: 0.45, speed: 0.25, defense: 0.20, strength: 0.10 },
+      alignedMaxL1: 0.22, driftMaxL1: 0.44,
+      rules: [
+        { msg: 'Dexterity should be ≥35% of total', check: s => s.dexterity / s.total >= 0.35 },
+        { msg: 'Speed should stay ≥20% (still need to land hits)', check: s => s.speed / s.total >= 0.20 },
+      ],
+    },
     grinder: {
       label: 'Stat Grinder',
       blurb: 'Any distribution works — the goal is total growth via safe high-respect targets. Audit is informational only.',
@@ -648,6 +816,188 @@
       rules: [],
     },
   };
+
+  // ─── WEAPON-BONUS FAMILIES (v0.7 Phase 2) ──────────────────────────────
+  // Maps each Torn weapon-bonus name to one of six effect families. The
+  // loadout-archetype detector tallies bonus values per family across
+  // every equipped weapon and picks the dominant family. Source data: the
+  // full Torn wiki bonus catalogue, saved in
+  // memory/reference_torn_weapon_bonuses.md (53 entries; rarity tiers do
+  // not change the family classification).
+  //
+  // Six families, deliberately collapsed from the wiki's nine raw clusters
+  // per user-validated 2026-05-29 design:
+  //   - dot          → ticking damage over time (Bleed, Poisoned, …)
+  //   - crit_burst   → burst / multi-hit / crit (Deadeye, Execute, Fury, …)
+  //   - debuff       → strip opponent stats + lockdown (Wither, Stun, …)
+  //   - reward_ko    → maximize per-KO payoff (Plunder, Warlord, …)
+  //   - self_buff    → snowball / sustain (Bloodlust, Motivation, …)
+  //   - pure_dmg     → reliable hit-for-hit damage with no DoT/crit gimmick
+  //                    (Powerful, Specialist, Assassinate, plus body-part
+  //                    hunters and armor-bypass folded in)
+  //
+  // Bonuses not present in this table (Storage, Parry, Hazardous, Sleep,
+  // Spray, Smash, Blindfire, etc.) are intentionally unclassified — they
+  // are weapon-specific quirks or pure utility, not loadout themes.
+  const WEAPON_BONUS_FAMILIES = {
+    // DoT family
+    'Bleed':          'dot',
+    'Poisoned':       'dot',
+    'Laceration':     'dot',
+    'Burn':           'dot',
+    'Severe Burning': 'dot',
+    // Crit / burst family
+    'Deadeye':    'crit_burst',
+    'Expose':     'crit_burst',
+    'Deadly':     'crit_burst',
+    'Execute':    'crit_burst',
+    'Double Tap': 'crit_burst',
+    'Fury':       'crit_burst',
+    'Rage':       'crit_burst',
+    // Debuff + CC family
+    'Wither':      'debuff',
+    'Weaken':      'debuff',
+    'Slow':        'debuff',
+    'Cripple':     'debuff',
+    'Demoralized': 'debuff',
+    'Toxin':       'debuff',
+    'Freeze':      'debuff',
+    'Stun':        'debuff',
+    'Shock':       'debuff',
+    'Suppress':    'debuff',
+    'Paralyze':    'debuff',
+    'Disarm':      'debuff',
+    'Eviscerate':  'debuff',
+    // Reward-on-KO family
+    'Plunder':     'reward_ko',
+    'Proficience': 'reward_ko',
+    'Revitalize':  'reward_ko',
+    'Warlord':     'reward_ko',
+    'Stricken':    'reward_ko',
+    'Irradiate':   'reward_ko',
+    'Emasculate':  'reward_ko',
+    // Self-buff family
+    'Empower':    'self_buff',
+    'Quicken':    'self_buff',
+    'Motivation': 'self_buff',
+    'Bloodlust':  'self_buff',
+    'Grace':      'self_buff',
+    'Focus':      'self_buff',
+    'Comeback':   'self_buff',
+    'Sure Shot':  'self_buff',
+    'Conserve':   'self_buff',
+    // Pure-damage family (body-part hunters + armor-bypass folded in)
+    'Powerful':     'pure_dmg',
+    'Specialist':   'pure_dmg',
+    'Assassinate':  'pure_dmg',
+    'Wind-up':      'pure_dmg',
+    'Blindside':    'pure_dmg',
+    'Frenzy':       'pure_dmg',
+    'Berserk':      'pure_dmg',
+    'Smurf':        'pure_dmg',
+    'Finale':       'pure_dmg',
+    'Achilles':     'pure_dmg',
+    'Crusher':      'pure_dmg',
+    'Cupid':        'pure_dmg',
+    'Roshambo':     'pure_dmg',
+    'Throttle':     'pure_dmg',
+    'Backstab':     'pure_dmg',
+    'Penetrate':    'pure_dmg',
+    'Puncture':     'pure_dmg',
+    'Double-edged': 'pure_dmg',
+    // Weapon-specific damage bonuses — tied to single weapons but read as
+    // pure_dmg because each is a predictable damage multiplier, not a
+    // crit/random gimmick. A Sledgehammer-only user runs primarily on
+    // Smash, so we need to classify it or their loadout reads vanilla.
+    'Smash':        'pure_dmg',   // Sledgehammer: 2x on cooldown
+    'Spray':        'pure_dmg',   // Dual SMGs: 2x dump on full clip
+    'Blindfire':    'pure_dmg',   // MG3: dump remaining clip
+  };
+
+  const LOADOUT_FAMILY_LABELS = {
+    dot:        'DoT',
+    crit_burst: 'Crit / Burst',
+    debuff:     'Debuff',
+    reward_ko:  'Reward-on-KO',
+    self_buff:  'Self-buff',
+    pure_dmg:   'Pure damage',
+  };
+
+  // ─── ARCHETYPE LOOKUP (v0.7 Phase 2) ────────────────────────────────────
+  // 2-axis combination of stat-shape (BUILD_GOALS key) and dominant loadout
+  // family. Snowballer uses the '*' wildcard for stat-shape because
+  // self-buff loadouts identify a player regardless of how they trained
+  // their stats.
+  //
+  // v0.6.80 — full flavor renaming with male/female variants per the user's
+  // alliterative naming scheme. Names are picked by meta.gender (captured
+  // from Torn's basic API on identifySelf); unknown/Enby falls back to the
+  // male form. Mechanical descriptors live in the blurb so the name can be
+  // pure flavor. GENERAL_ARCHETYPE is the fallback when no specific combo
+  // matches — every loadout-with-bonuses gets a name now, no more mismatch
+  // dead ends.
+  const ARCHETYPES = {
+    'tank:dot': {
+      male: 'DoT Dan', female: 'DoT Diana',
+      blurb: 'Tank stat-shape + DoT weapons. Survive the fight while bleeding / poisoning them down.',
+    },
+    'glass_cannon:crit_burst': {
+      male: 'Critical Cody', female: 'Critical Candy',
+      blurb: 'Glass Cannon + crit / burst weapons. Kill before they get a turn.',
+    },
+    'heavy_brawler:debuff': {
+      male: 'Crippler Chris', female: 'Crippler Christine',
+      blurb: 'Heavy Brawler + debuff weapons. Soak hits while stripping their stats — the longer the fight, the worse it gets for them.',
+    },
+    'chain:reward_ko': {
+      male: 'Tricky Tony', female: 'Tricky Tammy',
+      blurb: 'Chain Fighter + finishing-hit tricks (Plunder, Warlord, Revitalize, Proficience). Maximize the per-KO payoff during chain runs.',
+    },
+    'dodge:pure_dmg': {
+      male: 'Dancer Donald', female: 'Dancer Donna',
+      blurb: 'Dodge stat-shape + reliable damage. Untouchable, just keeps hitting.',
+    },
+    'smasher:pure_dmg': {
+      male: 'Powerhouse Paul', female: 'Powerhouse Paula',
+      blurb: 'Smasher stat-shape + Powerful / Specialist loadout. No tricks, no DoT — just hits like a truck, over and over.',
+    },
+    '*:self_buff': {
+      male: 'Snowball Samuel', female: 'Snowball Samantha',
+      blurb: 'Self-buff loadout. Gets stronger as the fight goes on — Empower, Quicken, Bloodlust, Motivation stacks.',
+    },
+  };
+
+  // Fallback when stat-shape × loadout-family doesn't map to a recognized
+  // combo. Surfaces instead of a "no archetype match" note so every
+  // loadout-with-bonuses gets a label.
+  const GENERAL_ARCHETYPE = {
+    male: 'General George', female: 'General Georgia',
+    blurb: 'Custom hybrid — your stat-shape and loadout don\'t lock into a recognized archetype combo. Both axes are shown above as separate signals; read your build from the pair.',
+  };
+
+  // Pick the gender-appropriate name; default to male for unknown / Enby
+  // since the Torn community is heavily male-coded and the fallback should
+  // be the most-common form rather than null/empty.
+  function pickArchetypeName(entry) {
+    if (!entry) return null;
+    const g = String(meta.gender || '').toLowerCase();
+    if (g === 'female' && entry.female) return entry.female;
+    return entry.male || entry.female || null;
+  }
+
+  function detectArchetype(goalKey, familyKey) {
+    if (!familyKey) return null;
+    let entry = null;
+    if (familyKey === 'self_buff') {
+      entry = ARCHETYPES['*:self_buff'];
+    } else if (goalKey) {
+      entry = ARCHETYPES[goalKey + ':' + familyKey] || GENERAL_ARCHETYPE;
+    } else {
+      entry = GENERAL_ARCHETYPE;
+    }
+    if (!entry) return null;
+    return { name: pickArchetypeName(entry), blurb: entry.blurb };
+  }
 
   // ─── STORAGE ────────────────────────────────────────────────────────────
   // v0.6.59 — module-level error surface. `store()` and `load()` used to
@@ -1588,11 +1938,15 @@
 
   // ─── POLL CYCLE ─────────────────────────────────────────────────────────
   async function identifySelf() {
-    if (meta.userId && meta.level) return;
+    // v0.6.80 — also require gender so v0.7 Phase 2 can pick the right
+    // flavor-name variant (Tricky Tony vs Tricky Tammy, etc). Existing
+    // installs without a cached gender will refetch on next poll.
+    if (meta.userId && meta.level && meta.gender) return;
     const data = await apiGet(tornUrl('basic'));
     meta.userId   = data.player_id;
     meta.userName = data.name;
     if (typeof data.level === 'number') meta.level = data.level;
+    if (typeof data.gender === 'string') meta.gender = data.gender;
     if (!meta.firstPollTs) meta.firstPollTs = nowSec();
     store('meta', meta);
   }
@@ -1763,9 +2117,20 @@
   //   - API errors out (separate shorter retry throttle)
   const ACTIVE_WAR_REFRESH_SEC = 300;
   const ACTIVE_WAR_ERROR_RETRY_SEC = 120;
+  // v0.6.77 — when a war ends, keep the snapshot around for one week so the
+  // WAR pill can render a final read-only scorecard. Long enough to brag
+  // about it, short enough that the next war replaces the snapshot before
+  // any "I forgot which war this was" confusion can set in.
+  const LAST_WAR_TTL_SEC = 7 * 86400;
 
+  // v0.6.77 — now returns { active, recentlyEnded } so the caller can also
+  // populate meta.lastWarTarget on cold start (when we missed the active →
+  // null transition because TECH wasn't running). The API's ranked_wars
+  // object includes ended wars until Torn rotates them out, so this lets us
+  // reconstruct lastWarTarget even after a fresh install during the post-
+  // war window.
   async function fetchActiveRankedWar() {
-    if (!settings.apiKey) return null;
+    if (!settings.apiKey) return { active: null, recentlyEnded: null };
     if (isRateLimited()) {
       throw new Error('Rate-limited · retry in ' + rateLimitRemainingSec() + 's');
     }
@@ -1777,36 +2142,59 @@
     });
     const url = 'https://api.torn.com/faction/?' + qs.toString();
     const data = await apiGet(url, { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' });
-    if (!data || typeof data !== 'object') return null;
+    if (!data || typeof data !== 'object') return { active: null, recentlyEnded: null };
     const ourFactionId = data.ID;
-    if (!ourFactionId) return null;       // user isn't in a faction
+    if (!ourFactionId) return { active: null, recentlyEnded: null };
     const wars = data.ranked_wars || {};
+    let active = null;
+    let recentlyEnded = null;
+    const recentCutoff = nowSec() - LAST_WAR_TTL_SEC;
     for (const warIdStr in wars) {
       const w = wars[warIdStr];
       if (!w || !w.war) continue;
-      if (w.war.end && w.war.end !== 0) continue;   // war already ended
       const factions = w.factions || {};
+      let enemyFid = null, enemyName = null;
       for (const fIdStr in factions) {
         const fid = parseInt(fIdStr, 10);
         if (!Number.isFinite(fid) || fid === ourFactionId) continue;
-        return {
-          warId: parseInt(warIdStr, 10),
-          ourFactionId,
-          ourFactionName: data.name || '',
-          factionId: fid,
-          factionName: (factions[fIdStr] && factions[fIdStr].name) || ('Faction ' + fid),
-          warStart: w.war.start || 0,
-          refreshedAt: nowSec(),
-        };
+        enemyFid = fid;
+        enemyName = (factions[fIdStr] && factions[fIdStr].name) || ('Faction ' + fid);
+        break;
+      }
+      if (!enemyFid) continue;
+      const warEnd = w.war.end || 0;
+      const shape = {
+        warId: parseInt(warIdStr, 10),
+        ourFactionId,
+        ourFactionName: data.name || '',
+        factionId: enemyFid,
+        factionName: enemyName,
+        warStart: w.war.start || 0,
+        warEnd: warEnd,
+        refreshedAt: nowSec(),
+      };
+      if (warEnd === 0) {
+        active = shape;
+      } else if (warEnd >= recentCutoff) {
+        if (!recentlyEnded || warEnd > recentlyEnded.warEnd) recentlyEnded = shape;
       }
     }
-    return null;   // no active war
+    return { active, recentlyEnded };
   }
 
   function maybeRefreshActiveWar(force) {
     if (!settings.apiKey) return;
     if (isRateLimited()) return;
     const now = nowSec();
+    // v0.6.77 — purge stale lastWarTarget proactively so an ancient war
+    // doesn't keep haunting the WAR pill past its TTL. Runs on every refresh
+    // attempt, not just successful fetches, so the TTL holds even if the
+    // API is unreachable.
+    if (meta.lastWarTarget && meta.lastWarTarget.warEnd
+        && (now - meta.lastWarTarget.warEnd) > LAST_WAR_TTL_SEC) {
+      meta.lastWarTarget = null;
+      store('meta', meta);
+    }
     if (!force) {
       const cached = meta.activeWarTarget;
       if (cached && cached.refreshedAt
@@ -1822,12 +2210,34 @@
         return;
       }
     }
-    fetchActiveRankedWar().then(function (war) {
-      meta.activeWarTarget = war;
+    fetchActiveRankedWar().then(function (result) {
+      const newActive = result.active;
+      const apiRecentEnded = result.recentlyEnded;
+      const prevActive = meta.activeWarTarget;
+      // v0.6.77 — manage meta.lastWarTarget in three cases:
+      //   1. active → null transition: snapshot the war we just had,
+      //      stamping warEnd = now() because we don't have the exact
+      //      Torn-side end timestamp.
+      //   2. cold start with no prior active: trust the API's recently-
+      //      ended war (within TTL) if we don't already have a snapshot
+      //      or if the API's is more recent.
+      //   3. active → active (same war): no-op for lastWarTarget.
+      if (prevActive && !newActive) {
+        meta.lastWarTarget = Object.assign({}, prevActive, {
+          warEnd: nowSec(),
+          snapshotedFromActive: true,
+        });
+      } else if (!prevActive && apiRecentEnded) {
+        if (!meta.lastWarTarget
+            || apiRecentEnded.warEnd > (meta.lastWarTarget.warEnd || 0)) {
+          meta.lastWarTarget = apiRecentEnded;
+        }
+      }
+      meta.activeWarTarget = newActive;
       meta.activeWarCheckedAt = nowSec();
       meta.activeWarError = null;
       store('meta', meta);
-      if (war) maybeRefreshFactionChain(war.factionId);
+      if (newActive) maybeRefreshFactionChain(newActive.factionId);
       if (panelEl && contentEl && settings.activeTab === 'dashboard' && !currentDrill) {
         renderActive();
       }
@@ -2485,6 +2895,11 @@
           // Prefer sub_type ("Shotgun", "Pistol", "Body", ...) for the
           // inline label; fall back to the broad "Weapon"/"Armor" type.
           type: item.sub_type || item.type || '',
+          // v0.6.76 — preserve the bonuses array verbatim for the Phase 2
+          // loadout-archetype detector. Shape per entry is { name, value }
+          // (e.g. { name: 'Bleed', value: 45 }); we keep the raw form so
+          // the family classifier can defensively handle either shape.
+          bonuses: Array.isArray(item.bonuses) ? item.bonuses : [],
         };
       }
     } else if (eq && typeof eq === 'object') {
@@ -2496,6 +2911,7 @@
             id:   v.id || v.item_id || v.ID || null,
             name: v.name || '',
             type: v.sub_type || v.type || '',
+            bonuses: Array.isArray(v.bonuses) ? v.bonuses : [],
           };
         }
       }
@@ -2758,49 +3174,47 @@
   // denominator so a fresh war with 1 fight doesn't divide by zero.
   function computeWarScorecard(views, overview) {
     if (!views || views.length === 0) return null;
-    // v0.6.72 — prefer the official war start time from
-    // meta.activeWarTarget.warStart (populated by /faction/?selections=basic
-    // in v0.6.70). Fall back to the earliest fight ts only when no active
-    // war target is detected — typically because the war ended and the
-    // 5-min refresh cleared the target. Without this preference the clock
-    // mis-anchored to whichever ranked-war fight in storage was oldest,
-    // which during back-to-back wars produced days-long readings.
-    let startTs;
+    // v0.6.77 — three states the scorecard can render in:
+    //   1. Active war:  anchor on activeWarTarget; elapsed = running clock.
+    //   2. Post-war:    anchor on lastWarTarget (snapshot taken on the
+    //                   active → null transition, or pulled from the API's
+    //                   ranked_wars on cold start within 7 days). Elapsed
+    //                   is the fixed war duration, not a running clock.
+    //   3. Neither:     return null. v0.6.72 used to fall back to the
+    //                   earliest stored ranked-war fight here, which after
+    //                   a war ended leaked prior wars into the WAR pill
+    //                   and produced multi-day elapsed readings.
+    let startTs, endTs, isPostWar = false, anchor = null;
     const war = meta.activeWarTarget;
+    const lastWar = meta.lastWarTarget;
     if (war && war.warStart) {
+      anchor = war;
       startTs = war.warStart;
+      endTs = nowSec();
+    } else if (lastWar && lastWar.warStart) {
+      anchor = lastWar;
+      startTs = lastWar.warStart;
+      endTs = lastWar.warEnd || nowSec();
+      isPostWar = true;
     } else {
-      let earliestTs = Infinity;
-      for (const v of views) {
-        if (v.tsEnded && v.tsEnded < earliestTs) earliestTs = v.tsEnded;
-      }
-      if (!Number.isFinite(earliestTs)) return null;
-      startTs = earliestTs;
+      return null;
     }
-    const elapsedSec = Math.max(0, nowSec() - startTs);
-    // Pace divides over a 60s minimum so a single fresh fight yields a
-    // meaningful number rather than NaN/Infinity. Once you've been in
-    // war for >1 hour, the floor is irrelevant.
+    const elapsedSec = Math.max(0, endTs - startTs);
     const elapsedHoursForPace = Math.max(elapsedSec / 3600, 60 / 3600);
     const respectPerHour = overview.respectGained > 0
       ? overview.respectGained / elapsedHoursForPace
       : 0;
-    // v0.6.37 — knockdowns (broad) instead of hosps (narrow). overview.wins
-    // / overview.losses already use the broad outcome.win / outcome.loss
-    // flags, which cover every decisive ending: a "Leave them on the
-    // street" finish that knocks the opponent out reads as outcomeKey='win'
-    // (or 'loss' on the defender side), not necessarily 'hosp_*'. Same
-    // family of fixes as v0.6.29's verdict gate — narrow hospitalize-only
-    // counts misrepresent brutality when most chains use "Attacked"
-    // finishers to keep their own chain alive.
     return {
       wins:        overview.wins,
       losses:      overview.losses,
       respectNet:  overview.respectTotal,
-      koDelivered: overview.wins,   // every win = a decisive defeat you inflicted
-      koTaken:     overview.losses, // every loss = a decisive defeat you suffered
+      koDelivered: overview.wins,
+      koTaken:     overview.losses,
       elapsedSec,
       respectPerHour,
+      isPostWar,
+      warEndedAt:  isPostWar ? (lastWar.warEnd || null) : null,
+      enemyName:   (anchor && anchor.factionName) || null,
     };
   }
 
@@ -3381,6 +3795,71 @@
     }
 
     return { ready: true, goal, distribution, distanceL1, violations, verdict, topAction, simOutlook };
+  }
+
+  // ─── LOADOUT FAMILY DETECTOR (v0.7 Phase 2) ─────────────────────────────
+  // Walks the four weapon slots (primary, secondary, melee, temporary),
+  // reads each item's `bonuses` array, and tallies per-family scores. The
+  // family with the highest total bonus-value wins; ties broken by count.
+  // Returns null when no recognized bonuses are equipped (vanilla loadout).
+  //
+  // Scoring uses raw bonus value (the % the bonus rolls — Bleed 45, Poisoned
+  // 95, etc.) because higher-rolled bonuses represent more commitment to
+  // that effect. A weapon with a strong Bleed roll dominates the family
+  // signal over a weapon with a weak Plunder roll.
+  //
+  // `evidence` lists the contributing bonus + weapon pairs for the dominant
+  // family so the UI can show "DoT loadout — Bleed (Bread Knife), Poisoned
+  // (Blowgun)" instead of just the family name.
+  function computeLoadoutFamily(equipment) {
+    if (!equipment || !equipment.fetchedAt) return null;
+    const WEAPON_SLOTS = ['primary', 'secondary', 'melee', 'temporary'];
+    const tallies = {};
+    let totalValue = 0;
+    let totalCount = 0;
+    for (const slot of WEAPON_SLOTS) {
+      const item = equipment[slot];
+      if (!item || !Array.isArray(item.bonuses)) continue;
+      for (const b of item.bonuses) {
+        if (!b) continue;
+        // v0.6.79 — Torn's /v2/user/equipment uses `title` for the bonus
+        // name (verified against user's payload showing Specialist/
+        // Powerful/Empower with id+title+description+value fields).
+        // Defensive fallback to `name` in case Torn ever renames it.
+        const bonusName = b.title || b.name;
+        if (!bonusName) continue;
+        const family = WEAPON_BONUS_FAMILIES[bonusName];
+        if (!family) continue;
+        const value = typeof b.value === 'number' ? b.value : 1;
+        if (!tallies[family]) tallies[family] = { count: 0, value: 0, evidence: [] };
+        tallies[family].count += 1;
+        tallies[family].value += value;
+        tallies[family].evidence.push({ bonus: bonusName, weapon: item.name, value });
+        totalValue += value;
+        totalCount += 1;
+      }
+    }
+    if (totalCount === 0) return null;
+    // Pick dominant family by total value; count as tiebreak.
+    let dominantKey = null, dominant = null;
+    for (const key in tallies) {
+      const t = tallies[key];
+      if (!dominant
+          || t.value > dominant.value
+          || (t.value === dominant.value && t.count > dominant.count)) {
+        dominant = t;
+        dominantKey = key;
+      }
+    }
+    const share = dominant.value / totalValue;
+    return {
+      dominantKey,
+      dominantLabel: LOADOUT_FAMILY_LABELS[dominantKey] || dominantKey,
+      share,
+      evidence: dominant.evidence,
+      tallies,
+      totalCount,
+    };
   }
 
   const LEVEL_TRAP_GAP = 10;
@@ -4994,6 +5473,31 @@
       font-variant-numeric:tabular-nums;
       overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
 
+    /* v0.7 Phase 2 — Effect family + archetype rows on the Loadout card.
+       Family row sits directly under armor with the same dashed-border
+       treatment, but uses an ember accent on the family name to mark it
+       as the derived signal (vs the raw gear above). Archetype row uses
+       a left-edge violet bar to visually pair it with the stat-shape
+       Build Coherence verdict, since Phase 3 will fuse the two cards. */
+    .tech-loadout-family-row{display:flex;align-items:baseline;gap:8px;
+      font-size:11px;padding:6px 0 2px;margin-top:5px;
+      border-top:1px dashed #2a1f2e;}
+    .tech-loadout-family-name{color:#fb923c;font-weight:700;
+      letter-spacing:.5px;font-size:11px;}
+    .tech-loadout-family-evidence{color:#9ca3af;font-size:10px;flex:1;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+    .tech-loadout-archetype{margin:6px 0 0;padding:6px 8px 7px;
+      background:#0f0a12;border:1px solid #2a1f2e;border-left:3px solid #a855f7;
+      border-radius:3px;}
+    .tech-loadout-archetype-name{display:block;font:800 13px/1.1 Impact,'Oswald','Arial Narrow',sans-serif;
+      color:#fde047;letter-spacing:.05em;
+      text-shadow:0 0 6px rgba(168,85,247,.35);}
+    .tech-loadout-archetype-blurb{display:block;font-size:11px;color:#cbd5e1;
+      margin-top:3px;line-height:1.4;}
+    .tech-loadout-archetype.mismatch{border-left-color:#6b7280;}
+    .tech-loadout-archetype.mismatch .tech-loadout-archetype-blurb{
+      color:#9ca3af;font-style:italic;}
+
     /* Leveling Roadmap — v0.6.0 feature #9 */
     .tech-roadmap{border-left:3px solid #4b5563;padding-left:10px;}
     .tech-roadmap-line{color:#d1d5db;font-size:12px;margin:4px 0 8px;}
@@ -5176,6 +5680,15 @@
     .tech-warscore-title{font:800 11px/1 Impact,'Oswald','Arial Narrow',sans-serif;
       letter-spacing:2px;color:#fca5a5;text-transform:uppercase;margin-bottom:9px;
       text-shadow:0 0 6px rgba(220,38,38,.4);}
+    /* v0.6.77 — post-war variant. Cooler ember (less alarm-red) + subdued
+       top edge mark that the war's over, not running. Ended-Xh-ago + enemy
+       subtitle sits inline with the title in a quieter colour. */
+    .tech-warscore.postwar::before{background:linear-gradient(90deg,#7c3aed 0%,#f97316 50%,#7c3aed 100%);
+      box-shadow:0 0 6px rgba(168,85,247,.4);}
+    .tech-warscore.postwar .tech-warscore-title{color:#fde047;
+      text-shadow:0 0 6px rgba(168,85,247,.4);}
+    .tech-warscore-ended{color:#9ca3af;font-weight:600;letter-spacing:.5px;
+      text-transform:none;font-size:9px;}
     .tech-warscore-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
     .tech-warscore-cell{background:#08070b;border:1px solid #2a1f2e;border-radius:4px;
       padding:7px 10px;}
@@ -6118,6 +6631,35 @@
       el('span', { class: 'tech-loadout-armor-line' }, armorPieces.join(' · ')),
     ));
 
+    // v0.7 Phase 2 — Effect family + archetype. The detector returns null
+    // for vanilla loadouts (no recognized bonuses); we surface nothing in
+    // that case rather than printing "no archetype" noise. When a family
+    // is detected but no archetype matches the user's stat-shape, only the
+    // family line renders — that's still useful info on its own.
+    const family = computeLoadoutFamily(eq);
+    if (family) {
+      const evidenceText = family.evidence
+        .slice(0, 3)
+        .map(function (e) { return e.bonus + ' (' + e.weapon + ')'; })
+        .join(' · ');
+      card.appendChild(el('div', { class: 'tech-loadout-family-row' },
+        el('span', { class: 'tech-loadout-slot' }, 'Focus'),
+        el('span', { class: 'tech-loadout-family-name' }, family.dominantLabel),
+        el('span', { class: 'tech-loadout-family-evidence' }, '· ' + evidenceText),
+      ));
+      // v0.6.80 — detectArchetype now always returns a result for any
+      // detected loadout family: a mapped combo, the Snowballer wildcard
+      // for self_buff, or the General fallback. The mismatch-note branch
+      // is gone — every loadout-with-bonuses gets a name.
+      const archetype = detectArchetype(settings.buildGoal, family.dominantKey);
+      if (archetype) {
+        card.appendChild(el('div', { class: 'tech-loadout-archetype' },
+          el('span', { class: 'tech-loadout-archetype-name' }, archetype.name),
+          el('span', { class: 'tech-loadout-archetype-blurb' }, archetype.blurb),
+        ));
+      }
+    }
+
     host.appendChild(card);
   }
 
@@ -6339,8 +6881,18 @@
       if (sc) {
         const winLossClass = sc.wins >= sc.losses ? 'good' : 'bad';
         const respClass = sc.respectNet >= 0 ? 'good' : 'bad';
-        host.appendChild(el('div', { class: 'tech-warscore' },
-          el('div', { class: 'tech-warscore-title' }, 'War Scorecard'),
+        // v0.6.77 — post-war state flips the title to "Last War Scorecard"
+        // and adds an "ended Xh ago · vs Faction" subtitle so the user reads
+        // it as a final result rather than a still-running clock.
+        const titleText = sc.isPostWar ? 'Last War Scorecard' : 'War Scorecard';
+        const subtitle = sc.isPostWar
+          ? ('ended ' + (sc.warEndedAt ? fmtAgo(sc.warEndedAt) : 'recently')
+             + (sc.enemyName ? ' · vs ' + sc.enemyName : ''))
+          : null;
+        host.appendChild(el('div', { class: 'tech-warscore' + (sc.isPostWar ? ' postwar' : '') },
+          el('div', { class: 'tech-warscore-title' }, titleText,
+            subtitle ? el('span', { class: 'tech-warscore-ended' }, ' · ' + subtitle) : null,
+          ),
           el('div', { class: 'tech-warscore-grid' },
             el('div', { class: 'tech-warscore-cell ' + winLossClass },
               el('div', { class: 'big' }, sc.wins + ' / ' + sc.losses),
