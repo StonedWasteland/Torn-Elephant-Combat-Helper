@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.80
+// @version      0.6.81
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,6 +16,50 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ─── UPDATE NOTES (0.6.81) ──────────────────────────────────────────
+// Phase 3 of the v0.7 Build Coherence rewrite — the 2-axis verdict.
+// The existing single-axis stat-shape verdict (ALIGNED/DRIFTING/OFF
+// pill + colored card edge) is preserved as the at-a-glance signal,
+// but the card now also surfaces:
+//
+//   - Soft score + 5-dot confidence visual next to the verdict pill
+//     ("ALIGNED · ⬤⬤⬤⬤⬤ 95" or "DRIFTING · ⬤⬤⬤⬤◯ 72"). The dots
+//     give the granular "how close are you really" answer that the
+//     hard-bucketed verdict label can't.
+//   - A new LOADOUT ALIGNMENT section under the existing stat bars.
+//     Shows the loadout axis: dots + score + dominant family + match
+//     status vs the expected family for the user's stat-shape goal.
+//   - Family breakdown line when the loadout has more than one
+//     contributing family ("Pure damage 65% · Self-buff 35%").
+//   - Mismatch hint when the user's loadout and stat-shape disagree
+//     ("Smasher expects Pure damage but yours is DoT focus. Switch
+//     goal to Tank for DoT Dan, or swap weapons to Pure damage").
+//
+// New helpers:
+//   - STAT_TO_EXPECTED_FAMILY — inverse of ARCHETYPES, maps each
+//     stat-shape goal to the loadout family it "should" be running.
+//     Grinder excluded (no expectation).
+//   - scoreToDots(score) + dotsString(dots) — 0-100 score → 1-5 dot
+//     glyph, rendered inline with Unicode ⬤/◯.
+//   - computeLoadoutCoherence(equipment, goalKey) — the second axis.
+//     Returns loadoutScore (dominant family share × 100), allShares
+//     for the breakdown line, matchesExpected for the OK/mismatch
+//     status, and mismatchHint with actionable swap-or-retrain advice
+//     that points to the alternative stat-shape goal whose archetype
+//     would match the user's actual loadout.
+//
+// Stat-shape scoring formula: 100 - distanceL1 × 100 - 10 × violations,
+// floored at 0. Grinder always = 100 (no shape requirement).
+// Loadout scoring formula: dominant family value share × 100. 100 =
+// pure single-family loadout, lower = scattered across families.
+// Both feed into the same 5-dot confidence scale (80+ = 5 dots,
+// 60-79 = 4, 40-59 = 3, 20-39 = 2, <20 = 1).
+//
+// Self-buff is special-cased as "matches any goal" since Snowballer
+// is the wildcard archetype — never flagged as a mismatch.
+//
+// Zero new API calls. Pure analysis on data we already had.
+//
 // ─── UPDATE NOTES (0.6.80) ──────────────────────────────────────────
 // Phase 2 archetypes get full personality. All seven mapped archetypes
 // now have alliterative male/female flavor names that pair with the
@@ -665,7 +709,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.80';
+  const SCRIPT_VERSION    = '0.6.81';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -997,6 +1041,41 @@
     }
     if (!entry) return null;
     return { name: pickArchetypeName(entry), blurb: entry.blurb };
+  }
+
+  // ─── EXPECTED LOADOUT FAMILIES PER STAT-SHAPE (v0.7 Phase 3) ───────────
+  // Inverse of ARCHETYPES: for each stat-shape, what's the loadout family
+  // the user "should" be running for the canonical archetype? Used by the
+  // 2-axis Build Coherence verdict to detect mismatches ("you trained
+  // Smasher but your weapons say Tank — pick a side").
+  //
+  // Derived manually rather than scanning ARCHETYPES at runtime so the
+  // mapping stays explicit. Grinder excluded — Stat Grinder is the "any
+  // loadout works" goal, so any family is acceptable.
+  const STAT_TO_EXPECTED_FAMILY = {
+    tank:          'dot',
+    glass_cannon:  'crit_burst',
+    heavy_brawler: 'debuff',
+    chain:         'reward_ko',
+    dodge:         'pure_dmg',
+    smasher:       'pure_dmg',
+  };
+
+  // Soft scoring helpers (v0.7 Phase 3). 0-100 score → 1-5 confidence
+  // dots. 5 dots = locked in, 1 dot = nowhere near. The dots are pure
+  // glyph rendering — ⬤ filled + ◯ empty Unicode — no CSS needed for the
+  // dots themselves, just inherit text colour.
+  function scoreToDots(score) {
+    if (score == null) return 0;
+    if (score >= 80) return 5;
+    if (score >= 60) return 4;
+    if (score >= 40) return 3;
+    if (score >= 20) return 2;
+    return 1;
+  }
+  function dotsString(dots) {
+    const filled = Math.max(0, Math.min(5, dots));
+    return '⬤'.repeat(filled) + '◯'.repeat(5 - filled);
   }
 
   // ─── STORAGE ────────────────────────────────────────────────────────────
@@ -3794,7 +3873,19 @@
       } catch (e) { /* leave simOutlook null */ }
     }
 
-    return { ready: true, goal, distribution, distanceL1, violations, verdict, topAction, simOutlook };
+    // v0.7 Phase 3 — soft score (0-100) + 5-dot confidence visual.
+    // Supplementary to the existing ALIGNED/DRIFTING/OFF verdict — the
+    // pill keeps its color theming, the dots give a more granular read.
+    // Grinder = always 100 (no shape requirement). Otherwise: start at
+    // 100, subtract distanceL1 * 100 (so 20% L1 distance → 80), then
+    // subtract 10 per rule violation. Floor at 0.
+    let statScore = 100;
+    if (goalKey !== 'grinder' && goal.targetShares) {
+      statScore = Math.max(0, Math.round(100 - distanceL1 * 100 - violations.length * 10));
+    }
+    const statDots = scoreToDots(statScore);
+
+    return { ready: true, goal, distribution, distanceL1, violations, verdict, topAction, simOutlook, statScore, statDots };
   }
 
   // ─── LOADOUT FAMILY DETECTOR (v0.7 Phase 2) ─────────────────────────────
@@ -3859,6 +3950,91 @@
       evidence: dominant.evidence,
       tallies,
       totalCount,
+    };
+  }
+
+  // ─── LOADOUT COHERENCE (v0.7 Phase 3) ───────────────────────────────────
+  // Second axis of the 2-axis Build Verdict. Layers on top of
+  // computeLoadoutFamily by adding:
+  //   - loadoutScore (0-100): how concentrated the loadout is in its
+  //     dominant family. 100 = single-family pure (every bonus same
+  //     family); lower = scattered across multiple families.
+  //   - allShares: every family with non-zero contribution, sorted by
+  //     value share descending. Drives the "Family breakdown: X 65% ·
+  //     Y 25% · Z 10%" line so the user sees the full distribution.
+  //   - expected match: compares the dominant family to
+  //     STAT_TO_EXPECTED_FAMILY[goalKey] to detect goal/loadout mismatch.
+  //   - mismatchHint: actionable note when the user's loadout doesn't
+  //     match their stat-shape goal ("Switch to Tank for DoT Dan, or
+  //     swap to Pure damage weapons for Powerhouse Paul").
+  // Returns { ready: false, reason: 'vanilla' } when no recognized
+  // bonuses are equipped — caller skips the entire Loadout alignment
+  // section rather than printing a meaningless verdict.
+  function computeLoadoutCoherence(equipment, goalKey) {
+    const family = computeLoadoutFamily(equipment);
+    if (!family) {
+      return { ready: false, reason: 'vanilla' };
+    }
+    const loadoutScore = Math.round(family.share * 100);
+    const loadoutDots = scoreToDots(loadoutScore);
+    // Build sorted family breakdown across ALL contributing families.
+    let grandTotal = 0;
+    for (const k in family.tallies) grandTotal += family.tallies[k].value;
+    const allShares = [];
+    for (const k in family.tallies) {
+      allShares.push({
+        key: k,
+        label: LOADOUT_FAMILY_LABELS[k] || k,
+        share: grandTotal > 0 ? family.tallies[k].value / grandTotal : 0,
+        value: family.tallies[k].value,
+        count: family.tallies[k].count,
+      });
+    }
+    allShares.sort(function (a, b) { return b.share - a.share; });
+    // Expected-family + mismatch detection. Self-buff is special-cased:
+    // any goalKey accepts a self-buff loadout (it maps to Snowballer),
+    // so we never treat self-buff as a mismatch.
+    const expectedFamily = STAT_TO_EXPECTED_FAMILY[goalKey] || null;
+    let matchesExpected = null;   // null = no expectation (grinder, no goal, self-buff)
+    if (expectedFamily) {
+      if (family.dominantKey === 'self_buff') matchesExpected = null;
+      else matchesExpected = family.dominantKey === expectedFamily;
+    }
+    let mismatchHint = null;
+    if (matchesExpected === false) {
+      const expectedLabel = LOADOUT_FAMILY_LABELS[expectedFamily] || expectedFamily;
+      // Find which stat-shape would match the user's actual loadout
+      // dominant family so we can offer "OR change goal to X" advice.
+      let altGoalKey = null;
+      for (const gk in STAT_TO_EXPECTED_FAMILY) {
+        if (STAT_TO_EXPECTED_FAMILY[gk] === family.dominantKey) { altGoalKey = gk; break; }
+      }
+      const altGoalLabel = altGoalKey && BUILD_GOALS[altGoalKey] ? BUILD_GOALS[altGoalKey].label : null;
+      const altArchetype = altGoalKey
+        ? detectArchetype(altGoalKey, family.dominantKey)
+        : null;
+      const goalLabel = (BUILD_GOALS[goalKey] && BUILD_GOALS[goalKey].label) || goalKey;
+      mismatchHint = goalLabel + ' expects a ' + expectedLabel
+                   + ' loadout, but yours is ' + family.dominantLabel + ' focus.';
+      if (altGoalKey && altArchetype) {
+        mismatchHint += ' Switch goal to ' + altGoalLabel + ' for ' + altArchetype.name
+                      + ', or swap weapons to ' + expectedLabel + ' to match.';
+      } else {
+        mismatchHint += ' Either swap to ' + expectedLabel + ' weapons, or rethink the goal.';
+      }
+    }
+    return {
+      ready: true,
+      loadoutScore,
+      loadoutDots,
+      dominantKey: family.dominantKey,
+      dominantLabel: family.dominantLabel,
+      dominantShare: family.share,
+      allShares,
+      expectedFamily,
+      expectedLabel: expectedFamily ? (LOADOUT_FAMILY_LABELS[expectedFamily] || expectedFamily) : null,
+      matchesExpected,
+      mismatchHint,
     };
   }
 
@@ -5446,6 +5622,32 @@
     .tech-build-action{color:#fde047;font-size:12px;margin-top:6px;}
     .tech-build-action strong{color:#fbbf24;}
 
+    /* v0.7 Phase 3 — soft-score dots inline with the verdict pill, and
+       the new Loadout alignment section below the stat bars. Dots are
+       just Unicode glyphs (⬤ ◯); the .aligned/drift/off classes pick
+       a colour so the dots visually echo the verdict. */
+    .tech-build-dots{font-weight:600;font-variant-numeric:tabular-nums;
+      letter-spacing:.05em;}
+    .tech-build-dots.aligned{color:#34d399;}
+    .tech-build-dots.drift  {color:#fbbf24;}
+    .tech-build-dots.off    {color:#fca5a5;}
+    .tech-build-loadout{margin-top:10px;padding-top:8px;
+      border-top:1px dashed #2a1f2e;}
+    .tech-build-loadout-title{font:700 9px/1 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:1.5px;color:#a855f7;
+      margin-bottom:4px;}
+    .tech-build-loadout-score{font-size:12px;color:#d1d5db;line-height:1.4;}
+    .tech-build-loadout-score strong{color:#fb923c;letter-spacing:.3px;}
+    .tech-build-loadout-ok{color:#34d399;font-weight:600;}
+    .tech-build-loadout-bad{color:#fca5a5;font-weight:600;
+      text-shadow:0 0 4px rgba(220,38,38,.35);}
+    .tech-build-loadout-neutral{color:#9ca3af;font-style:italic;}
+    .tech-build-loadout-breakdown{font-size:10px;color:#9ca3af;margin-top:4px;
+      letter-spacing:.3px;font-variant-numeric:tabular-nums;}
+    .tech-build-loadout-hint{font-size:11px;color:#fde047;margin-top:6px;
+      padding:5px 8px;background:#1f1326;border-left:2px solid #f97316;
+      border-radius:2px;line-height:1.4;}
+
     /* v0.6.71 — Equipped Loadout card (Phase 1 of v0.7 Build Coherence
        rewrite). Compact stacked list of weapon slots with optional
        wiki-derived dmg/acc readout; armor pieces packed into a single
@@ -6798,7 +7000,17 @@
       const card = el('div', { class: 'tech-section tech-build ' + bc.verdict.className });
       card.appendChild(el('div', { class: 'tech-section-title' },
         'Build Coherence · ', el('span', { class: 'tech-build-goal' }, bc.goal.label)));
-      card.appendChild(el('div', { class: 'tech-intel-verdict ' + bc.verdict.className }, bc.verdict.label));
+      // v0.7 Phase 3 — verdict pill gets the soft score + 5-dot
+      // confidence visual appended after the hard-verdict label. Pill
+      // colour still drives at-a-glance reading; dots+score give the
+      // granular "how close are you really" answer.
+      const verdictChildren = [bc.verdict.label];
+      if (bc.statScore != null) {
+        verdictChildren.push(el('span', { class: 'tech-build-dots ' + bc.verdict.className },
+          ' · ' + dotsString(bc.statDots) + ' ' + bc.statScore));
+      }
+      card.appendChild(el('div', { class: 'tech-intel-verdict ' + bc.verdict.className },
+        ...verdictChildren));
 
       if (bc.verdict.key === 'waiting') {
         card.appendChild(el('div', { class: 'tech-build-hint' },
@@ -6844,6 +7056,51 @@
             `vs an even-stats opponent your shape wins ~${pct}% `,
             el('span', { class: 'tech-tag' }, bc.simOutlook.calibration),
           ));
+        }
+        // v0.7 Phase 3 — second axis of the Build Verdict: loadout
+        // coherence. Skipped entirely when the user has vanilla weapons
+        // (no recognized bonuses). Otherwise surfaces score+dots,
+        // dominant-family vs expected-family match status, family
+        // breakdown, and mismatch hint when goal+loadout disagree.
+        const loadCoh = computeLoadoutCoherence(meta.equipment, settings.buildGoal);
+        if (loadCoh.ready) {
+          const isGrinder = settings.buildGoal === 'grinder';
+          const matchStatus = isGrinder ? 'aligned'
+                            : loadCoh.matchesExpected === true ? 'aligned'
+                            : loadCoh.matchesExpected === false ? 'off'
+                            : 'drift';   // null = self_buff or no expectation
+          card.appendChild(el('div', { class: 'tech-build-loadout' },
+            el('div', { class: 'tech-build-loadout-title' }, 'Loadout alignment'),
+            el('div', { class: 'tech-build-loadout-score' },
+              el('span', { class: 'tech-build-dots ' + matchStatus },
+                dotsString(loadCoh.loadoutDots) + ' ' + loadCoh.loadoutScore),
+              ' — ',
+              el('strong', {}, loadCoh.dominantLabel),
+              ' focus (' + Math.round(loadCoh.dominantShare * 100) + '% of bonus value)',
+              loadCoh.matchesExpected === true
+                ? el('span', { class: 'tech-build-loadout-ok' }, ' ✓ matches ' + bc.goal.label)
+                : loadCoh.matchesExpected === false
+                  ? el('span', { class: 'tech-build-loadout-bad' },
+                      ' ✗ ' + bc.goal.label + ' expects ' + loadCoh.expectedLabel)
+                  : loadCoh.dominantKey === 'self_buff'
+                    ? el('span', { class: 'tech-build-loadout-ok' }, ' ✓ Self-buff matches any goal')
+                    : el('span', { class: 'tech-build-loadout-neutral' },
+                        ' · ' + bc.goal.label + ' has no specific expectation'),
+            ),
+          ));
+          // Family breakdown — only render when more than one family
+          // contributed, otherwise it's just the dominant restated.
+          if (loadCoh.allShares.length > 1) {
+            const breakdownText = loadCoh.allShares
+              .map(function (s) { return s.label + ' ' + Math.round(s.share * 100) + '%'; })
+              .join(' · ');
+            card.appendChild(el('div', { class: 'tech-build-loadout-breakdown' },
+              'Family breakdown: ' + breakdownText));
+          }
+          if (loadCoh.mismatchHint) {
+            card.appendChild(el('div', { class: 'tech-build-loadout-hint' },
+              loadCoh.mismatchHint));
+          }
         }
       }
       host.appendChild(card);
