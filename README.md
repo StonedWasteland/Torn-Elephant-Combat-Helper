@@ -57,7 +57,7 @@ Tampermonkey checks for updates automatically. To force an update, open the dash
 - **Targets queue** — pin opponents from any Opponent Intel drill. Live online status, hospital countdowns, and a green **HIT** badge when they're attackable and you have the energy. Optional browser notification when a pinned target leaves hospital/jail/abroad.
 - **Stats grid** — win rate, respect net, hospitalisation counts (both directions), respect-per-bar, filtered by 24H / 7D / 30D / All / **WAR** windows.
 - **War Scorecard** — dedicated hero panel that appears when the WAR window is active. W/L, net respect, time elapsed, respect-per-hour pace, KO counts both directions.
-- **Build Coherence** — pick a build goal (Glass Cannon, Tank, Heavy Brawler, Chain Fighter, Stat Grinder) and the dashboard audits your actual stat distribution against the target shape. Surfaces the biggest gap to close and runs a 500-trial sim against an even-stats reference to validate the shape itself.
+- **Build Coherence** — pick a build goal (Glass Cannon, Tank, Heavy Brawler, Chain Fighter, Stat Grinder, Dodge, Smasher) and the dashboard delivers a two-axis verdict: how well your stats match the goal, AND how concentrated your weapon-bonus loadout is around a single effect family (DoT, Crit/burst, Debuff, Reward-on-KO, Self-buff, Pure damage). The two axes resolve to a named archetype — DoT Dan, Critical Cody, Powerhouse Paul, Tricky Tony, and 8 more (gendered variants for female characters). When your stats and loadout disagree, the card surfaces both paths: swap weapons toward the canonical family for your goal, or switch goals to match the loadout you're already running. Equipped Loadout card below shows all 9 slots, polled every 5 min.
 - **Leveling Trap Detector** — aggregates incoming-attacker levels and renders a verdict: NORMAL / WATCH / FARM TARGET / OUT-STATTING. Stat-builder-safe: distinguishes "high-level chainers can't dent me" from "I'm getting farmed."
 - **Difficulty Roadmap** — buckets your outgoing fights by Torn's fair-fight modifier (FF 1.0–3.0) and ranks each bracket PRIME / SAFE / CONTESTED / AVOID. Tells you where you actually win, not where you "should" be hunting.
 
@@ -125,7 +125,7 @@ Tampermonkey menu commands (right-click the TM icon → TECH):
 - **Export your data anytime:** Settings tab → **Export fights (JSON)** or the Tampermonkey menu command. The export includes all stored fights and the live DOM event buffer.
 - **Wipe your data anytime:** Settings tab → **Clear all data**. Nuclear option, no undo.
 
-The userscript is one file with no dependencies. Read it. Audit it. It's ~7,000 lines of plain JavaScript.
+The userscript is one file with no dependencies. Read it. Audit it. It's ~9,500 lines of plain JavaScript.
 
 ---
 

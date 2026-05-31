@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.6.81
+// @version      0.7.0
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -16,690 +16,87 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (0.6.81) ──────────────────────────────────────────
-// Phase 3 of the v0.7 Build Coherence rewrite — the 2-axis verdict.
-// The existing single-axis stat-shape verdict (ALIGNED/DRIFTING/OFF
-// pill + colored card edge) is preserved as the at-a-glance signal,
-// but the card now also surfaces:
-//
-//   - Soft score + 5-dot confidence visual next to the verdict pill
-//     ("ALIGNED · ⬤⬤⬤⬤⬤ 95" or "DRIFTING · ⬤⬤⬤⬤◯ 72"). The dots
-//     give the granular "how close are you really" answer that the
-//     hard-bucketed verdict label can't.
-//   - A new LOADOUT ALIGNMENT section under the existing stat bars.
-//     Shows the loadout axis: dots + score + dominant family + match
-//     status vs the expected family for the user's stat-shape goal.
-//   - Family breakdown line when the loadout has more than one
-//     contributing family ("Pure damage 65% · Self-buff 35%").
-//   - Mismatch hint when the user's loadout and stat-shape disagree
-//     ("Smasher expects Pure damage but yours is DoT focus. Switch
-//     goal to Tank for DoT Dan, or swap weapons to Pure damage").
-//
-// New helpers:
-//   - STAT_TO_EXPECTED_FAMILY — inverse of ARCHETYPES, maps each
-//     stat-shape goal to the loadout family it "should" be running.
-//     Grinder excluded (no expectation).
-//   - scoreToDots(score) + dotsString(dots) — 0-100 score → 1-5 dot
-//     glyph, rendered inline with Unicode ⬤/◯.
-//   - computeLoadoutCoherence(equipment, goalKey) — the second axis.
-//     Returns loadoutScore (dominant family share × 100), allShares
-//     for the breakdown line, matchesExpected for the OK/mismatch
-//     status, and mismatchHint with actionable swap-or-retrain advice
-//     that points to the alternative stat-shape goal whose archetype
-//     would match the user's actual loadout.
-//
-// Stat-shape scoring formula: 100 - distanceL1 × 100 - 10 × violations,
-// floored at 0. Grinder always = 100 (no shape requirement).
-// Loadout scoring formula: dominant family value share × 100. 100 =
-// pure single-family loadout, lower = scattered across families.
-// Both feed into the same 5-dot confidence scale (80+ = 5 dots,
-// 60-79 = 4, 40-59 = 3, 20-39 = 2, <20 = 1).
-//
-// Self-buff is special-cased as "matches any goal" since Snowballer
-// is the wildcard archetype — never flagged as a mismatch.
-//
-// Zero new API calls. Pure analysis on data we already had.
-//
-// ─── UPDATE NOTES (0.6.80) ──────────────────────────────────────────
-// Phase 2 archetypes get full personality. All seven mapped archetypes
-// now have alliterative male/female flavor names that pair with the
-// user's character gender, and a "General" fallback covers any combo
-// that doesn't map to a specific archetype — every loadout-with-bonuses
-// gets a label, no more dead-end "no match" notes.
-//
-// New stat-shape goal: SMASHER — all-offense Strength build with mid
-// Speed + Defense and low Dex (Str ≥45%, Dex ≤10%, Spd/Def within
-// ~10% of each other). Sits alongside Heavy Brawler as the "punchier
-// less-tanky cousin" — same general direction, more raw offense.
-//
-// Archetype map (male / female):
-//   Tank          × DoT             → DoT Dan / DoT Diana
-//   Glass Cannon  × Crit / Burst    → Critical Cody / Critical Candy
-//   Heavy Brawler × Debuff          → Crippler Chris / Crippler Christine
-//   Chain Fighter × Reward-on-KO    → Tricky Tony / Tricky Tammy
-//   Dodge/Evader  × Pure damage     → Dancer Donald / Dancer Donna
-//   Smasher       × Pure damage     → Powerhouse Paul / Powerhouse Paula
-//   Any shape     × Self-buff       → Snowball Samuel / Snowball Samantha
-//   (no specific combo)             → General George / General Georgia
-//
-// Implementation:
-//   - meta.gender captured from Torn's /user/?selections=basic on
-//     identifySelf. Existing installs without a cached gender refetch
-//     on next poll (added to the early-out check).
-//   - ARCHETYPES entries now { male, female, blurb } shape. New
-//     pickArchetypeName() helper picks the right variant; unknown /
-//     Enby falls back to the male form (most common in Torn).
-//   - detectArchetype now always returns an archetype for any detected
-//     family (mapped → that archetype, no map → General). The Loadout
-//     card's mismatch-note render branch is removed.
-//   - BUILD_GOALS.smasher entry: { str: 0.50, spd/def: 0.22 each,
-//     dex: 0.06 } with rules for Str ≥45%, Dex ≤10%, |spd-def| ≤10%.
-//
-// Zero new API calls — gender rides on the existing identifySelf basic
-// fetch.
-//
-// ─── UPDATE NOTES (0.6.79) ──────────────────────────────────────────
-// Phase 2 classifier fix: bonus names live under `b.title`, not `b.name`.
-// v0.6.76 assumed `name` based on a partial schema read; v0.6.78's
-// inline JSON debug surfaced the actual shape on user's Ithaca 37
-// (Powerful 17 + Specialist 33), Qsz-92 (Specialist 33), and Metal
-// Nunchakus (Empower 68). The classifier was silently dropping every
-// bonus because `b.name` was undefined on every entry.
-//
-// Fix: read `b.title || b.name` (defensive — both shapes work, so a
-// future Torn API rename in either direction stays compatible). Same
-// fallback applied to the family-evidence label so the Focus row shows
-// the right bonus name in the "·" list.
-//
-// Also stripped: v0.6.78's inline JSON debug span on every weapon row
-// and the console.log of the raw equipment payload in fetchEquipment.
-// Both served their purpose, both gone now.
-//
-// Expected result for the test loadout above: Focus row reads
-// "Pure damage · Specialist (Ithaca 37) · Powerful (Ithaca 37) ·
-// Specialist (Qsz-92)" with no archetype match note (Heavy Brawler +
-// Pure damage isn't one of the six v0.7 archetypes — Heavy Brawler
-// pairs with Debuff for "Crippler"). Future Phase 3 polish: add a
-// Heavy Brawler + Pure damage archetype, or rank Empower (Self-buff
-// 68%) high enough that it wins over Pure damage 83-total and surfaces
-// "Snowballer" (which matches any stat-shape).
-//
-// ─── UPDATE NOTES (0.6.77) ──────────────────────────────────────────
-// Bug fix: WAR Scorecard leaked prior-war fights once the active war
-// ended. Symptom: 13h 43m war ends, scorecard later reads "201h 26m
-// elapsed" with W/L counts mixing the just-finished war and every
-// ranked-war fight in storage (back to the prior war ~8 days earlier).
-//
-// Root cause: v0.6.72's fallback. When meta.activeWarTarget cleared
-// (Torn's /faction/?selections=basic stopped returning the war), the
-// WAR rawFilter dropped its time floor and the scorecard anchored on
-// the earliest fight in `views` — which for back-to-back-war players
-// is a prior war's first hit, not the current war's.
-//
-// Fix:
-//   - New meta.lastWarTarget snapshot. Captured automatically on the
-//     active → null transition (snapshotedFromActive=true, warEnd =
-//     now()). Also populated on cold start from the API's recently-
-//     ended wars within the 7-day TTL window, so users who install
-//     the fix POST-war still get the right scorecard back.
-//   - WAR rawFilter now reads activeWarTarget || lastWarTarget for
-//     both the warStart floor AND a new warEnd ceiling. Prior-war
-//     fights drop out of every WAR-scoped view.
-//   - computeWarScorecard returns isPostWar + warEndedAt so the
-//     render layer can flip the title to "Last War Scorecard" with
-//     an "ended Xh ago · vs Faction" subtitle.
-//   - lastWarTarget auto-purges after 7 days (LAST_WAR_TTL_SEC).
-//     Long enough to brag, short enough that the next war replaces
-//     the snapshot before context drifts.
-//
-// Zero new API calls. Pure refinement of the v0.6.72 active-war
-// detection layer.
-//
-// ─── UPDATE NOTES (0.6.76) ──────────────────────────────────────────
-// Phase 2 of the v0.7 Build Coherence rewrite — loadout-archetype
-// detection. The Equipped Loadout card now reads the `bonuses` array
-// on each equipped weapon, clusters the bonuses into six effect
-// families (DoT / Crit-burst / Debuff / Reward-on-KO / Self-buff /
-// Pure damage), and surfaces the dominant family + the 2-axis
-// archetype label when the family pairs with your stat-shape goal.
-//
-// Six recognized archetypes (user-validated 2026-05-29):
-//
-//   - Tank + DoT             → DOT Bill  (survive the fight while
-//                                          bleed/poison ticks them down)
-//   - Glass Cannon + Crit    → Crit Demon (kill before they react)
-//   - Heavy Brawler + Debuff → Crippler   (soak hits, strip their stats)
-//   - Chain Fighter + KO-rwd → Plunderer  (max payoff during chains)
-//   - Dodge + Pure damage    → Dancer     (untouchable, just keeps hitting)
-//   - Any  + Self-buff       → Snowballer (gets stronger as fight goes)
-//
-// Dodge is a new BUILD_GOALS entry alongside Glass Cannon / Tank /
-// Heavy Brawler / Chain / Grinder — pure-Dex evasion shape with a Dex
-// >= 35% rule and a Speed >= 20% floor (still need to land hits).
-//
-// When a family is detected but no archetype matches your selected
-// stat-shape goal, the card surfaces the mismatch as a quiet note
-// instead of hiding the signal. Phase 3 will turn that into a full
-// 2-axis verdict ("loadout says DoT, stats say Glass Cannon — pick
-// a side"). Phase 2 ships the building block; Phase 3 ships the
-// verdict.
-//
-// Bonus-name to family mapping covers 50+ entries from the Torn wiki
-// catalogue (see memory/reference_torn_weapon_bonuses.md). Body-part
-// hunters (Achilles / Crusher / Throttle etc.) and armor-bypass
-// (Penetrate / Puncture) are folded into Pure damage per user
-// feedback — real weapons but not a player identity. Pure-utility
-// bonuses (Storage / Parry / Hazardous / Sleep) are intentionally
-// unclassified.
-//
-// Existing v0.6.71 equipment cache lacks the bonuses array. The
-// 5-min poll throttle will refetch on the next cycle; users who
-// want the new card immediately can hit the panel header's poll-now
-// button (↻) once after installing.
-//
-// Zero new API calls. No behaviour change for any other tab.
-//
-// ─── UPDATE NOTES (0.6.75) ──────────────────────────────────────────
-// Equipped Loadout normaliser audited against the live /v2/user/
-// equipment response and fixed. The truncated v2 swagger schema led
-// v0.6.71 to treat `item.slot` as a string slot-name; the actual
-// payload encodes it as integer 1-9 (with the temporary slot wedged
-// non-intuitively between body and helmet). v0.6.75 adds an explicit
-// EQUIPMENT_SLOT_BY_NUMBER lookup, prefers `sub_type` over `type` for
-// the inline label (so the card reads "Shotgun" / "Pistol" / "Body"
-// instead of the broad "Weapon" / "Armor"), and drops the v0.6.73
-// in-panel debug block + first-fetch console diagnostic now that the
-// shape is verified.
-//
-// No new API calls. No behaviour change for any other tab.
-//
-// ─── UPDATE NOTES (0.6.72) ──────────────────────────────────────────
-// Bug fix: War Scorecard elapsed-time clock + every WAR-pill stat were
-// silently including ranked-war fights from PRIOR wars, not just the
-// current one. Symptom: scorecard reads "191h 54m elapsed" four hours
-// into a fresh war, because the oldest ranked-war fight in storage
-// dates back to the last war 8 days ago.
-//
-// Root cause: WAR window's rawFilter only checked `r.ranked_war`. No
-// timestamp floor. The v0.6.70 active-war detection already gives us
-// the current war's exact start time via meta.activeWarTarget.warStart,
-// but nothing was using it for scoping.
-//
-// Fix:
-//   - WAR rawFilter now also requires r.timestamp_ended >= warStart
-//     when an active war target is detected. Prior-war fights drop
-//     out of every WAR-scoped view (Dashboard cards, Fights tab,
-//     Roadmap, Trap detector, War Scorecard).
-//   - computeWarScorecard now uses warStart for the elapsed clock
-//     with the earliest-fight fallback only when no active war target
-//     is cached (war ended + 5-min refresh cleared it).
-//
-// Zero new API calls. Pure filter-tightening on data we already had.
-//
-// ─── UPDATE NOTES (0.6.71) ──────────────────────────────────────────
-// Phase 1 of the v0.7 Build Coherence rewrite — Equipped Loadout card
-// on the Dashboard. Polls /v2/user/equipment every 5 minutes and
-// surfaces your currently equipped weapons + armor below the existing
-// Build Coherence verdict.
-//
-// Each weapon slot (Primary / Secondary / Melee / Temp) renders the
-// equipped item's name, type, and — when the name matches an entry in
-// the WEAPONS wiki table — an inline "dmg X · acc Y" readout pulled
-// from the wiki midpoints (same table that powers the TEST sim). The
-// armor row packs Helmet / Body / Pants / Boots / Gloves into a single
-// dash-separated line so the card stays vertically tight.
-//
-// Phase 2 will add a loadout-archetype classifier (Dodge / Sniper /
-// Brawler / Burner / Bleeder / Suppressor / Critter / Counter) so the
-// card detects which fighting style your gear maps to. Phase 3
-// replaces the single-axis Build Coherence card with a 2-axis verdict
-// (stat-shape × loadout-archetype) using soft scoring + confidence
-// dots, comparing goal vs actual side-by-side.
-//
-// Cost: +1 API call per 5 minutes. Modest against TECH's idle budget.
-//
-// ─── UPDATE NOTES (0.6.70) ──────────────────────────────────────────
-// Dual chain pills on the Dashboard during an active ranked war. TECH
-// now auto-detects your faction's current ranked-war target via the
-// /faction/?selections=basic endpoint (throttled to 5 minutes); when a
-// war is in progress, the chain pill at the top of the Dashboard
-// splits into a side-by-side pair — your chain on the left, the enemy
-// faction's chain on the right. Both pills tick independently, both
-// urgency-color the same way (green safe / amber <120s / red pulse
-// <60s), so a glance at the Dashboard answers "should we be chaining"
-// AND "are they vulnerable" simultaneously.
-//
-// In dual-pill mode both sides always render — including an idle "No
-// active chain" placeholder when one side has nothing going. That's
-// deliberate: "you have no chain, but they're at 47" is itself
-// actionable war intel ("we need to start chaining now"). When no
-// active war is detected, the Dashboard falls back to the original
-// single-pill behavior (idle = no pill at all, no clutter during
-// regular play).
-//
-// Implementation:
-//   - New fetchActiveRankedWar() hits /faction/?selections=basic with
-//     the user's key (no faction ID needed — returns their own faction).
-//     Scans ranked_wars for an entry whose war.end === 0, picks the
-//     non-self faction in war.factions as the opponent.
-//   - maybeRefreshActiveWar() handles the 5-minute throttle with a
-//     separate 2-minute error retry. Wired into the poll cycle as a
-//     fire-and-forget call after fetchSelfState.
-//   - meta.activeWarTarget caches the detected war so the dashboard
-//     doesn't re-fetch on every render.
-//   - renderChainPill and renderFactionChainPill both gained an opts
-//     parameter (label / forceIdle / compact / skipMargin); signatures
-//     stay backward-compatible. The Faction Intel drill view is
-//     untouched — it still gets the full header row + refresh button.
-//
-// Cost: +1 API call per 5 minutes when not throttled and no error.
-// Negligible against the ~1-2/min idle TECH budget.
-//
-// ─── UPDATE NOTES (0.6.69) ──────────────────────────────────────────
-// Scout tab hospital tracker. Each roster row now leads with a colored
-// status dot (locked/abroad/online/idle/offline) matching the Targets
-// queue, and locked rows render a live "Hosp 14:23" / "Jail 2h 14m" /
-// "Fed 5h 12m" countdown that ticks every second. Two new sort options:
-//
-//   - Hospital (out soonest) — locked rows ranked by closest release,
-//     hittable + abroad rows sink to the end. War-prep queue at a
-//     glance.
-//   - Status (hittable first) — Okay > Hospital/Jail/Fed (soonest out)
-//     > Traveling/Abroad. Mirrors the Targets queue's tier ordering.
-//
-// Implementation: fetchFactionRoster() now captures status.until and
-// last_action.status alongside the existing state field. Row layout
-// stacks name + verdict in a tech-scout-main column wrapper so the
-// status dot has a fixed seat on the left. The 1Hz ticker is
-// self-cancelling on disconnect — tab switch / panel close / drill
-// open all stop it without a manual clear. When a countdown elapses
-// the badge greys out and reads "out" until the next roster fetch
-// reconfirms the live state.
-//
-// Same rate-limit posture as before — uses already-cached roster data;
-// no new API calls.
-//
-// ─── UPDATE NOTES (0.6.63) ──────────────────────────────────────────
-// Bugfix on v0.6.62: the HIT badge linked to /loader.php?sid=attack
-// but Torn has migrated attack pages to /page.php?sid=attack. The old
-// URL now returns:
-//   "This endpoint is no longer available. Please use the new
-//    endpoints instead (page.php)."
-//
-// Three call sites touch this URL — all updated:
-//   1. The HIT badge link (renderTargetQueue) — now points at /page.php.
-//      Outgoing only, /loader.php is dead.
-//   2. getActiveOpponentFromUrl() (Active-Page Banner) — now accepts
-//      BOTH /page.php and /loader.php so stale links still trigger
-//      the banner. Banner is URL-based intel, doesn't depend on the
-//      page actually loading.
-//   3. isAttackPage() (DOM hook gate) — same: accept both so the
-//      hook attaches on the new URL going forward. On the legacy
-//      /loader.php URL Torn shows an error page with no combat log,
-//      so parseLogRow returns null and nothing breaks.
-//
-// Caught by user the first time the HIT badge was clicked in v0.6.62.
-//
-// ─── UPDATE NOTES (0.6.62) ──────────────────────────────────────────
-// UX fix: the ⚡ HIT badge on Targets queue rows now actually attacks.
-// Previously it was a visual marker only — clicking it triggered the
-// row's drill-into-intel handler, same as clicking anywhere else on
-// the row. Bad UX: badge says "hittable now" but doesn't get you any
-// closer to actually hitting.
-//
-// Now the badge is an <a> element linking to
-// /loader.php?sid=attack&user2ID={id}. Click → go straight to attack
-// page. stopPropagation keeps the row's drill handler from firing too,
-// so the row-vs-badge distinction is preserved: badge = attack, row
-// elsewhere = open Opponent Intel.
-//
-// Right-click → "open in new tab" works naturally because it's a real
-// anchor. CSS adds `text-decoration:none` and a hover brightness bump
-// so the badge keeps its existing look but reads as clickable.
-//
-// ─── UPDATE NOTES (0.6.61) ──────────────────────────────────────────
-// Chain-break browser notification. Opt-in via Settings. Background
-// watcher runs every 5 seconds reading the chain state from Torn's
-// sidebar (same zero-API-cost path the chain pill uses) and fires a
-// browser notification when an active chain drops below 60s remaining.
-//
-// Runs independent of the panel — the existing chain pill ticker only
-// ticks while the Dashboard is rendered, so a user with TECH minimized
-// scrolling Reddit wouldn't otherwise catch a chain about to break.
-// The watcher closes that gap with one ping when it matters.
-//
-// Dedup: fires ONCE per critical dip. State resets when chain bounces
-// back above 90s (i.e., a fresh hit landed) so consecutive critical-low
-// events on the same chain re-arm naturally without spam.
-//
-// Doesn't fire when:
-//   - User hasn't opted in
-//   - Browser hasn't granted notification permission
-//   - No active chain (current = 0)
-//   - Chain is in cooldown (not active)
-//   - Chain is already broken (remaining <= 0)
-//   - Already warned for this dip and chain hasn't bounced back
-//
-// Same notification plumbing as v0.6.43 target-ready. New constants:
-// CHAIN_WATCH_INTERVAL_MS = 5000, CHAIN_BREAK_WARN_SEC = 60,
-// CHAIN_BREAK_REARM_SEC = 90. New setting: notifyChainBreak (default
-// false).
-//
-// Zero new API calls. The DOM scrape is the same one already used for
-// the chain pill — runs more often (every 5s vs the pill's 1s tick)
-// but only ever reads sidebar text, no network.
-//
-// ─── UPDATE NOTES (0.6.60) ──────────────────────────────────────────
-// Quick Wins panel — chain-fight optimizer. New Dashboard section
-// between Targets and Build Coherence that ranks opponents from your
-// fight history by a composite "chain efficiency" score:
-//
-//   score = winRate²
-//         × respectPerFight
-//         × (60 / max(avgDurationSec, 30))   // reward short fights
-//         × stalenessPenalty                  // ½ past 30d, ¼ past 90d
-//
-// Eligibility: you were the attacker, ≥3 outgoing fights, win rate
-// ≥ 50%, usable timing data, last seen within a year. Top 8 candidates.
-//
-// Each row surfaces win rate, sample size, avg fight duration,
-// respect/fight, last-seen age, and a STALE tag when the staleness
-// penalty has kicked in. Click any row → Opponent Intel drill, where
-// you can pin them to the Targets queue for live status tracking.
-//
-// Design choice — DATA-DRIVEN ONLY. The panel doesn't poll live
-// online/hospital status for non-pinned candidates. Live status is
-// the Targets panel's job; Quick Wins is the discovery tool that
-// surfaces opponents you might've forgotten you can reliably farm.
-// Zero new API calls, instant render, plays alongside the existing
-// rate-limit-aware target refresh cadence without adding load.
-//
-// Silent on fresh installs (no outgoing fights yet). Shows a thin-
-// data hint when you have some outgoing fights but no opponent has
-// crossed the 3-fight floor — actionable signal that ranking is
-// pending more samples.
-//
-// New constants: QUICK_WIN_MIN_FIGHTS=3, QUICK_WIN_MIN_WINRATE=0.5,
-// QUICK_WIN_AGE_CUTOFF_SEC=365 days. Tweakable if calibration drifts.
-//
-// ─── UPDATE NOTES (0.6.59) ──────────────────────────────────────────
-// Stability sweep — five findings from the post-v0.6.58 code review,
-// none ship-blocking but all worth tightening before Tier 1.
-//
-//   F1. `store()` and `load()` used to silently swallow GM storage
-//       failures. Now both `console.warn` on catch and stash the
-//       error to a module-level `lastStoreError` for future surface
-//       in the Settings tab. Most relevant when the `fights` blob
-//       approaches the Tampermonkey storage quota.
-//   F2. Removed unused `escapeHtml()` helper. The `el()` DOM builder
-//       routes all dynamic content through `.text → textContent`,
-//       which is XSS-safe by construction, so escapeHtml was dead
-//       code masking the actual safety story.
-//   F3. `factionChainCache` is now included in the 30-day TTL sweep
-//       alongside `spyCache` and `scoutData`. Practical impact tiny
-//       (bounded by drills opened) but symmetry with the other
-//       keyed-by-id caches.
-//   F4. `domSeenUnknown` Set now caps at 200 entries. Was unbounded;
-//       in practice fills very slowly with unique unrecognized DOM
-//       verbs, but the cap removes the "what if Torn rewords every
-//       log line" failure mode.
-//   F5. The `bodyObs` MutationObserver inside `attachLogObserver()`
-//       now self-disconnects after 30s if the log selector never
-//       appears. Defensive against a future Torn DOM change that
-//       would otherwise leave a permanent body-subtree observer
-//       running on attack pages.
-//
-// ─── UPDATE NOTES (0.6.58) ──────────────────────────────────────────
-// Cache hygiene: 30-day TTL sweep for `spyCache` and `scoutData`. Both
-// keyed-by-id caches had no eviction beyond explicit user actions
-// (un-pin, clear-all). Over months of pre-war scouts and dead pinned
-// targets they would otherwise grow into thousands of stale entries.
-// P2 finding from the v0.6.57 code review, deferred to v0.6.58 to keep
-// the prior release scope tight.
-//
-// New constant `CACHE_TTL_SEC = 30 * 86400`. New init-time IIFE
-// `sweepStaleCaches()` walks both caches once per page load, drops any
-// entry whose `fetchedAt` is older than the TTL, and rewrites storage
-// only if anything was removed. Runs after the dedup migration so the
-// `fights` store is already settled.
-//
-// Why 30 days: TornStats spy data drifts heavily over a month; scout
-// rosters are war-time pre-fight reads and irrelevant post-mortem. Long
-// enough that no normal workflow re-uses an entry past the cutoff;
-// short enough that a year of casual play caps each cache at ~100s of
-// entries instead of thousands.
-//
-// `factionChainCache` and `targetStatus` are deliberately NOT swept —
-// the former is bounded by "factions you opened the drill on"
-// (lifetime ~dozens), and the latter is bounded by `settings.targetIds`
-// and already gets cleaned up on un-pin via `toggleTarget()`.
-//
-// Zero new API calls. Zero new storage keys.
-//
-// ─── UPDATE NOTES (0.6.57) ──────────────────────────────────────────
-// Polish pass on the way to a public v0.7 release. Two P1 fixes
-// surfaced by a code review:
-//
-// 1. Errored cache entries refetched without throttle.
-//    `maybeFetchSpy` and `maybeRefreshFactionChain` both gated their
-//    refresh window on `!cached.error` — meaning any cached error
-//    bypassed the 30s/1h throttle entirely. Drilling repeatedly into
-//    an errored opponent or faction would spawn one TornStats / Torn
-//    API call per drill open. The targets refresh path already
-//    handles this correctly via TARGETS_ERROR_RETRY_SEC=60s; the same
-//    pattern now applies to spy + faction chain via new constants
-//    SPY_ERROR_RETRY_SEC and FACTION_CHAIN_ERROR_RETRY_SEC (both 60s).
-//    Errored entries now wait 60s before the next attempt regardless
-//    of how many times the drill is reopened.
-//
-// 2. Dead setting removed: `settings.targetsRefreshSec`.
-//    Held a 120s default but hadn't driven refresh timing since the
-//    v0.6.47 adaptive-cadence pivot (target refresh now uses
-//    targetRefreshDueAt with locked/heartbeat/error tiers).
-//    No UI control, no live read — pure dead weight in the settings
-//    object. Removed from the defaults; existing stored values are
-//    inert because `load()` only seeds from defaults on first run.
-//
-// Zero new features. Zero new API calls. Zero new storage keys.
-// One bug class fixed, one piece of dead surface area removed.
-//
-// ─── UPDATE NOTES (0.6.56) ──────────────────────────────────────────
-// Strips the v0.6.55 TornStats batch attempt. Verified against the
-// TornStats v2 docs that `/spy/faction/{id}` returns a faction roster
-// + Torn personalstats — NOT spy stats. The member objects have name,
-// level, and personalstats only; no strength/defense/speed/dexterity
-// fields at all. Even if the endpoint worked for our key (it returned
-// "User not found." for faction 36660), it could not have populated
-// the Scout spy column with usable stat data.
-//
-// Removed:
-//   - `fetchSpyFactionBatch()` (dead, endpoint can't supply our data).
-//   - Batch-first path in `pullSpiesForRoster`. Function is now a
-//     single try/finally around the per-member loop (v0.6.54 behavior).
-//   - "BATCH FAILED" status banner — no batch to fail.
-//
-// Retained (from v0.6.55):
-//   - Spy total sort options (high→low / low→high). Work on per-member
-//     cache identically; no change needed.
-//
-// Per-member loop is the only path TornStats actually exposes that
-// returns the strength/defense/speed/dexterity fields. Sequential
-// pull cost is unchanged from v0.6.54 (~25s for a fresh 100-member
-// faction, near-instant on re-pull because of the 1-hour cache).
-//
-// ─── UPDATE NOTES (0.6.55) ──────────────────────────────────────────
-// Two Scout-tab upgrades stacked into one release: TornStats batch
-// endpoint attempt (later removed in v0.6.56 — endpoint doesn't
-// return spy stats), and two sort options that re-rank by stat mass.
-//
-// Spy sort options
-//    Two new entries in the Scout sort dropdown: "Spy total (high → low)"
-//    and "Spy total (low → high)". After bulk-pulling spies, picking
-//    either reorders the roster by actual stat mass — heavy hitters or
-//    soft targets surface immediately without scanning per-row badges.
-//
-//    Members without populated spy data (no cache / noData / error) sink
-//    to the end of the sort so the meaningful rows always lead. Stable
-//    name-comparison tiebreak at the leaf, consistent with the existing
-//    level / last-action sorts.
-//
-// ─── UPDATE NOTES (0.6.54) ──────────────────────────────────────────
-// Scout tab gets bulk TornStats spy enrichment. Adds a "Pull spies"
-// button alongside the existing sort/filter controls: click it once
-// after fetching a roster and TECH sequentially pulls spy data for
-// every member, surfacing their estimated total stats inline on each
-// row. Turns Scout from "verdict triage" into "verdict + stat-mass
-// triage" in one pre-war view.
-//
-// Implementation:
-//   - New `pullSpiesForRoster(roster)` walks the roster sequentially
-//     with a 250ms inter-call delay (so a 100-member faction takes
-//     ~25s and stays gentle on TornStats).
-//   - Skips members with a fresh cached spy entry (good OR noData) —
-//     re-clicks within the 1-hour throttle are nearly instant because
-//     most rows are already cached. Errored entries are retried.
-//   - Bails on first hard fetch error (TornStats down / bad key) so
-//     a sustained outage doesn't churn through the whole roster.
-//   - Aborts cleanly on Torn-side rate-limit (checks between every call).
-//   - Re-renders the Scout panel every 5 fetches to keep DOM updates
-//     cheap while still showing live progress.
-//
-// UI:
-//   - "Pull spies (N)" button in the Scout controls row, where N counts
-//     members without a fresh spy cache. Disabled mid-pull, label
-//     swaps to "Pulling 12/N…" with live progress.
-//   - Member rows get a "spy 1.2M" badge inline with the existing meta
-//     bits (FF / fight count / last action / status). noData rows show
-//     "spy —" so the user knows TornStats was asked and came up dry.
-//     Errored rows omit the badge so transient TornStats hiccups don't
-//     spam the panel.
-//   - Completion message ("Pulled 87/87" / "Rate-limited; aborted at
-//     45/87" / etc.) holds for 2s before the button returns to its
-//     normal label.
-//
-// API budget impact: one TornStats call per uncached member, throttled
-// to ~4/sec. Tornside rate-limit gate applies (TornStats uses the same
-// Torn API key under the hood, so a Torn-side throttle pauses spies
-// too). Cached entries cost zero — repeat clicks are basically free.
-//
-// ─── UPDATE NOTES (0.6.53) ──────────────────────────────────────────
-// Fix: TornStats "User not found" response was being surfaced as a red
-// error stripe in the spy card. It's not an error — TornStats simply
-// has no record of that player (fresh account, never been spied, etc.)
-// — and should render as the neutral "No spy on record" line, the same
-// as their `spy.status:false` payload for known-but-unspied users.
-//
-// fetchSpyData now matches the message of any `status:false` response
-// against "not found" or "no spy" substrings; either match reclassifies
-// to the noData state. Other status:false messages (auth failure, rate
-// limit on TornStats' side, etc.) still propagate as actual errors.
-//
-// No migration needed — the existing throttle in maybeFetchSpy retries
-// errored cache entries on next drill open, so the bad rows will repaint
-// correctly the next time the user reopens those opponents' drills.
-//
-// ─── UPDATE NOTES (0.6.52) ──────────────────────────────────────────
-// TornStats spy integration on the Opponent Intel drill. Pulls the
-// latest spy report from tornstats.com — total estimated stats + the
-// four per-stat values, each with the timestamp of when it was last
-// spied — and surfaces them inline on every drill open.
-//
-// Implementation:
-//   - New `fetchSpyData(id)` hits
-//     https://www.tornstats.com/api/v2/{key}/spy/user/{id}, normalises
-//     the response to a flat shape. Uses the user's Torn API key for
-//     auth — no separate TornStats key needed. Rate-limit gated.
-//   - Per-target cache in `spyCache` (persisted), throttled to 1 hour
-//     per target. Manual ↻ button bypasses the throttle.
-//   - Auto-fetch fires on `openOpponentDrill()` — drill open kicks the
-//     request; the drill re-renders when it resolves.
-//   - Distinguishes four states: loading / error / no-data ("no spy
-//     on record for this player") / populated.
-//   - "@connect www.tornstats.com" added to header so Tampermonkey
-//     permits the cross-origin call.
-//
-// Render: new spy section in the Opponent Intel drill —
-//   - In the populated branch, slots between the verdict blurb and
-//     the first row of stat cards.
-//   - In the empty-state branch (no fight history), renders ABOVE the
-//     empty-state message — this is the pre-war scenario where spy
-//     data is most valuable, and the drill should still be useful.
-//   - Shows the headline Total at glance + a 4-stat grid (Str/Def/
-//     Spd/Dex) with per-stat spy ages, plus TornStats' own "stronger
-//     / weaker / same" verdict line when present.
-//
-// Target Queue rows: when spy data is cached for a pinned target, the
-// row sub-line now includes "spy 1.2M" alongside the other bits.
-// Doesn't trigger a fetch — just surfaces what's already in cache from
-// a prior drill open, so the badge appears at zero extra API cost.
-//
-// API budget impact: +1 TornStats call per drill open (throttled to
-// 1h). TornStats has its own quota separate from Torn's, but we still
-// rate-limit-gate the call so a Torn-side throttle pauses spy fetches
-// too. Modest cost; drills are intentional, not poll-driven.
-//
-// ─── UPDATE NOTES (0.6.51) ──────────────────────────────────────────
-// Bugfix: Faction Intel drill bailed out completely when the user had
-// no local fight history against the target faction — which is exactly
-// the pre-war scenario where the v0.6.50 chain timer is most useful.
-// Symptom: click a faction in Scout, see "No fights against this
-// faction yet" with no chain pill, no faction name (just a back button).
-//
-// Fix mirrors v0.6.41's Opponent Intel empty-state fix. The empty
-// branch now:
-//   1. Renders the faction name (from currentDrill.name → scout cache
-//      → "Faction <id>" fallback).
-//   2. Renders the chain pill regardless of fight history — that's
-//      the whole point of opening the drill pre-war.
-//   3. Then shows a softer "no fight history" empty message that
-//      points at the chain pill above.
-//
-// No new state, no API changes — pure ordering fix.
-//
-// ─── UPDATE NOTES (0.6.50) ──────────────────────────────────────────
-// Enemy faction chain timer on the Faction Intel drill. War-prep gold —
-// when does the target faction's chain break, what's their current
-// respect modifier, and how long until their post-break cooldown ends.
-// Lets you time a strike to break their chain (knock them off the
-// respect modifier ladder) or schedule a hit-cluster to land just as
-// their cooldown ends.
-//
-// Implementation:
-//   - New `fetchFactionChain(id)` hits /faction/{id}?selections=chain
-//     and normalises the response to absolute Unix timestamps
-//     (timeoutAt, cooldownAt) the same way fetchSelfState normalises
-//     the user's own chain. One API call per refresh.
-//   - Per-faction cache in `factionChainCache` (persisted to GM)
-//     throttled to 30s per faction — opening/closing/reopening the
-//     drill doesn't burn API calls within that window.
-//   - Rate-limit gated like every other TECH fetcher (skips fetch
-//     while `meta.rateLimitedUntil` is in the future).
-//   - Auto-fetch on `openFactionDrill()`; manual ↻ button in the pill
-//     header forces a refresh (bypasses the 30s throttle).
-//   - Auto-refresh when the local countdown elapses, so "broken" or
-//     "ready" transitions trigger one fresh fetch to confirm.
-//
-// Render states (above the existing Faction Intel cards):
-//   - active   → "⛓ Enemy chain 47/100 · 4:23 to break · 1.5× respect"
-//   - cooldown → "⛓ Enemy cooldown · 28s until ready"
-//   - error    → red "⚠ <error>" line
-//   - idle     → muted "No active chain." line
-//
-// Reuses the existing .tech-chain-pill CSS so urgency colors (green
-// safe / amber <120s / red pulse <60s) and the live setInterval
-// countdown pattern stay consistent with the Dashboard's own-chain
-// pill. Separate `factionChainTickerInterval` handle so the two
-// pills can tick independently without clashing.
-//
-// API budget impact: +1 call per Faction Intel drill open
-// (throttled). Modest — Faction Intel is opened intentionally
-// (not on every poll), and the 30s cache absorbs rapid re-opens.
-//
-// Older versions (v0.6.49 and earlier) live in CHANGELOG.md alongside this
-// file. Tracked there so the userscript header stays focused on what's new
-// in the current feature wave. If you're upgrading from TornIQ-era storage
-// (pre-v0.2.0), the migrator at the top of the IIFE handles the tiqc_* →
-// tech_* rename on first run.
+// ─── UPDATE NOTES (0.7.0 — Build Coherence milestone) ──────────────
+// v0.7.0 is the public milestone that finishes the Build Coherence
+// rewrite started at v0.6.50. The Combat tab Dashboard now ships a
+// two-axis read on your character: stat-shape × loadout effect family,
+// with a flavor-named archetype combining both.
+//
+// What's in v0.7.0:
+//
+// 1. Equipped Loadout card (v0.6.74). Polls /v2/user/equipment every
+//    5 min, renders your 9 slots inline below the Build Coherence
+//    verdict. ↻ button forces an immediate refresh outside the throttle.
+//
+// 2. Loadout family classifier (v0.6.76, debugged v0.6.78-79). Every
+//    weapon bonus on your equipped gear is bucketed into one of 6
+//    families: DoT, Crit/burst, Debuff, Reward-on-KO, Self-buff,
+//    Pure damage. Dominant family + share rendered on the loadout card.
+//    (Bug fix in v0.6.79: the API field is `title`, not `name` —
+//    earlier classifier silently dropped every bonus.)
+//
+// 3. New stat-shape goals (v0.6.76, v0.6.80). Dodge (pure-Dex evasion)
+//    and Smasher (high Str / high damage / medium Spd-Def / low Dex)
+//    join the existing Heavy Brawler, Glass Cannon, Tank, Chain
+//    Fighter, and Stat Grinder shapes — 7 total.
+//
+// 4. 2-axis verdict (v0.6.81). Build Coherence card now shows two
+//    independent scores: stat alignment (how well your stats match the
+//    chosen goal) AND loadout alignment (how concentrated your dominant
+//    family is). 5-dot confidence rendering for both.
+//
+// 5. Gendered archetype names (v0.6.80, v0.6.82). 10 specific
+//    (stat-shape × family) archetypes + one wildcard for Self-buff +
+//    General George/Georgia fallback. Names render based on character
+//    gender from /v2/user (?selections=basic). Pure damage column is
+//    fully populated as of v0.6.82, since Powerful + Specialist are the
+//    most common bonuses in real-world loadouts.
+//
+//    Full archetype roster (male / female):
+//      Tank          × DoT         → DoT Dan / DoT Diana
+//      Glass Cannon  × Crit/burst  → Critical Cody / Critical Candy
+//      Heavy Brawler × Debuff      → Crippler Chris / Crippler Christine
+//      Chain Fighter × Reward-KO   → Tricky Tony / Tricky Tammy
+//      Dodge         × Pure damage → Dancer Donald / Dancer Donna
+//      Smasher       × Pure damage → Powerhouse Paul / Powerhouse Paula
+//      Heavy Brawler × Pure damage → Walloper Walt / Walloper Wendy
+//      Glass Cannon  × Pure damage → Hitman Henry / Hitman Helena
+//      Tank          × Pure damage → Bulwark Brent / Bulwark Brenda
+//      Chain Fighter × Pure damage → Workhorse Wally / Workhorse Wanda
+//      Any           × Self-buff   → Snowball Samuel / Snowball Samantha
+//      Fallback                    → General George / General Georgia
+//
+// 6. Smart mismatch hints (v0.6.82). When no archetype exists for your
+//    (goal, family) combo, the verdict offers BOTH paths: keep the goal
+//    + swap weapons toward the canonical expected family, OR keep the
+//    loadout + switch to a stat-shape goal whose archetype matches your
+//    current loadout family.
+//
+// 7. Empty-state placeholder (v0.6.83). First-time installers with no
+//    Build Goal set now see a small placeholder card on the Dashboard
+//    naming all 7 stat-shapes with a one-click "Open Settings" button,
+//    instead of nothing.
+//
+// Also bundled in this milestone:
+//   - Post-war WAR Scorecard fix (v0.6.77): meta.lastWarTarget snapshot
+//     + warEnd ceiling kill the prior-war leak. Title flips to
+//     "Last War Scorecard · ended Xh ago · vs FactionName".
+//   - Live faction chain pill in the Faction Intel drill (v0.6.50).
+//   - Per-weapon picker for TEST sim (v0.6.65, 130+ wiki weapons).
+//   - GM_xhr browser cache bypass (v0.6.30).
+//   - Various polish around the Dashboard layout, drill, and modal UX.
+//
+// Cost: +1 API call per 5 min for /v2/user/equipment. No other new
+// polls. Storage growth is bounded by the 9-slot equipment shape +
+// the lastWarTarget snapshot (auto-purged at 7 days).
+//
+// Older per-version UPDATE NOTES (v0.6.49 and earlier, plus the
+// granular v0.6.50–v0.6.83 entries that built up to this milestone)
+// live in CHANGELOG.md alongside this file. Tracked there so the
+// userscript header stays focused on what's new in the current
+// feature wave. If you're upgrading from TornIQ-era storage
+// (pre-v0.2.0), the migrator at the top of the IIFE handles the
+// tiqc_* → tech_* rename on first run.
 
 (function () {
   'use strict';
@@ -709,7 +106,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.6.81';
+  const SCRIPT_VERSION    = '0.7.0';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -1004,6 +401,27 @@
     'smasher:pure_dmg': {
       male: 'Powerhouse Paul', female: 'Powerhouse Paula',
       blurb: 'Smasher stat-shape + Powerful / Specialist loadout. No tricks, no DoT — just hits like a truck, over and over.',
+    },
+    // v0.6.82 — Pure damage column completion. Powerful + Specialist are
+    // the most universal bonuses (drop on every weapon category), so the
+    // Pure damage family is the most common loadout family. Filling the
+    // remaining four stat-shape combos lets non-Smasher / non-Dodge Pure
+    // damage users land on a named archetype instead of General George.
+    'heavy_brawler:pure_dmg': {
+      male: 'Walloper Walt', female: 'Walloper Wendy',
+      blurb: 'Heavy Brawler stat-shape + reliable per-hit damage. Bashes through, hit after hit — close-range with weight behind every swing.',
+    },
+    'glass_cannon:pure_dmg': {
+      male: 'Hitman Henry', female: 'Hitman Helena',
+      blurb: 'Glass Cannon stat-shape + clean damage weapons. Deletes targets before they react. Fragile, but they\'re usually down first.',
+    },
+    'tank:pure_dmg': {
+      male: 'Bulwark Brent', female: 'Bulwark Brenda',
+      blurb: 'Tank stat-shape + steady damage output. Immovable; soaks hits while applying consistent pressure. The attrition fighter.',
+    },
+    'chain:pure_dmg': {
+      male: 'Workhorse Wally', female: 'Workhorse Wanda',
+      blurb: 'Chain Fighter stat-shape + reliable per-hit output. No-frills chain grinder. Predictable, efficient, gets the job done.',
     },
     '*:self_buff': {
       male: 'Snowball Samuel', female: 'Snowball Samantha',
@@ -2895,13 +2313,12 @@
     }
   }
 
-  // ─── EQUIPPED LOADOUT (v0.6.71 — phase 1 of v0.7 Build Coherence rewrite) ──
+  // ─── EQUIPPED LOADOUT (v0.6.71) ────────────────────────────────────────
   // Polls /v2/user/equipment for the user's currently equipped weapons +
-  // armor. Phase 1 surfaces this as an info-only Dashboard card; Phase 2
-  // adds a loadout-archetype classifier (Dodge / Sniper / Brawler / Burner
-  // / Bleeder / Suppressor / Critter / Counter); Phase 3 wires it into a
-  // new 2-axis Build Coherence card (stat-shape × loadout-archetype) with
-  // soft scoring and confidence dots.
+  // armor. Source of truth for the Dashboard's Equipped Loadout card,
+  // the v0.7 Phase 2 loadout-archetype classifier (Walloper Walt / DoT
+  // Dan / etc.), and the v0.7 Phase 3 2-axis Build Coherence verdict
+  // (stat-shape × loadout-family with soft scoring + confidence dots).
   //
   // Throttled to 5 minutes because equipment changes are user-initiated
   // and infrequent — there's no reason to re-pull every poll. Failure is
@@ -3991,37 +3408,52 @@
       });
     }
     allShares.sort(function (a, b) { return b.share - a.share; });
-    // Expected-family + mismatch detection. Self-buff is special-cased:
-    // any goalKey accepts a self-buff loadout (it maps to Snowballer),
-    // so we never treat self-buff as a mismatch.
+    // v0.6.82 — direct-archetype-match check. Replaces the v0.6.81 rigid
+    // "expects family X" check now that ARCHETYPES has 10 specific
+    // (goalKey, familyKey) entries. A match means a specific archetype
+    // exists for the user's (goal, family) combo — not "your loadout
+    // matches the goal's canonical expected family." Self-buff still
+    // matches anything via the wildcard.
     const expectedFamily = STAT_TO_EXPECTED_FAMILY[goalKey] || null;
+    const expectedLabel = expectedFamily ? (LOADOUT_FAMILY_LABELS[expectedFamily] || expectedFamily) : null;
+    const directKey = goalKey + ':' + family.dominantKey;
+    const directMatch = ARCHETYPES[directKey];
     let matchesExpected = null;   // null = no expectation (grinder, no goal, self-buff)
-    if (expectedFamily) {
-      if (family.dominantKey === 'self_buff') matchesExpected = null;
-      else matchesExpected = family.dominantKey === expectedFamily;
-    }
+    if (family.dominantKey === 'self_buff') matchesExpected = null;
+    else if (!goalKey || goalKey === 'grinder') matchesExpected = null;
+    else matchesExpected = !!directMatch;
+
     let mismatchHint = null;
     if (matchesExpected === false) {
-      const expectedLabel = LOADOUT_FAMILY_LABELS[expectedFamily] || expectedFamily;
-      // Find which stat-shape would match the user's actual loadout
-      // dominant family so we can offer "OR change goal to X" advice.
-      let altGoalKey = null;
-      for (const gk in STAT_TO_EXPECTED_FAMILY) {
-        if (STAT_TO_EXPECTED_FAMILY[gk] === family.dominantKey) { altGoalKey = gk; break; }
+      const goalLabel = (BUILD_GOALS[goalKey] && BUILD_GOALS[goalKey].label) || goalKey;
+      // Two alternative paths to offer:
+      //   1. Swap weapons: keep the goal, change to the goal's canonical
+      //      expected family (if it has a named archetype).
+      //   2. Swap goal: keep the loadout, switch to a stat-shape goal
+      //      whose archetype DOES match the user's actual dominant family.
+      const canonArch = expectedFamily ? ARCHETYPES[goalKey + ':' + expectedFamily] : null;
+      const canonResolved = canonArch
+        ? { name: pickArchetypeName(canonArch) }
+        : null;
+      // Find ANY goalKey whose direct archetype matches the user's family.
+      let altGoalKey = null, altArch = null;
+      for (const gk in BUILD_GOALS) {
+        if (gk === goalKey) continue;
+        const cand = ARCHETYPES[gk + ':' + family.dominantKey];
+        if (cand) { altGoalKey = gk; altArch = cand; break; }
       }
       const altGoalLabel = altGoalKey && BUILD_GOALS[altGoalKey] ? BUILD_GOALS[altGoalKey].label : null;
-      const altArchetype = altGoalKey
-        ? detectArchetype(altGoalKey, family.dominantKey)
-        : null;
-      const goalLabel = (BUILD_GOALS[goalKey] && BUILD_GOALS[goalKey].label) || goalKey;
-      mismatchHint = goalLabel + ' expects a ' + expectedLabel
-                   + ' loadout, but yours is ' + family.dominantLabel + ' focus.';
-      if (altGoalKey && altArchetype) {
-        mismatchHint += ' Switch goal to ' + altGoalLabel + ' for ' + altArchetype.name
-                      + ', or swap weapons to ' + expectedLabel + ' to match.';
-      } else {
-        mismatchHint += ' Either swap to ' + expectedLabel + ' weapons, or rethink the goal.';
+      const altResolved = altArch ? { name: pickArchetypeName(altArch) } : null;
+      const parts = [goalLabel + ' doesn\'t have a specific archetype for '
+                   + family.dominantLabel + ' loadouts.'];
+      if (canonResolved && expectedLabel) {
+        parts.push('Swap to ' + expectedLabel + ' weapons for ' + canonResolved.name + '.');
       }
+      if (altResolved && altGoalLabel) {
+        parts.push((canonResolved ? 'Or switch ' : 'Switch ')
+                 + 'goal to ' + altGoalLabel + ' for ' + altResolved.name + '.');
+      }
+      mismatchHint = parts.join(' ');
     }
     return {
       ready: true,
@@ -4032,7 +3464,7 @@
       dominantShare: family.share,
       allShares,
       expectedFamily,
-      expectedLabel: expectedFamily ? (LOADOUT_FAMILY_LABELS[expectedFamily] || expectedFamily) : null,
+      expectedLabel,
       matchesExpected,
       mismatchHint,
     };
@@ -5679,8 +5111,9 @@
        Family row sits directly under armor with the same dashed-border
        treatment, but uses an ember accent on the family name to mark it
        as the derived signal (vs the raw gear above). Archetype row uses
-       a left-edge violet bar to visually pair it with the stat-shape
-       Build Coherence verdict, since Phase 3 will fuse the two cards. */
+       a left-edge violet bar that visually echoes the Build Coherence
+       card's verdict pill — the two cards work together as Phase 3's
+       2-axis verdict. */
     .tech-loadout-family-row{display:flex;align-items:baseline;gap:8px;
       font-size:11px;padding:6px 0 2px;margin-top:5px;
       border-top:1px dashed #2a1f2e;}
@@ -6770,16 +6203,13 @@
   }
 
   // ─── EQUIPPED LOADOUT CARD (v0.6.71) ───────────────────────────────────
-  // Phase 1 of the v0.7 Build Coherence rewrite. Pure info card — surfaces
-  // your currently equipped weapons + armor pulled from /v2/user/equipment.
-  // When a weapon's name matches an entry in the WEAPONS table (wiki data)
-  // the row gains an inline dmg/acc readout from the wiki midpoints so the
-  // user can see at a glance what their loadout's hit/damage profile is.
-  //
-  // Phase 2 will layer a loadout-archetype classifier on top of this card
-  // (Dodge / Sniper / Brawler / Burner / Bleeder / Suppressor / Critter /
-  // Counter). Phase 3 replaces the existing single-axis Build Coherence
-  // card with a 2-axis (stat-shape × loadout-archetype) verdict.
+  // Renders the user's currently equipped weapons + armor pulled from
+  // /v2/user/equipment. When a weapon's name matches an entry in the
+  // WEAPONS table (wiki data) the row gains an inline dmg/acc readout
+  // from the wiki midpoints. Below the gear: the v0.7 Phase 2 Focus row
+  // (dominant effect family + evidence) and Archetype card (e.g.
+  // Powerhouse Paul, Walloper Walt). The Phase 3 2-axis Build Verdict
+  // lives on the Build Coherence card above this one.
   function renderEquippedLoadout(host) {
     const eq = meta.equipment;
     if (!eq || !eq.fetchedAt) return;   // silent until first fetch lands
@@ -6995,7 +6425,25 @@
 
     // Build Coherence card (above the empty-state check so it's visible even
     // for fresh installs with no fights yet — it's stat-driven, not fight-driven).
-    if (settings.buildGoal) {
+    // v0.6.83 — when no Build Goal is picked, render a small placeholder so
+    // first-time installers can discover the feature instead of silently
+    // missing it. Renders a one-click jump to Settings.
+    if (!settings.buildGoal) {
+      const card = el('div', { class: 'tech-section tech-build unset' });
+      card.appendChild(el('div', { class: 'tech-section-title' }, 'Build Coherence'));
+      card.appendChild(el('div', { class: 'tech-build-hint' },
+        'Pick a Build Goal in Settings to unlock the 2-axis Build Verdict. ',
+        'Seven archetypes available — Powerhouse Paul, DoT Dan, Critical Cody, and more — ',
+        'matched from your stats × loadout combination.'));
+      const settingsBtn = el('button', { class: 'tech-btn', type: 'button' }, 'Open Settings');
+      settingsBtn.addEventListener('click', function () {
+        settings.activeTab = 'settings';
+        store('settings', settings);
+        renderActive();
+      });
+      card.appendChild(el('div', { class: 'tech-btnrow' }, settingsBtn));
+      host.appendChild(card);
+    } else if (settings.buildGoal) {
       const bc = computeBuildCoherence(meta.battleStats, settings.buildGoal, meta.level);
       const card = el('div', { class: 'tech-section tech-build ' + bc.verdict.className });
       card.appendChild(el('div', { class: 'tech-section-title' },
@@ -7081,11 +6529,11 @@
                 ? el('span', { class: 'tech-build-loadout-ok' }, ' ✓ matches ' + bc.goal.label)
                 : loadCoh.matchesExpected === false
                   ? el('span', { class: 'tech-build-loadout-bad' },
-                      ' ✗ ' + bc.goal.label + ' expects ' + loadCoh.expectedLabel)
+                      ' ✗ no archetype for this combo')
                   : loadCoh.dominantKey === 'self_buff'
                     ? el('span', { class: 'tech-build-loadout-ok' }, ' ✓ Self-buff matches any goal')
                     : el('span', { class: 'tech-build-loadout-neutral' },
-                        ' · ' + bc.goal.label + ' has no specific expectation'),
+                        ' · ' + bc.goal.label + ' accepts any loadout'),
             ),
           ));
           // Family breakdown — only render when more than one family
