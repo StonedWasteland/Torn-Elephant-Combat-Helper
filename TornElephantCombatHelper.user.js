@@ -1,11 +1,13 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      0.7.0
+// @version      1.0.0
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
 // @match        https://www.torn.com/*
+// @updateURL    https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/TornElephantCombatHelper.user.js
+// @downloadURL  https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/TornElephantCombatHelper.user.js
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
@@ -106,7 +108,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '0.7.0';
+  const SCRIPT_VERSION    = '1.0.0';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -2093,6 +2095,10 @@
   const CHAIN_WATCH_INTERVAL_MS = 5000;
   const CHAIN_BREAK_WARN_SEC    = 60;
   const CHAIN_BREAK_REARM_SEC   = 90;
+  // Torn's chain respect-multiplier tiers start at 10 (10/25/50/100/...).
+  // Below 10 there's no multiplier to protect, so a dropped chain costs
+  // nothing meaningful — don't ping the user about it.
+  const CHAIN_BREAK_MIN_COUNT   = 10;
   let chainWatchInterval = null;
   let chainWarningFired  = false;
 
@@ -2121,6 +2127,13 @@
     const c = readChainFromTornDom() || meta.chain;
     if (!c || !c.current || c.current === 0 || !c.timeoutAt) {
       // No chain — reset state so the next chain starts fresh.
+      chainWarningFired = false;
+      return;
+    }
+    if (c.current < CHAIN_BREAK_MIN_COUNT) {
+      // Below the first respect-multiplier tier — nothing worth saving.
+      // Keep the flag reset so the alert arms the moment the chain
+      // crosses into multiplier territory.
       chainWarningFired = false;
       return;
     }
@@ -7923,7 +7936,7 @@
                fontWeight: '500', cursor: 'pointer', margin: '0' },
     },
       chainCb,
-      el('span', {}, 'Ping me when my chain timer drops under 60 seconds'),
+      el('span', {}, 'Ping me when my chain timer drops under 60 seconds (chain ≥ 10 only)'),
     );
     form.appendChild(chainLabel);
     const chainHint = el('div', { class: 'hint' },

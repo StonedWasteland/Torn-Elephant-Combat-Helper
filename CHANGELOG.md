@@ -6,6 +6,20 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.0.0 — Stability declaration
+
+The v0.7.0 feature set, war-validated in the TNU vs Infernum Perdition ranked war on 2026-05-29, is now the stable production version. No new features in this release — it's a milestone: TECH is feature-complete by design, and v1.0 declares the codebase production-quality for daily use.
+
+Two stabilising fixes layered on top of v0.7.0:
+
+1. **`@updateURL` + `@downloadURL` added** to the script header. Without these, Tampermonkey's auto-update logic could resolve TECH's update source to a sibling userscript with a higher version number (e.g. TEEM at v6.6.x > TECH at v0.7.0), silently overwriting TECH's installed code. Symptom: "TECH suddenly broke for no reason." Fix is preventive — every sibling userscript now carries its own explicit update/download URLs. **Reinstall from corrected source is required for the fix to take effect**, since Tampermonkey reads the update URL from the installed copy.
+
+2. **Chain-break notifications gated to chain ≥ 10.** Torn's chain respect-multiplier tiers start at 10 (10/25/50/100/...). Below 10 there's no multiplier to protect — a dropped chain costs nothing meaningful. The chain-break notification was firing for sub-tier chains, which the user found noisy. Now silent below 10; the alert auto-arms the moment the chain crosses into multiplier territory. Settings label updated to reflect the floor.
+
+Neither change affects core combat-data flow or any of the v0.7.0 Build Coherence feature set.
+
+---
+
 ## v0.6.83 — Polish pass before v0.7.0
 
 Two cleanup items on the way to the v0.7.0 milestone:
