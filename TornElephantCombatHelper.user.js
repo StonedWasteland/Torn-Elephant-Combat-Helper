@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.1.0
+// @version      1.2.0
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,8 +20,36 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.1.0 — Hub-not-silo integrations) ──────────────
-// v1.1.0 is the integration milestone. TECH stops being a closed loop
+// ─── UPDATE NOTES (1.2.0 — Cross-source consensus + bulk spies) ────
+// v1.2.0 layers synthesis on top of v1.1.0's three integrations. The
+// data was already flowing in from spy / BSP / FF Scouter — v1.2.0
+// makes that data easier to *use*.
+//
+// What's in v1.2.0:
+//
+// 1. Cross-source consensus card (settings.consensusEnabled, default
+//    on). Combines available stat-prediction sources for an opponent
+//    into a synthesised median band + explicit agreement chip that
+//    flags when sources disagree. Renders as a new card at the top of
+//    Opponent Intel with the headline verdict + per-source breakdown
+//    chips. Scout rows consolidate the separate bsp/ff bits into a
+//    single consolidated chip with ⚠ for major disagreement / ◆ for
+//    minor. Per-source cards remain as the audit trail.
+//
+// 2. TornStats faction-spy bulk endpoint. The Pull spies button now
+//    tries `/api/v2/{key}/spy/faction/{factionId}` first — one HTTP
+//    call covers a whole roster with wider coverage (faction-spy +
+//    personal-spy + faction-share). Silent fallback to per-user loop
+//    if the bulk call fails for any reason — worst case matches v1.1.0
+//    behavior. Per-member parser is defensive about response shape.
+//
+// 3. Honest synthesis design. Consensus is the median of available
+//    source values, robust to one stale outlier; the agreement chip
+//    explicitly reports how much sources agree. TECH never invents a
+//    prediction it didn't read from a real service.
+//
+// ─── PRIOR UPDATE NOTES (1.1.0 — Hub-not-silo integrations) ────────
+// v1.1.0 was the integration milestone. TECH stops being a closed loop
 // over your own fight history and starts orchestrating data from the
 // rest of the Torn ecosystem: BSP (Battle Stats Predictor), FF Scouter,
 // and TornStats now feed the same Opponent Intel and Scout views.
@@ -99,7 +127,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.1.0';
+  const SCRIPT_VERSION    = '1.2.0';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -569,6 +597,7 @@
     notifyChainBreak: false,               // v0.6.61 — fire browser notification when chain timer drops under 60s
     bspEnabled: false,                     // v1.0.1 — opt-in BSP predictions; requires user's own BSP subscription
     ffEnabled: false,                      // v1.1.0-dev — opt-in FF Scouter predictions; free tier covers basic data
+    consensusEnabled: true,                // v1.2.0-dev — synthesised cross-source consensus band on scout/intel views
     // v1.1.0-dev — Optional per-service API key overrides. Some users
     // register *different* Torn API keys with different services (BSP,
     // FF Scouter, TornStats) — for security partitioning or just historical
@@ -2024,7 +2053,98 @@
     });
   }
 
-  // v1.0.1 — BSP (Battle Stats Predictor) integration.
+  // v1.2.0-dev — Bulk faction spy fetch.
+  // TornStats's per-user endpoint (`/spy/user/{id}`) only returns data
+  // when SOMEONE in the community has spied that player. Coverage is
+  // sparse for the average user. Their faction endpoint
+  // (`/spy/faction/{factionId}`) returns whatever TornStats has on every
+  // member of the faction in one call — much wider coverage and a single
+  // HTTP call instead of dozens. That's the bulk path we use for the
+  // "Pull spies" button on Scout.
+  //
+  // Response wrapper (confirmed via TornStats v2 docs):
+  //   { status: true, message: "Spy data found.", faction: {
+  //       ID, name, tag, ..., members: { "playerId": { ... } } } }
+  //
+  // Per-member spy-stat location is parsed defensively because the docs
+  // example didn't show the battle-stat fields inline. We probe:
+  //   member.spy.{strength,defense,speed,dexterity,total,...}  ← most likely
+  //   member.{strength,...} directly                            ← flat form
+  //   member.spies[0].{strength,...}                            ← array form
+  // First location with a usable `total` wins.
+  function _extractSpyFromMember(member) {
+    if (!member || typeof member !== 'object') return null;
+    const candidates = [];
+    if (member.spy && typeof member.spy === 'object') candidates.push(member.spy);
+    if (Array.isArray(member.spies) && member.spies.length > 0) candidates.push(member.spies[0]);
+    candidates.push(member); // flat fallback
+
+    for (const c of candidates) {
+      if (!c || typeof c !== 'object') continue;
+      if (typeof c.total === 'number' && c.total > 0) return c;
+      // Accept the entry even with no total if it has the four pillar stats —
+      // we can sum them ourselves.
+      if (typeof c.strength === 'number' && typeof c.defense === 'number'
+          && typeof c.speed === 'number' && typeof c.dexterity === 'number') return c;
+    }
+    return null;
+  }
+
+  function _normalizeSpyEntry(spyRaw, fallbackLevel) {
+    const total = (typeof spyRaw.total === 'number' && spyRaw.total > 0)
+      ? spyRaw.total
+      : (typeof spyRaw.strength === 'number' && typeof spyRaw.defense === 'number'
+         && typeof spyRaw.speed === 'number' && typeof spyRaw.dexterity === 'number')
+        ? (spyRaw.strength + spyRaw.defense + spyRaw.speed + spyRaw.dexterity)
+        : null;
+    return {
+      noData:      false,
+      level:       (typeof fallbackLevel === 'number') ? fallbackLevel : null,
+      total:       total,
+      strength:    (typeof spyRaw.strength === 'number') ? spyRaw.strength : null,
+      defense:     (typeof spyRaw.defense === 'number') ? spyRaw.defense : null,
+      speed:       (typeof spyRaw.speed === 'number') ? spyRaw.speed : null,
+      dexterity:   (typeof spyRaw.dexterity === 'number') ? spyRaw.dexterity : null,
+      totalTs:     (typeof spyRaw.total_timestamp === 'number') ? spyRaw.total_timestamp
+                  : (typeof spyRaw.timestamp === 'number') ? spyRaw.timestamp : 0,
+      strengthTs:  (typeof spyRaw.strength_timestamp === 'number') ? spyRaw.strength_timestamp : 0,
+      defenseTs:   (typeof spyRaw.defense_timestamp === 'number') ? spyRaw.defense_timestamp : 0,
+      speedTs:     (typeof spyRaw.speed_timestamp === 'number') ? spyRaw.speed_timestamp : 0,
+      dexterityTs: (typeof spyRaw.dexterity_timestamp === 'number') ? spyRaw.dexterity_timestamp : 0,
+      difference:  spyRaw.difference || null,
+      spyType:     spyRaw.type || null, // 'faction-spy' | 'personal-spy' | 'faction-share'
+      fetchedAt:   nowSec(),
+    };
+  }
+
+  async function fetchTornStatsFactionSpies(factionId) {
+    const fid = parseInt(factionId, 10);
+    if (!Number.isFinite(fid) || fid <= 0) throw new Error('Invalid faction ID');
+    const apiKey = (settings.tornStatsApiKey && settings.tornStatsApiKey.trim()) || settings.apiKey;
+    if (!apiKey) throw new Error('No API key set');
+    if (isRateLimited()) {
+      throw new Error('Rate-limited · retry in ' + rateLimitRemainingSec() + 's');
+    }
+    const url = 'https://www.tornstats.com/api/v2/'
+              + encodeURIComponent(apiKey)
+              + '/spy/faction/' + fid
+              + '?_=' + Date.now();
+    const data = await apiGet(url, {
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+    });
+    if (!data) throw new Error('Empty response from TornStats');
+    if (data.status === false) {
+      const msg = String(data.message || '').toLowerCase();
+      if (msg.includes('not found') || msg.includes('no spy') || msg.includes('no faction')) {
+        return { members: {} }; // soft "no data" — treat as empty roster
+      }
+      throw new Error(data.message || 'TornStats error');
+    }
+    const faction = data.faction || {};
+    const members = faction.members || {};
+    return { members: members, faction: faction };
+  }
   // TDup-blessed 2026-06-01 under one condition: each TECH user must have
   // their own active BSP subscription. We enforce this two ways:
   //   1. Calls use settings.apiKey (the user's own Torn key, which they
@@ -2433,6 +2553,118 @@
     'out-of-league': 'Out-of-league',
   };
 
+  // v1.2.0-dev — Cross-source consensus.
+  // Each external stat-prediction service (TornStats spy, BSP, FF Scouter)
+  // gives us its own best estimate of an opponent's battle-stat total.
+  // Each one has gaps: spy is ground truth but sparse, BSP and FF Scouter
+  // are widely covered but modeled.
+  //
+  // This function synthesises the available signals into a single
+  // headline consensus band, and reports how much the sources agree.
+  // The "honest" part of the design is the agreement signal — when the
+  // sources disagree, the consensus is still useful (it's the median, so
+  // robust to one outlier) but the disagreement chip warns the user that
+  // confidence is reduced. When sources agree, no chip → high confidence.
+  //
+  // Returns null if no usable source data exists. Otherwise:
+  //   { consensusBand, consensusValue, sources: [{name, value, band}],
+  //     agreement: 'unanimous' | 'minor' | 'major', spread: 0..3 }
+  //
+  // - Median is used instead of mean: robust to one wildly-stale outlier.
+  // - Bands compared via index in BSP_BAND_ORDER. Spread = max-min index.
+  //   0 = all same band (unanimous), 1 = adjacent bands (minor), 2+ = major.
+  // - We only pull NUMERIC stat-total estimates. FF Scouter's `fair_fight`
+  //   rating is in a different unit and isn't merged; only `bsEstimate`
+  //   is used. The cascade in getBeatabilityScore can still fall back to
+  //   FF rating when bsEstimate is missing — that's a separate concern.
+  const BSP_BAND_ORDER = ['soft', 'matched', 'dangerous', 'out-of-league'];
+  function computeOpponentConsensus(opponentId, myTotal) {
+    if (!Number.isFinite(myTotal) || myTotal <= 0) return null;
+    const sources = [];
+
+    const spy = spyCache[opponentId];
+    if (spy && !spy.error && !spy.noData
+        && typeof spy.total === 'number' && spy.total > 0) {
+      sources.push({
+        name: 'spy', value: spy.total,
+        band: classifyBspBand(myTotal, spy.total),
+        fetchedAt: spy.fetchedAt || 0,
+      });
+    }
+
+    if (settings.bspEnabled && bspSubscriptionActive() !== false) {
+      const bsp = bspCache[opponentId];
+      if (bsp && !bsp.error && !bsp.noData
+          && typeof bsp.tbs === 'number' && bsp.tbs > 0) {
+        sources.push({
+          name: 'bsp', value: bsp.tbs,
+          band: classifyBspBand(myTotal, bsp.tbs),
+          fetchedAt: bsp.fetchedAt || 0,
+        });
+      }
+    }
+
+    if (settings.ffEnabled) {
+      const ff = ffCache[opponentId];
+      if (ff && !ff.error && !ff.noData
+          && typeof ff.bsEstimate === 'number' && ff.bsEstimate > 0) {
+        sources.push({
+          name: 'ff', value: ff.bsEstimate,
+          band: classifyBspBand(myTotal, ff.bsEstimate),
+          fetchedAt: ff.fetchedAt || 0,
+        });
+      }
+    }
+
+    if (sources.length === 0) return null;
+
+    // Median of available values. Sort by value; pick middle index. For
+    // an even count we average the two middle values (standard median).
+    const sortedValues = sources.map(function (s) { return s.value; }).sort(function (a, b) { return a - b; });
+    let consensusValue;
+    const n = sortedValues.length;
+    if (n % 2 === 1) {
+      consensusValue = sortedValues[(n - 1) / 2];
+    } else {
+      consensusValue = (sortedValues[n / 2 - 1] + sortedValues[n / 2]) / 2;
+    }
+    const consensusBand = classifyBspBand(myTotal, consensusValue);
+
+    // Agreement signal — how spread out are the per-source bands?
+    const bandIndexes = sources
+      .map(function (s) { return BSP_BAND_ORDER.indexOf(s.band); })
+      .filter(function (i) { return i >= 0; });
+    let spread = 0;
+    if (bandIndexes.length > 1) {
+      spread = Math.max.apply(null, bandIndexes) - Math.min.apply(null, bandIndexes);
+    }
+    let agreement;
+    if (sources.length === 1) agreement = 'single';
+    else if (spread === 0)    agreement = 'unanimous';
+    else if (spread === 1)    agreement = 'minor';
+    else                      agreement = 'major';
+
+    return {
+      consensusBand: consensusBand,
+      consensusValue: consensusValue,
+      sources: sources,
+      agreement: agreement,
+      spread: spread,
+    };
+  }
+  const CONSENSUS_AGREEMENT_LABELS = {
+    'single':    'Single source',
+    'unanimous': 'All sources agree',
+    'minor':     'Sources mostly agree',
+    'major':     '⚠ Sources disagree',
+  };
+  const CONSENSUS_AGREEMENT_COLORS = {
+    'single':    '#9ca3af', // grey — only one opinion, can't measure agreement
+    'unanimous': '#34d399', // green — high confidence
+    'minor':     '#fbbf24', // amber — caution
+    'major':     '#f87171', // red — split / suspect
+  };
+
   // v0.6.54 — Sequential bulk-fetch of TornStats spy data for every member
   // of a scouted faction roster. Triggered by the "Pull spies" button on
   // the Scout tab. Throttling rules:
@@ -2485,14 +2717,90 @@
                         total: targets.length, message: null };
     renderActive();
 
+    // v1.2.0-dev — Try the bulk faction endpoint first. One HTTP call
+    // covers the entire roster and gets us TornStats's wider faction-
+    // level coverage (faction-spy and faction-share entries, not just
+    // personal-spies submitted by community members).
+    if (roster.factionId) {
+      try {
+        const bulk = await fetchTornStatsFactionSpies(roster.factionId);
+        const bulkMembers = bulk.members || {};
+        let bulkApplied = 0;
+        let bulkNoData = 0;
+        for (const m of targets) {
+          const raw = bulkMembers[String(m.id)] || bulkMembers[m.id];
+          if (!raw) {
+            // Member not present in bulk response — leave as-is, the
+            // per-user fallback below will pick them up.
+            continue;
+          }
+          const spyRaw = _extractSpyFromMember(raw);
+          if (spyRaw) {
+            spyCache[m.id] = _normalizeSpyEntry(spyRaw, raw.level);
+            bulkApplied++;
+          } else {
+            // Member returned by faction endpoint but with no spy data —
+            // store noData so we don't try the per-user fetch unnecessarily.
+            spyCache[m.id] = { noData: true, fetchedAt: nowSec() };
+            bulkNoData++;
+          }
+          scoutSpyPulling.current = bulkApplied + bulkNoData;
+        }
+        store('spyCache', spyCache);
+        // If the bulk call covered the whole roster, we're done — no need
+        // for the per-user loop. Mark complete and skip the fallback.
+        if ((bulkApplied + bulkNoData) >= targets.length) {
+          scoutSpyPulling.message = 'Pulled ' + bulkApplied + ' (' + bulkNoData
+                                  + ' no-data) via faction endpoint';
+          scoutSpyPulling.current = scoutSpyPulling.total;
+          renderActive();
+          setTimeout(function () {
+            scoutSpyPulling = null;
+            if (panelEl && contentEl && settings.activeTab === 'scout') renderActive();
+          }, 2000);
+          return;
+        }
+        // Some members weren't in the bulk response. Fall through to the
+        // per-user loop for the remaining ones.
+        renderActive();
+      } catch (e) {
+        // Bulk endpoint failed (network, auth, subscription tier, etc.).
+        // Log + silently fall through to the per-user loop. The user
+        // still gets data, just slower.
+        console.warn('[TECH] Faction-spy bulk fetch failed, falling back to per-user:', e);
+      }
+    }
+
+    // Per-user fallback for any members not covered by the bulk pull
+    // (or for the entire roster if bulk failed). Existing throttled
+    // sequential pattern. Filters out any members we already populated
+    // via the bulk pass so we don't double-fetch.
+    const remainingTargets = targets.filter(function (m) {
+      const c = spyCache[m.id];
+      if (!c) return true;
+      // Stale or absent? include. Fresh (good or noData)? skip.
+      if (c.fetchedAt && (nowSec() - c.fetchedAt) < SPY_REFRESH_SEC) return false;
+      return true;
+    });
+    if (remainingTargets.length === 0) {
+      scoutSpyPulling.message = 'Pulled ' + scoutSpyPulling.current + ' / ' + targets.length;
+      scoutSpyPulling.current = scoutSpyPulling.total;
+      renderActive();
+      setTimeout(function () {
+        scoutSpyPulling = null;
+        if (panelEl && contentEl && settings.activeTab === 'scout') renderActive();
+      }, 2000);
+      return;
+    }
+
     try {
-      for (let i = 0; i < targets.length; i++) {
+      for (let i = 0; i < remainingTargets.length; i++) {
         if (isRateLimited()) {
-          scoutSpyPulling.message = 'Rate-limited; aborted at ' + i + '/' + targets.length;
+          scoutSpyPulling.message = 'Rate-limited; aborted at ' + i + '/' + remainingTargets.length;
           break;
         }
-        const m = targets[i];
-        scoutSpyPulling.current = i + 1;
+        const m = remainingTargets[i];
+        scoutSpyPulling.current = scoutSpyPulling.current + 1;
         try {
           const spy = await fetchSpyData(m.id);
           spyCache[m.id] = spy;
@@ -2505,7 +2813,7 @@
           store('spyCache', spyCache);
           // Bail on first hard error — if TornStats is down or the key is
           // invalid, the rest of the roster will fail identically.
-          scoutSpyPulling.message = 'Stopped at ' + (i + 1) + '/' + targets.length
+          scoutSpyPulling.message = 'Stopped at ' + (i + 1) + '/' + remainingTargets.length
                                   + ': ' + (e && e.message ? e.message : e);
           break;
         }
@@ -8167,6 +8475,97 @@
     ));
   }
 
+  // v1.2.0-dev — Consensus intel card. Renders only when consensusEnabled
+  // is on AND at least one data source has produced a usable estimate for
+  // this opponent. Sits ABOVE the individual spy / BSP / FF cards as the
+  // headline read; per-source cards remain as the audit trail.
+  //
+  // Honest design: the consensus is the median across available sources,
+  // and the agreement chip explicitly says how much the sources agree.
+  // We never invent a prediction TECH didn't read from a real service.
+  function renderConsensusCard(host, opponentId) {
+    if (!settings.consensusEnabled) return;
+    const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
+      ? meta.battleStats.total : 0;
+    if (myTotal <= 0) return; // no own-stat anchor → no consensus possible
+    const consensus = computeOpponentConsensus(opponentId, myTotal);
+    if (!consensus) return; // nothing to synthesise
+
+    // Header row: title + agreement chip + (no refresh — derived view).
+    const headerRow = el('div', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               marginBottom: '6px', fontSize: '10px',
+               textTransform: 'uppercase', letterSpacing: '1.2px',
+               color: '#fde047', fontWeight: '700' },
+    },
+      el('span', {}, 'Consensus'),
+      el('span', { style: { color: '#6b7280', fontWeight: '500',
+                            textTransform: 'none', letterSpacing: '.5px' } },
+        '· ' + consensus.sources.length + ' source' + (consensus.sources.length === 1 ? '' : 's')),
+      el('span', { style: {
+        marginLeft: 'auto',
+        color: CONSENSUS_AGREEMENT_COLORS[consensus.agreement] || '#9ca3af',
+        fontWeight: '700', fontSize: '9px', letterSpacing: '.5px',
+      } }, CONSENSUS_AGREEMENT_LABELS[consensus.agreement] || ''),
+    );
+    host.appendChild(headerRow);
+
+    // Big verdict band — same visual treatment as the BSP / FF cards.
+    const bandColor = BSP_BAND_COLORS[consensus.consensusBand] || '#9ca3af';
+    const bandLabel = BSP_BAND_LABELS[consensus.consensusBand] || 'Unknown';
+    host.appendChild(el('div', {
+      style: { display: 'flex', alignItems: 'baseline', gap: '10px',
+               marginBottom: '8px' },
+    },
+      el('span', { style: { fontSize: '10px', textTransform: 'uppercase',
+                            letterSpacing: '1px', color: '#6b7280',
+                            fontWeight: '700' } }, 'Verdict'),
+      el('span', { style: { fontFamily: "Impact, 'Oswald', 'Arial Narrow', sans-serif",
+                            fontSize: '20px', color: bandColor,
+                            textShadow: '0 0 8px ' + bandColor + '40',
+                            letterSpacing: '.5px' } },
+        bandLabel),
+    ));
+
+    // Per-source breakdown — small chips so the user can see WHY the
+    // consensus landed where it did. Each chip shows source name + its
+    // own band in its own band color.
+    const breakdown = el('div', {
+      style: { display: 'flex', flexWrap: 'wrap', gap: '6px',
+               marginBottom: '8px', fontSize: '10px' },
+    });
+    const SOURCE_LABELS = { spy: 'Spy', bsp: 'BSP', ff: 'FF' };
+    for (const src of consensus.sources) {
+      const sColor = BSP_BAND_COLORS[src.band] || '#9ca3af';
+      breakdown.appendChild(el('span', {
+        style: { background: '#0f0a12', border: '1px solid ' + sColor + '60',
+                 borderRadius: '3px', padding: '3px 6px',
+                 color: sColor, fontWeight: '600' },
+      },
+        (SOURCE_LABELS[src.name] || src.name) + ': ' + (BSP_BAND_LABELS[src.band] || '—'),
+      ));
+    }
+    host.appendChild(breakdown);
+
+    // Disagreement explainer — only when sources actually disagree, so it
+    // doesn't waste vertical space on the typical aligned case.
+    if (consensus.agreement === 'major') {
+      host.appendChild(el('div', {
+        style: { fontSize: '10px', color: '#fca5a5', marginBottom: '11px',
+                 lineHeight: '1.4', fontStyle: 'italic' },
+      }, 'Sources span multiple bands — the consensus is the median, but ' +
+         'consider checking the per-source cards below before committing.'));
+    } else if (consensus.agreement === 'minor') {
+      host.appendChild(el('div', {
+        style: { fontSize: '10px', color: '#fbbf24', marginBottom: '11px',
+                 lineHeight: '1.4', fontStyle: 'italic' },
+      }, 'Sources land on adjacent bands — directional agreement, modest uncertainty.'));
+    } else {
+      // 'unanimous' or 'single' — no caveat needed; reserve space-economy.
+      host.appendChild(el('div', { style: { marginBottom: '8px' } }));
+    }
+  }
+
   // v1.1.0-dev — FF Scouter intel card. Renders only when the user has
   // opted in (settings.ffEnabled). Uses the same theme-aligned band
   // palette as BSP for visual consistency. Surfaces the raw FF rating
@@ -8352,6 +8751,15 @@
       nameLine.appendChild(starBtnEmpty);
       host.appendChild(nameLine);
 
+      // v1.2.0-dev — Consensus card sits at the very top of the intel
+      // stack as the headline read. Renders nothing when no data exists,
+      // so first-encounter zero-history opponents won't get an empty card.
+      if (settings.consensusEnabled) {
+        const consensusSec = el('div', { class: 'tech-section' });
+        renderConsensusCard(consensusSec, opponentId);
+        if (consensusSec.childNodes.length > 0) host.appendChild(consensusSec);
+      }
+
       // v0.6.52 — spy section works even with zero fight history; this is
       // the pre-war / first-encounter scenario where TornStats data is
       // most valuable. Render it ABOVE the empty-state message.
@@ -8437,6 +8845,15 @@
     host.appendChild(el('div', { class: 'tech-intel-verdict ' + intel.verdict.className },
       intel.verdict.label));
     host.appendChild(el('div', { class: 'tech-intel-blurb' }, intel.blurb));
+
+    // v1.2.0-dev — Consensus card sits at the top of the strategic stack
+    // for opponents with fight history too. Provides the headline "what's
+    // their strength" read; per-source cards below give the audit trail.
+    if (settings.consensusEnabled) {
+      const consensusSec = el('div', { class: 'tech-section' });
+      renderConsensusCard(consensusSec, intel.id);
+      if (consensusSec.childNodes.length > 0) host.appendChild(consensusSec);
+    }
 
     // v0.6.52 — TornStats spy section. Sits between the behavioural verdict
     // (what your fight history says) and the structural stat cards (what
@@ -9099,6 +9516,36 @@
 
     ffCb.addEventListener('change', function () {
       settings.ffEnabled = ffCb.checked;
+      store('settings', settings);
+    });
+
+    // v1.2.0-dev — Cross-source Consensus toggle.
+    // When on (default), TECH synthesises a "headline" consensus band from
+    // whichever of spy / BSP / FF Scouter have data on a target, and flags
+    // when those sources disagree. The Consensus card renders ABOVE the
+    // per-source cards in Opponent Intel; scout rows show a single
+    // consolidated consensus band instead of separate spy/bsp/ff bits.
+    // Turning this off restores the v1.1.0 behaviour (separate bits, no
+    // consolidated view). The per-source cards always still render.
+    form.appendChild(el('label', {}, 'Cross-source consensus'));
+    const consensusCb = el('input', { type: 'checkbox' });
+    consensusCb.checked = settings.consensusEnabled !== false;
+    const consensusLabel = el('label', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               textTransform: 'none', letterSpacing: '0', color: '#e5e7eb',
+               fontWeight: '500', cursor: 'pointer', margin: '0' },
+    },
+      consensusCb,
+      el('span', {}, 'Show a synthesised consensus band + agreement chip across spy / BSP / FF Scouter'),
+    );
+    form.appendChild(consensusLabel);
+    form.appendChild(el('div', { class: 'hint' },
+      'TECH picks the median across available sources and flags when they disagree. ' +
+      'Off → scout rows show each source separately (v1.1.0 behaviour) and the ' +
+      'Opponent Intel consensus card is hidden. Per-source cards always remain visible.',
+    ));
+    consensusCb.addEventListener('change', function () {
+      settings.consensusEnabled = consensusCb.checked;
       store('settings', settings);
     });
 
@@ -10295,8 +10742,11 @@
         // v1.1.0-dev — render as a colored span so the user can scan a 100-
         // member roster at a glance. Bullet+label share the band color so
         // each entry reads as a single styled chunk rather than text noise.
+        // v1.2.0-dev — when consensusEnabled is on, the consensusBit below
+        // replaces this and the FF bit. Logic stays here for the off-case.
         let bspBit = null;
-        if (settings.bspEnabled && bspSubscriptionActive() !== false) {
+        if (settings.bspEnabled && bspSubscriptionActive() !== false
+            && !settings.consensusEnabled) {
           const cachedBsp = bspCache[m.id];
           if (cachedBsp && !cachedBsp.error && !cachedBsp.noData
               && typeof cachedBsp.tbs === 'number') {
@@ -10318,8 +10768,10 @@
         // v1.1.0-dev — FF Scouter roughened band. Same colored-span pattern
         // as BSP. Same band classifier when bsEstimate is available; falls
         // back to FF-rating mapping when only the FF score is present.
+        // v1.2.0-dev — when consensusEnabled is on, the consensusBit below
+        // replaces this and the BSP bit. Logic stays here for the off-case.
         let ffBitScouter = null;
-        if (settings.ffEnabled) {
+        if (settings.ffEnabled && !settings.consensusEnabled) {
           const cachedFF = ffCache[m.id];
           if (cachedFF && !cachedFF.error && !cachedFF.noData) {
             const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
@@ -10343,6 +10795,38 @@
                 },
               }, '· ff ' + BSP_BAND_LABELS[band]);
             }
+          }
+        }
+
+        // v1.2.0-dev — Cross-source consensus bit. Replaces the separate
+        // bsp / ff bits in scout rows when settings.consensusEnabled is on.
+        // Shows the synthesised median band in its band color, plus a small
+        // ⚠ icon when sources disagree significantly (major spread).
+        let consensusBit = null;
+        if (settings.consensusEnabled) {
+          const myTotalForConsensus = (meta.battleStats && typeof meta.battleStats.total === 'number')
+            ? meta.battleStats.total : 0;
+          const consensus = computeOpponentConsensus(m.id, myTotalForConsensus);
+          if (consensus && consensus.consensusBand) {
+            const cBandColor = BSP_BAND_COLORS[consensus.consensusBand] || '#9ca3af';
+            const labelText = '· ' + BSP_BAND_LABELS[consensus.consensusBand]
+              + (consensus.agreement === 'major' ? ' ⚠' : '')
+              + (consensus.agreement === 'minor' ? ' ◆' : '');
+            consensusBit = el('span', {
+              style: {
+                color: cBandColor,
+                fontWeight: '600',
+                marginLeft: '4px',
+              },
+              title: 'Consensus (' + consensus.sources.length + ' source'
+                   + (consensus.sources.length === 1 ? '' : 's') + '): '
+                   + (CONSENSUS_AGREEMENT_LABELS[consensus.agreement] || '')
+                   + '\n' + consensus.sources.map(function (s) {
+                       const SOURCE_LABELS = { spy: 'Spy', bsp: 'BSP', ff: 'FF Scouter' };
+                       return '  ' + (SOURCE_LABELS[s.name] || s.name) + ': '
+                            + (BSP_BAND_LABELS[s.band] || '—');
+                     }).join('\n'),
+            }, labelText);
           }
         }
 
@@ -10385,8 +10869,9 @@
               ffBit,
               fightsBit,
               spyBit,
-              bspBit,
-              ffBitScouter,
+              bspBit,         // null when consensusEnabled — see assignment above
+              ffBitScouter,   // null when consensusEnabled — see assignment above
+              consensusBit,   // null when consensusEnabled is off OR no sources have data
               priBit,
               lastBit,
               statusEl ? document.createTextNode(' · ') : null,

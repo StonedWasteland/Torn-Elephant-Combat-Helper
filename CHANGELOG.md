@@ -6,6 +6,28 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.2.0 — Cross-source consensus + TornStats faction-spy bulk
+
+Two synthesis layers on top of v1.1.0's three integrations. The data is already flowing in from spy / BSP / FF Scouter — v1.2.0 makes that data easier to *use*.
+
+### What's new
+
+1. **Cross-source consensus card** (`settings.consensusEnabled`, default **on**). Combines the available stat-prediction sources for an opponent into a synthesised median band, plus an explicit agreement chip that flags when the sources disagree. Renders as a new "Consensus" card at the very top of Opponent Intel with the headline verdict + per-source breakdown chips; the existing TornStats / BSP / FF Scouter cards stay below as the audit trail. Disagreement gets a short explainer line so the user knows not to over-trust a split read. Scout rows consolidate the separate `bsp`/`ff` bits into a single consolidated chip with `⚠` for major disagreement / `◆` for minor.
+
+2. **TornStats faction-spy bulk endpoint.** The Pull spies button on the Scout tab now tries TornStats's `/api/v2/{key}/spy/faction/{factionId}` endpoint first — one HTTP call covers a whole roster and pulls wider coverage (faction-spy + personal-spy + faction-share entries) than the per-user endpoint alone. If the bulk call fails for any reason (network, subscription tier, partial roster), TECH silently falls back to the existing sequential per-user loop — worst case matches v1.1.0 behavior. Per-member spy data is parsed defensively across several possible response shapes since the public docs example was truncated.
+
+3. **Honest synthesis design.** The consensus is the median of available source values, robust to one stale outlier, and the agreement chip explicitly says how much the sources agree. TECH never invents a prediction it didn't read from a real service — it's still a hub, not a silo.
+
+### Cost
+
+No new external services — both features layer on data v1.1.0 already collects. The bulk faction-spy call is a net *reduction* in TornStats traffic vs. the per-user loop it replaces.
+
+### Caveat
+
+Like v1.1.0's Phase 2 War Priority Queue, the cross-source consensus is best validated in real conditions. The faction-spy bulk endpoint is partly modeled from truncated docs — if you see spy data missing for opponents TornStats's website shows as spied, paste the API response shape so we can refine the per-member parser.
+
+---
+
 ## v1.1.0 — Hub-not-silo integrations
 
 The integration milestone. TECH stops being a closed loop over your own fight history and starts orchestrating data from the rest of the Torn ecosystem: BSP (Battle Stats Predictor), FF Scouter, and TornStats all feed the same Opponent Intel and Scout views. Positioning is explicit: TECH is a hub, not a silo — we want users running BSP, TornTools, TornStats, and FF Scouter alongside TECH, not picking between them.
