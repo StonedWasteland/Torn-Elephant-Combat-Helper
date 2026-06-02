@@ -6,6 +6,14 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.2.2 — TEST tab Specific dropdown mobile fix
+
+The Specific (named-weapon) dropdown on the TEST simulator was clipping its closed-state text on mobile — selected weapons like "Jackhammer · dmg 71.5 · acc 65" displayed as "Jackhammer · dmg 71.5" with the trailing `acc` field hidden off-screen.
+
+Added `min-width:0`, `text-overflow:ellipsis`, `overflow:hidden`, and `white-space:nowrap` to `.wpn-select`. The select can now shrink below its content's intrinsic width within the flex layout, and gracefully ellipsizes when narrow. The full option text remains visible when the dropdown is open (mobile native pickers have plenty of space).
+
+---
+
 ## v1.2.1 — Mobile viewport fix
 
 Panel was using a hardcoded `width:430px`. On Firefox mobile (and any browser with a viewport narrower than 446px after padding), the panel extended off the left edge of the screen — left content like the `DASHBOARD` tab label got clipped to `ASHBOARD`, settings rows lost the start of their labels, etc.
