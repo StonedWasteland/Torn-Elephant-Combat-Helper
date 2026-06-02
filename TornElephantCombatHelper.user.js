@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.0.0
+// @version      1.0.1
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -108,7 +108,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.0.0';
+  const SCRIPT_VERSION    = '1.0.1';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -908,11 +908,83 @@
     });
   }
 
-  function apiGet(url, headers) {
+  // ─── CROSS-TAB API CACHE ─────────────────────────────────────────────
+  // Tampermonkey runs one userscript instance per Torn tab. Without a
+  // shared cache, each tab independently re-fetches the same endpoints,
+  // multiplying our Torn API budget by the number of open tabs.
+  //
+  // GM_setValue is shared across all tabs running the same script, so we
+  // route a thin freshness check through it: before fetching, check if any
+  // tab cached this URL within the TTL window. If yes, return the cached
+  // payload and skip the API call entirely.
+  //
+  // Cache key strips the cache-buster (_), api key (key) and analytics
+  // comment (comment) so two tabs asking "the same thing" map to the same
+  // key. Default TTL is 45s — slightly under TECH's default 60s poll
+  // interval so the dedup window covers a full poll cycle for any second
+  // tab whose timer is offset, without serving data older than one poll
+  // tick. Callers may override via apiGet(url, headers, { crossTabTtl: ms })
+  // — pass 0 to opt out. Burst-prone endpoints (scout roster fetch, FF
+  // Scouter, spy lookups) benefit most.
+  const XTCACHE_KEY              = 'xtcache';
+  const XTCACHE_DEFAULT_TTL_MS   = 45000;
+  // v1.0.1 — Hard eviction window for the cross-tab cache. Must be at least
+  // as long as the longest per-call TTL we use; otherwise long-TTL entries
+  // (BSP at 5 days, FF Scouter at 1 hour) get garbage-collected from the
+  // shared blob before their nominal validity, forcing redundant re-fetches
+  // from other tabs. 24 h is the sweet spot: covers all current consumers
+  // and still keeps the blob bounded across multi-day sessions.
+  const XTCACHE_HARD_EVICT_MS    = 24 * 60 * 60 * 1000;
+  const XTCACHE_STRIP_PARAMS     = ['_', 'key', 'comment'];
+
+  function xtCacheKey(url) {
+    try {
+      const u = new URL(url);
+      for (const p of XTCACHE_STRIP_PARAMS) u.searchParams.delete(p);
+      return u.origin + u.pathname + (u.search ? u.search : '');
+    } catch (e) {
+      return url;
+    }
+  }
+  function xtCacheRead() { return load(XTCACHE_KEY, {}) || {}; }
+  function xtCacheGet(key, ttl) {
+    const all = xtCacheRead();
+    const entry = all[key];
+    if (!entry || typeof entry.ts !== 'number') return null;
+    if ((Date.now() - entry.ts) > ttl) return null;
+    return entry.data;
+  }
+  function xtCacheSet(key, data) {
+    const all = xtCacheRead();
+    all[key] = { ts: Date.now(), data: data };
+    // Opportunistic eviction so the blob doesn't grow unbounded across
+    // sessions. Cheap: O(n) over an object with at most a few hundred
+    // entries.
+    const cutoff = Date.now() - XTCACHE_HARD_EVICT_MS;
+    for (const k of Object.keys(all)) {
+      if (!all[k] || typeof all[k].ts !== 'number' || all[k].ts < cutoff) delete all[k];
+    }
+    store(XTCACHE_KEY, all);
+  }
+
+  function apiGet(url, headers, opts) {
+    const ttl = (opts && typeof opts.crossTabTtl === 'number') ? opts.crossTabTtl : XTCACHE_DEFAULT_TTL_MS;
+    const key = ttl > 0 ? xtCacheKey(url) : null;
+
+    if (key) {
+      const hit = xtCacheGet(key, ttl);
+      if (hit !== null && hit !== undefined) return Promise.resolve(hit);
+    }
+
     return Promise.race([
       _gmFetch(url, headers),
       new Promise((_, rej) => setTimeout(() => rej(new Error('Hard timeout')), API_TIMEOUT_MS + 1000)),
-    ]);
+    ]).then((data) => {
+      if (key) {
+        try { xtCacheSet(key, data); } catch (e) { /* storage error already logged by store() */ }
+      }
+      return data;
+    });
   }
 
   // Legacy v1 URL (still used by identifySelf via /user/?selections=basic).
