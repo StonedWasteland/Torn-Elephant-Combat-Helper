@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.0.1
+// @version      1.1.0
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -15,90 +15,81 @@
 // @grant        GM_registerMenuCommand
 // @connect      api.torn.com
 // @connect      www.tornstats.com
+// @connect      lol-manager.com
+// @connect      ffscouter.com
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (0.7.0 — Build Coherence milestone) ──────────────
-// v0.7.0 is the public milestone that finishes the Build Coherence
-// rewrite started at v0.6.50. The Combat tab Dashboard now ships a
-// two-axis read on your character: stat-shape × loadout effect family,
-// with a flavor-named archetype combining both.
+// ─── UPDATE NOTES (1.1.0 — Hub-not-silo integrations) ──────────────
+// v1.1.0 is the integration milestone. TECH stops being a closed loop
+// over your own fight history and starts orchestrating data from the
+// rest of the Torn ecosystem: BSP (Battle Stats Predictor), FF Scouter,
+// and TornStats now feed the same Opponent Intel and Scout views.
 //
-// What's in v0.7.0:
+// Positioning: TECH is a hub, not a silo. We want users running BSP,
+// TornTools, TornStats, and FF Scouter alongside TECH — not picking
+// between them. The integrations route traffic *to* those services
+// (subscriber-gated where required) rather than replacing them.
 //
-// 1. Equipped Loadout card (v0.6.74). Polls /v2/user/equipment every
-//    5 min, renders your 9 slots inline below the Build Coherence
-//    verdict. ↻ button forces an immediate refresh outside the throttle.
+// What's in v1.1.0:
 //
-// 2. Loadout family classifier (v0.6.76, debugged v0.6.78-79). Every
-//    weapon bonus on your equipped gear is bucketed into one of 6
-//    families: DoT, Crit/burst, Debuff, Reward-on-KO, Self-buff,
-//    Pure damage. Dominant family + share rendered on the loadout card.
-//    (Bug fix in v0.6.79: the API field is `title`, not `name` —
-//    earlier classifier silently dropped every bonus.)
+// 1. BSP integration (TDup-blessed 2026-06-01). Opt-in via Settings.
+//    Requires the user's own active BSP subscription — verified on every
+//    response via SubscriptionEnd, with a "Subscribe at BSP" nudge when
+//    lapsed. Output is roughened to coarse strength bands (Soft target /
+//    Matched / Dangerous / Out-of-league) so BSP's precise TBS stays a
+//    reason to subscribe directly. Roughened BSP card in Opponent Intel,
+//    color-coded `bsp` band in scout rows, Pull BSP bulk button.
 //
-// 3. New stat-shape goals (v0.6.76, v0.6.80). Dodge (pure-Dex evasion)
-//    and Smasher (high Str / high damage / medium Spd-Def / low Dex)
-//    join the existing Heavy Brawler, Glass Cannon, Tank, Chain
-//    Fighter, and Stat Grinder shapes — 7 total.
+// 2. FF Scouter integration (Glasnost/rDacted public API). Opt-in via
+//    Settings. Free tier provides FF rating + battle-stat estimate; the
+//    Premium tier "Top stats distribution" is surfaced when available.
+//    Batched endpoint = one HTTP call for an entire 100-member roster
+//    (much friendlier on the API budget than per-target calls). 1-hour
+//    cache TTL per the author's request. FF Scouter card in Opponent
+//    Intel + `ff` band in scout rows + Pull FF bulk button.
 //
-// 4. 2-axis verdict (v0.6.81). Build Coherence card now shows two
-//    independent scores: stat alignment (how well your stats match the
-//    chosen goal) AND loadout alignment (how concentrated your dominant
-//    family is). 5-dot confidence rendering for both.
+// 3. Beatability cascade for Phase 2 War Priority Queue. The scout
+//    sort that auto-activates when scouting your ranked war target now
+//    reads from the richest available signal:
+//      spy → BSP (subscriber-gated) → FF Scouter → local FF history → neutral
+//    Each layer fills gaps the next can't, so users without one service
+//    still get useful priority scoring.
 //
-// 5. Gendered archetype names (v0.6.80, v0.6.82). 10 specific
-//    (stat-shape × family) archetypes + one wildcard for Self-buff +
-//    General George/Georgia fallback. Names render based on character
-//    gender from /v2/user (?selections=basic). Pure damage column is
-//    fully populated as of v0.6.82, since Powerful + Specialist are the
-//    most common bonuses in real-world loadouts.
+// 4. Per-service Torn API key overrides. Some Torn players keep multiple
+//    limited keys registered with different services. Three optional
+//    override fields in Settings — TornStats / BSP / FF Scouter — fall
+//    back to the main key when empty. Lets TECH talk to each service
+//    using whichever key the user registered there.
 //
-//    Full archetype roster (male / female):
-//      Tank          × DoT         → DoT Dan / DoT Diana
-//      Glass Cannon  × Crit/burst  → Critical Cody / Critical Candy
-//      Heavy Brawler × Debuff      → Crippler Chris / Crippler Christine
-//      Chain Fighter × Reward-KO   → Tricky Tony / Tricky Tammy
-//      Dodge         × Pure damage → Dancer Donald / Dancer Donna
-//      Smasher       × Pure damage → Powerhouse Paul / Powerhouse Paula
-//      Heavy Brawler × Pure damage → Walloper Walt / Walloper Wendy
-//      Glass Cannon  × Pure damage → Hitman Henry / Hitman Helena
-//      Tank          × Pure damage → Bulwark Brent / Bulwark Brenda
-//      Chain Fighter × Pure damage → Workhorse Wally / Workhorse Wanda
-//      Any           × Self-buff   → Snowball Samuel / Snowball Samantha
-//      Fallback                    → General George / General Georgia
+// 5. Cross-tab API cache (was v1.0.1; carried forward and improved).
+//    GM_setValue is shared across all tabs running the script, so the
+//    apiGet wrapper consults a shared blob before fetching. With this:
+//    open N Torn tabs and you no longer get N× the API calls. The
+//    error-not-cached fix added here prevents transient failures from
+//    propagating to every tab for the full TTL window. Validated on the
+//    author's install: poll cycle dropped from 73s → 47s under multi-tab.
 //
-// 6. Smart mismatch hints (v0.6.82). When no archetype exists for your
-//    (goal, family) combo, the verdict offers BOTH paths: keep the goal
-//    + swap weapons toward the canonical expected family, OR keep the
-//    loadout + switch to a stat-shape goal whose archetype matches your
-//    current loadout family.
+// 6. Theme-aligned BSP band palette. Soft target = icy cyan, Matched =
+//    TECH purple, Dangerous = gold, Out-of-league = orange. Cool→warm
+//    escalation reads naturally. Same palette used for FF Scouter bands.
 //
-// 7. Empty-state placeholder (v0.6.83). First-time installers with no
-//    Build Goal set now see a small placeholder card on the Dashboard
-//    naming all 7 stat-shapes with a one-click "Open Settings" button,
-//    instead of nothing.
+// 7. Pull-button retry-on-error behaviour. Pull BSP / Pull FF now treat
+//    cached errors as immediately retryable on explicit user click. The
+//    5-minute cooldown exists to prevent automatic hammering — it
+//    shouldn't gate a user's "try again" intent.
 //
-// Also bundled in this milestone:
-//   - Post-war WAR Scorecard fix (v0.6.77): meta.lastWarTarget snapshot
-//     + warEnd ceiling kill the prior-war leak. Title flips to
-//     "Last War Scorecard · ended Xh ago · vs FactionName".
-//   - Live faction chain pill in the Faction Intel drill (v0.6.50).
-//   - Per-weapon picker for TEST sim (v0.6.65, 130+ wiki weapons).
-//   - GM_xhr browser cache bypass (v0.6.30).
-//   - Various polish around the Dashboard layout, drill, and modal UX.
+// Caveat — Phase 2 War Priority Queue is **war-untested in production**.
+// It's gated dormant for users who aren't in an active ranked war
+// (`meta.activeWarTarget` null), so non-war users see no change. War
+// users get a clearly-marked early-access cycle; please report any
+// glitches you see during a real war.
 //
-// Cost: +1 API call per 5 min for /v2/user/equipment. No other new
-// polls. Storage growth is bounded by the 9-slot equipment shape +
-// the lastWarTarget snapshot (auto-purged at 7 days).
-//
-// Older per-version UPDATE NOTES (v0.6.49 and earlier, plus the
-// granular v0.6.50–v0.6.83 entries that built up to this milestone)
-// live in CHANGELOG.md alongside this file. Tracked there so the
-// userscript header stays focused on what's new in the current
-// feature wave. If you're upgrading from TornIQ-era storage
-// (pre-v0.2.0), the migrator at the top of the IIFE handles the
-// tiqc_* → tech_* rename on first run.
+// Older v0.6.x / v0.7.0 / v1.0.x UPDATE NOTES live in CHANGELOG.md
+// alongside this file. Tracked there so the userscript header stays
+// focused on what's new in the current feature wave. If you're
+// upgrading from TornIQ-era storage (pre-v0.2.0), the migrator at the
+// top of the IIFE handles the tiqc_* → tech_* rename on first run.
 
 (function () {
   'use strict';
@@ -108,7 +99,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.0.1';
+  const SCRIPT_VERSION    = '1.1.0';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -576,6 +567,16 @@
     targetIds: [],                         // v0.6.39 — pinned opponent IDs for the Dashboard target queue
     notifyTargetReady: false,              // v0.6.43 — fire browser notification when a pinned target becomes hittable
     notifyChainBreak: false,               // v0.6.61 — fire browser notification when chain timer drops under 60s
+    bspEnabled: false,                     // v1.0.1 — opt-in BSP predictions; requires user's own BSP subscription
+    ffEnabled: false,                      // v1.1.0-dev — opt-in FF Scouter predictions; free tier covers basic data
+    // v1.1.0-dev — Optional per-service API key overrides. Some users
+    // register *different* Torn API keys with different services (BSP,
+    // FF Scouter, TornStats) — for security partitioning or just historical
+    // reasons. Empty string = fall back to settings.apiKey (the main TECH
+    // key). Pattern extends naturally to any future external service.
+    bspApiKey:       '',
+    ffApiKey:        '',
+    tornStatsApiKey: '',
   });
 
   // v0.6.34 — Scout cache. Last roster fetch per faction ID. We keep
@@ -601,6 +602,42 @@
   // The *Ts fields are timestamps of when each stat was last spied
   // (TornStats stitches together datapoints from many spy reports).
   let spyCache = load('spyCache', {});
+
+  // v1.0.1 — BSP (Battle Stats Predictor) prediction cache.
+  // Cleared by TDup 2026-06-01 with one condition: each TECH user must
+  // have their own active BSP subscription (no proxying — see
+  // project_tech_integration_vision memory for full context).
+  //
+  // We verify the user's subscription via `subscriptionEnd` returned
+  // on every BSP response — when it falls in the past, we disable the
+  // feature and surface a "subscribe at BSP" nudge instead of data.
+  //
+  // Shape per entry:
+  //   { tbs, score, result, subscriptionEnd (unix sec, 0 = unknown),
+  //     predictionDate, fetchedAt, error?, noData? }
+  // Cached for 5 days (matches BSP's own PREDICTION_VALIDITY_DAYS), so
+  // a typical scout session won't re-hit the backend for the same target.
+  let bspCache = load('bspCache', {});
+
+  // v1.1.0-dev — FF Scouter prediction cache.
+  // Cleared as a public API by FF Scouter's author (Glasnost/rDacted)
+  // on 2026-06-01 with one condition: cap cache TTL at 1 hour. The
+  // service returns BOTH a Fair-Fight rating AND a battle-stat estimate
+  // in a single batched call, so a 100-member roster fetch is a single
+  // request — much friendlier on the API budget than BSP's per-target
+  // pattern.
+  //
+  // Shape per entry:
+  //   { ff (fair_fight 0..8 scale, lower = weaker),
+  //     bsEstimate (battle stat total, may be null when fair_fight is
+  //     also null = "no data on this player"),
+  //     bsEstimateHuman (formatted string from API),
+  //     lastUpdated (unix sec from server),
+  //     premiumAvailable (bool — server says distribution data exists),
+  //     distributionHuman (premium-only top stats string, null otherwise),
+  //     fetchedAt, error?, noData? }
+  // Cached for 1 hour (matches FF Scouter author's request).
+  let ffCache = load('ffCache', {});
 
   // v0.6.39 — Target queue. Per-id status snapshot from /user/{id}?selections=profile
   // so the Dashboard Targets panel can render online/offline + last-action without
@@ -734,10 +771,38 @@
         }
       }
       if (chainDropped > 0) store('factionChainCache', factionChainCache);
-      if (spyDropped + scoutDropped + chainDropped > 0) {
+      // v1.0.1 — BSP cache sweep. BSP predictions are valid for 5 days per
+      // TDup's own convention, but we keep the same 30-day eviction window
+      // as the other caches: a stale entry still tells us the user *had* a
+      // subscription at some point, and a fresh fetch will overwrite it.
+      let bspDropped = 0;
+      for (const id in bspCache) {
+        const e = bspCache[id];
+        if (e && e.fetchedAt && e.fetchedAt < cutoff) {
+          delete bspCache[id];
+          bspDropped++;
+        }
+      }
+      if (bspDropped > 0) store('bspCache', bspCache);
+      // v1.1.0-dev — FF Scouter cache sweep. 1-hour TTL on data freshness
+      // is enforced at the fetch layer; the 30-day eviction here just
+      // bounds disk usage across long-running sessions.
+      let ffDropped = 0;
+      for (const id in ffCache) {
+        const e = ffCache[id];
+        if (e && e.fetchedAt && e.fetchedAt < cutoff) {
+          delete ffCache[id];
+          ffDropped++;
+        }
+      }
+      if (ffDropped > 0) store('ffCache', ffCache);
+      const totalDropped = spyDropped + scoutDropped + chainDropped + bspDropped + ffDropped;
+      if (totalDropped > 0) {
         console.log('[TECH] Cache sweep dropped ' + spyDropped + ' spy + '
                   + scoutDropped + ' scout + ' + chainDropped
-                  + ' faction-chain entries older than 30 days.');
+                  + ' faction-chain + ' + bspDropped
+                  + ' BSP + ' + ffDropped
+                  + ' FF Scouter entries older than 30 days.');
       }
     } catch (e) {
       console.warn('[TECH] Cache sweep skipped:', e);
@@ -758,6 +823,11 @@
     // Cached battle stats from /user/?selections=battlestats — refreshed on poll.
     // Shape: { strength, defense, speed, dexterity, total, ts } or null.
     battleStats: null,
+    // v1.0.1 — Most recent SubscriptionEnd value (unix sec) returned by BSP.
+    // Used to gate the BSP feature without re-checking on every call: if
+    // this falls in the past, we stop calling and show the subscribe nudge.
+    // 0 = unknown (haven't called BSP yet, or call failed before parse).
+    bspSubscriptionEnd: 0,
   });
 
   let pollTimer    = null;
@@ -884,8 +954,16 @@
           onload: (r) => {
             try {
               const data = JSON.parse(r.responseText);
-              if (data && data.error) {
-                // Torn returns { error: { code, error } } on API errors.
+              // Torn-format error gate: only treat data.error as a Torn API
+              // error when it's an OBJECT with a numeric code field. Other
+              // services (FF Scouter, BSP) use a flat string error shape;
+              // misinterpreting those as Torn errors masks the real message
+              // (was producing "Torn API undefined: undefined"). Non-Torn
+              // error shapes pass through so the per-API caller can throw
+              // a meaningful error.
+              if (data && data.error
+                  && typeof data.error === 'object'
+                  && typeof data.error.code === 'number') {
                 // Code 5 = rate limit; tag the error + set the cooldown so
                 // every call site short-circuits until the quota refills.
                 if (data.error.code === 5) {
@@ -973,14 +1051,25 @@
 
     if (key) {
       const hit = xtCacheGet(key, ttl);
-      if (hit !== null && hit !== undefined) return Promise.resolve(hit);
+      // v1.1.0-dev — never serve a cached error response. If a stale error
+      // payload is sitting in the shared blob from before the no-cache-
+      // errors fix below, fall through to a fresh network call instead of
+      // re-throwing the same error for the full TTL window. Self-healing.
+      if (hit !== null && hit !== undefined && !(hit && hit.error)) {
+        return Promise.resolve(hit);
+      }
     }
 
     return Promise.race([
       _gmFetch(url, headers),
       new Promise((_, rej) => setTimeout(() => rej(new Error('Hard timeout')), API_TIMEOUT_MS + 1000)),
     ]).then((data) => {
-      if (key) {
+      // Only cache successful responses. A response with a top-level
+      // `error` field is an API-side failure (Torn rate-limit, FF Scouter
+      // "invalid key", BSP backend hiccup, etc.) — caching those would
+      // propagate the failure to every tab for the full TTL window.
+      const isError = data && data.error;
+      if (key && !isError) {
         try { xtCacheSet(key, data); } catch (e) { /* storage error already logged by store() */ }
       }
       return data;
@@ -1845,12 +1934,17 @@
   async function fetchSpyData(id) {
     const playerId = parseInt(id, 10);
     if (!Number.isFinite(playerId) || playerId <= 0) throw new Error('Invalid player ID');
-    if (!settings.apiKey) throw new Error('No API key set');
+    // v1.1.0-dev — per-service key override. Same pattern as BSP / FF
+    // Scouter: use settings.tornStatsApiKey if set, otherwise fall back
+    // to the main TECH key. Lets users who registered a different Torn
+    // key with TornStats point TECH at it.
+    const apiKey = (settings.tornStatsApiKey && settings.tornStatsApiKey.trim()) || settings.apiKey;
+    if (!apiKey) throw new Error('No API key set');
     if (isRateLimited()) {
       throw new Error('Rate-limited · retry in ' + rateLimitRemainingSec() + 's');
     }
     const url = 'https://www.tornstats.com/api/v2/'
-              + encodeURIComponent(settings.apiKey)
+              + encodeURIComponent(apiKey)
               + '/spy/user/' + playerId
               + '?_=' + Date.now();
     const data = await apiGet(url, {
@@ -1929,6 +2023,415 @@
       }
     });
   }
+
+  // v1.0.1 — BSP (Battle Stats Predictor) integration.
+  // TDup-blessed 2026-06-01 under one condition: each TECH user must have
+  // their own active BSP subscription. We enforce this two ways:
+  //   1. Calls use settings.apiKey (the user's own Torn key, which they
+  //      must have configured in BSP for their subscription to bind).
+  //   2. We read SubscriptionEnd from every response and refuse to surface
+  //      data when the sub has lapsed — see meta.bspSubscriptionEnd cache.
+  //
+  // Response shape per TDup's spec (May 2025):
+  //   { Result, TargetId, TBS, TBS_Balanced, Score, Version, Reason,
+  //     SubscriptionEnd, PredictionDate }
+  // Result codes:
+  //   0=FAIL, 1=SUCCESS, 2=TOO_WEAK, 3=TOO_STRONG, 4=MODEL_ERROR,
+  //   5=HOF (use TBS, BScore is wrong), 6=FFATTACKS
+  // Important fields:
+  //   TBS — extrapolated battle-stat total (use this; raw is legacy)
+  //   Score — BScore, capped + wrong for HOF; rely only on TBS for those
+  //   SubscriptionEnd — ISO-8601 string; in past = sub lapsed
+  //
+  // Rate limit: 100 calls/minute (TDup's stated cap).
+  // Cache validity: 5 days per BSP's own PREDICTION_VALIDITY_DAYS.
+  const BSP_RESULT_FAIL         = 0;
+  const BSP_RESULT_SUCCESS      = 1;
+  const BSP_RESULT_TOO_WEAK     = 2;
+  const BSP_RESULT_TOO_STRONG   = 3;
+  const BSP_RESULT_MODEL_ERROR  = 4;
+  const BSP_RESULT_HOF          = 5;
+  const BSP_RESULT_FFATTACKS    = 6;
+  const BSP_PREDICTION_VALID_SEC = 5 * 86400;
+  const BSP_ERROR_RETRY_SEC      = 300;
+  const BSP_BASE_URL             = 'http://www.lol-manager.com/api/battlestats';
+  // Tool-name slot in the URL — TDup uses this to attribute calls per his
+  // own spec. Keep it as "TECH" so traffic shows up under our app.
+  const BSP_TOOL_NAME            = 'TECH';
+
+  function bspSubscriptionActive() {
+    const endSec = (meta && typeof meta.bspSubscriptionEnd === 'number')
+      ? meta.bspSubscriptionEnd : 0;
+    if (!endSec) return null; // unknown — haven't called BSP yet
+    return endSec > nowSec();
+  }
+
+  // Convert TDup's ISO-8601 SubscriptionEnd ("2025-11-01T00:06:39.0066667")
+  // into unix seconds. Tolerates the fractional seconds tail Date can't parse.
+  function parseBspSubEnd(str) {
+    if (typeof str !== 'string' || !str) return 0;
+    const trimmed = str.replace(/\.\d+$/, '');
+    const ms = Date.parse(trimmed);
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0;
+  }
+
+  async function fetchBSPPrediction(id) {
+    const playerId = parseInt(id, 10);
+    if (!Number.isFinite(playerId) || playerId <= 0) throw new Error('Invalid player ID');
+    // v1.1.0-dev — per-service key override. Use settings.bspApiKey if
+    // set; otherwise fall back to the main TECH key. Lets users who
+    // registered a different Torn key with BSP point TECH at it without
+    // changing the global key.
+    const apiKey = (settings.bspApiKey && settings.bspApiKey.trim()) || settings.apiKey;
+    if (!apiKey) throw new Error('No API key set');
+    if (isRateLimited()) {
+      throw new Error('Rate-limited · retry in ' + rateLimitRemainingSec() + 's');
+    }
+    const url = BSP_BASE_URL + '/'
+              + encodeURIComponent(apiKey) + '/'
+              + playerId + '/'
+              + encodeURIComponent(BSP_TOOL_NAME);
+    // 5-day cross-tab cache because BSP predictions don't change minute-to-
+    // minute and TDup's rate limit (100/min) is shared across all tools
+    // calling with the same key — generous caching keeps us polite.
+    const data = await apiGet(url, undefined, { crossTabTtl: BSP_PREDICTION_VALID_SEC * 1000 });
+    if (!data) throw new Error('Empty response from BSP');
+
+    const result = (typeof data.Result === 'number') ? data.Result : BSP_RESULT_FAIL;
+    const subEndSec = parseBspSubEnd(data.SubscriptionEnd);
+    if (subEndSec > 0) {
+      // Persist the latest known subscription end on the meta blob so the
+      // subscriber gate works even before this prediction is consumed.
+      if (meta.bspSubscriptionEnd !== subEndSec) {
+        meta.bspSubscriptionEnd = subEndSec;
+        store('meta', meta);
+      }
+    }
+
+    // Categorical "no useful data" cases — TooWeak / TooStrong / FFAttacks
+    // mean the model couldn't or wouldn't predict. We surface as noData
+    // (distinguishable from a hard error in the cache + UI).
+    if (result === BSP_RESULT_FAIL || result === BSP_RESULT_MODEL_ERROR) {
+      return { noData: true, result: result, reason: data.Reason || '',
+               subscriptionEnd: subEndSec, fetchedAt: nowSec() };
+    }
+    const tbs = (typeof data.TBS === 'number' && data.TBS > 0) ? data.TBS : null;
+    if (tbs === null) {
+      return { noData: true, result: result, reason: data.Reason || '',
+               subscriptionEnd: subEndSec, fetchedAt: nowSec() };
+    }
+    return {
+      noData:          false,
+      tbs:             tbs,
+      tbsBalanced:     (typeof data.TBS_Balanced === 'number') ? data.TBS_Balanced : null,
+      score:           (typeof data.Score === 'number') ? data.Score : null,
+      result:          result,
+      reason:          data.Reason || '',
+      isHof:           result === BSP_RESULT_HOF,
+      subscriptionEnd: subEndSec,
+      predictionDate:  data.PredictionDate || null,
+      fetchedAt:       nowSec(),
+    };
+  }
+
+  // Throttled fire-and-forget wrapper. Mirrors maybeFetchSpy.
+  function maybeFetchBSP(id, force) {
+    const playerId = parseInt(id, 10);
+    if (!Number.isFinite(playerId) || playerId <= 0) return;
+    if (!settings.apiKey) return;
+    if (!settings.bspEnabled) return;
+    // Don't bother calling BSP if we know the sub has lapsed — the call
+    // would succeed but return data we can't surface anyway (and would
+    // waste TDup's 100/min budget). Re-checks happen on app start when
+    // the user has time to re-subscribe.
+    const subActive = bspSubscriptionActive();
+    if (subActive === false) return;
+
+    const cached = bspCache[playerId];
+    const now = nowSec();
+    if (!force && cached && cached.fetchedAt) {
+      const since = now - cached.fetchedAt;
+      if (cached.error && since < BSP_ERROR_RETRY_SEC) return;
+      if (!cached.error && since < BSP_PREDICTION_VALID_SEC) return;
+    }
+    fetchBSPPrediction(playerId).then(function (pred) {
+      bspCache[playerId] = pred;
+      store('bspCache', bspCache);
+      if (currentDrill && currentDrill.kind === 'opponent' && currentDrill.id === playerId
+          && panelEl && contentEl) {
+        renderActive();
+      }
+    }).catch(function (e) {
+      bspCache[playerId] = Object.assign(bspCache[playerId] || {}, {
+        error: String(e && e.message ? e.message : e),
+        fetchedAt: now,
+      });
+      store('bspCache', bspCache);
+      if (currentDrill && currentDrill.kind === 'opponent' && currentDrill.id === playerId
+          && panelEl && contentEl) {
+        renderActive();
+      }
+    });
+  }
+
+  // ─── FF SCOUTER INTEGRATION (v1.1.0-dev) ─────────────────────────────
+  // Glasnost/rDacted's public stat-estimate service. Free tier covers FF
+  // rating + battle-stat estimate; premium tier adds top-stats distribution.
+  // Author requested 1-hour cache cap and we honour it cleanly via the
+  // cross-tab cache TTL. Batched endpoint is a major efficiency win over
+  // BSP — one HTTP call for an entire 100-member roster.
+  //
+  // Endpoint: GET https://ffscouter.com/api/v1/get-stats
+  //   ?key={user's Torn limited API key}
+  //   &targets={comma-separated player ids}
+  // Returns: array of per-id objects (see ffCache shape comment above).
+  //   fair_fight === null means "no data on this player".
+  // Errors come back as { error: "...", code: N } at top level.
+  // Rate limit: server-reported via x-ratelimit-* headers, default 100/min.
+  const FFSCOUTER_PREDICTION_VALID_SEC = 60 * 60;            // 1 hour
+  const FFSCOUTER_ERROR_RETRY_SEC      = 300;                // 5 min
+  const FFSCOUTER_BASE_URL             = 'https://ffscouter.com';
+  const FFSCOUTER_BATCH_SIZE           = 100;                // ids per request
+  const FFSCOUTER_PREMIUM_URL          = 'https://ffscouter.com/premium';
+
+  async function fetchFFScouter(playerIds) {
+    if (!Array.isArray(playerIds) || playerIds.length === 0) return [];
+    // v1.1.0-dev — per-service key override. Use settings.ffApiKey if
+    // set; otherwise fall back to the main TECH key. Lets users who
+    // registered a different Torn key with FF Scouter target it without
+    // changing the global key.
+    const apiKey = (settings.ffApiKey && settings.ffApiKey.trim()) || settings.apiKey;
+    if (!apiKey) throw new Error('No API key set');
+    if (isRateLimited()) {
+      throw new Error('Rate-limited · retry in ' + rateLimitRemainingSec() + 's');
+    }
+    // De-dupe + cap to API batch size — guard against caller passing junk.
+    const dedup = Array.from(new Set(playerIds
+      .map(function (x) { return parseInt(x, 10); })
+      .filter(function (n) { return Number.isFinite(n) && n > 0; })));
+    if (dedup.length === 0) return [];
+
+    const url = FFSCOUTER_BASE_URL + '/api/v1/get-stats'
+              + '?key=' + encodeURIComponent(apiKey)
+              + '&targets=' + dedup.join(',');
+
+    // 1-hour cross-tab cache TTL matches the per-entry TTL we enforce in
+    // ffCache (FFSCOUTER_PREDICTION_VALID_SEC), so a second tab fetching
+    // the same target list within an hour reuses tab A's response.
+    const data = await apiGet(url, undefined, {
+      crossTabTtl: FFSCOUTER_PREDICTION_VALID_SEC * 1000,
+    });
+
+    // Error shape: { error: "...", code: N }
+    if (data && data.error) {
+      throw new Error('FF Scouter: ' + data.error);
+    }
+    if (!Array.isArray(data)) {
+      throw new Error('FF Scouter returned unexpected payload');
+    }
+    return data;
+  }
+
+  // Normalises one entry from the FF Scouter response into the ffCache shape.
+  function normalizeFFEntry(raw) {
+    const noData = raw && (raw.fair_fight === null || raw.fair_fight === undefined);
+    if (noData) {
+      return { noData: true, fetchedAt: nowSec() };
+    }
+    return {
+      noData:            false,
+      ff:                (typeof raw.fair_fight === 'number') ? raw.fair_fight : null,
+      bsEstimate:        (typeof raw.bs_estimate === 'number') ? raw.bs_estimate : null,
+      bsEstimateHuman:   raw.bs_estimate_human || null,
+      lastUpdated:       (typeof raw.last_updated === 'number') ? raw.last_updated : 0,
+      premiumAvailable:  !!raw.premium_insights_available,
+      distributionHuman: (raw.distribution && raw.distribution.distribution_human) || null,
+      fetchedAt:         nowSec(),
+    };
+  }
+
+  // Throttled fire-and-forget wrapper for a single player ID. Mirrors
+  // maybeFetchSpy / maybeFetchBSP. Single-target call still uses the
+  // batch endpoint with one id — the server doesn't care, and we benefit
+  // from the same cross-tab cache key.
+  function maybeFetchFFScouter(id, force) {
+    const playerId = parseInt(id, 10);
+    if (!Number.isFinite(playerId) || playerId <= 0) return;
+    if (!settings.apiKey) return;
+    if (!settings.ffEnabled) return;
+
+    const cached = ffCache[playerId];
+    const now = nowSec();
+    if (!force && cached && cached.fetchedAt) {
+      const since = now - cached.fetchedAt;
+      if (cached.error && since < FFSCOUTER_ERROR_RETRY_SEC) return;
+      if (!cached.error && since < FFSCOUTER_PREDICTION_VALID_SEC) return;
+    }
+    fetchFFScouter([playerId]).then(function (results) {
+      // Server may return entries for ids we didn't ask for? Unlikely, but
+      // defensively iterate and only commit the row that matches.
+      let matched = false;
+      for (const raw of results) {
+        if (raw && raw.player_id === playerId) {
+          ffCache[playerId] = normalizeFFEntry(raw);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        // Server omitted the row — treat as noData so we don't keep retrying.
+        ffCache[playerId] = { noData: true, fetchedAt: nowSec() };
+      }
+      store('ffCache', ffCache);
+      if (currentDrill && currentDrill.kind === 'opponent' && currentDrill.id === playerId
+          && panelEl && contentEl) {
+        renderActive();
+      }
+    }).catch(function (e) {
+      ffCache[playerId] = Object.assign(ffCache[playerId] || {}, {
+        error: String(e && e.message ? e.message : e),
+        fetchedAt: now,
+      });
+      store('ffCache', ffCache);
+      if (currentDrill && currentDrill.kind === 'opponent' && currentDrill.id === playerId
+          && panelEl && contentEl) {
+        renderActive();
+      }
+    });
+  }
+
+  // Bulk-pull FF Scouter predictions for a whole scouted roster. Uses the
+  // batched endpoint: one HTTP call for up to FFSCOUTER_BATCH_SIZE ids,
+  // chunked if the roster is larger. Compared to the spy / BSP per-target
+  // bulk pulls (sequential, 250 ms between calls), this is 100x faster.
+  let scoutFFPulling = null;
+  async function pullFFScouterForRoster(roster) {
+    if (scoutFFPulling) return;
+    if (!roster || !Array.isArray(roster.members)) return;
+    if (!settings.apiKey) return;
+    if (!settings.ffEnabled) return;
+
+    const now = nowSec();
+    const targets = roster.members.filter(function (m) {
+      if (m.id === meta.userId) return false;
+      const cached = ffCache[m.id];
+      if (!cached) return true;
+      // v1.1.0-dev — cached errors are *always* retryable on Pull FF. The
+      // user clicking the button is an explicit "try again" signal, so we
+      // shouldn't honor the standard cooldown that exists to prevent
+      // automatic hammering. A "key not registered" error stays cached
+      // forever otherwise, even after the user signs up.
+      if (cached.error) return true;
+      if (cached.fetchedAt
+          && (now - cached.fetchedAt) >= FFSCOUTER_PREDICTION_VALID_SEC) return true;
+      return false;
+    });
+
+    if (targets.length === 0) {
+      scoutFFPulling = { factionId: roster.factionId, current: 0, total: 0,
+                         message: 'All FF Scouter predictions already cached' };
+      renderActive();
+      setTimeout(function () { scoutFFPulling = null; renderActive(); }, 1500);
+      return;
+    }
+
+    // Slice into batches of FFSCOUTER_BATCH_SIZE ids.
+    const batches = [];
+    for (let i = 0; i < targets.length; i += FFSCOUTER_BATCH_SIZE) {
+      batches.push(targets.slice(i, i + FFSCOUTER_BATCH_SIZE));
+    }
+    scoutFFPulling = { factionId: roster.factionId, current: 0,
+                       total: targets.length, message: null };
+    renderActive();
+
+    try {
+      for (let b = 0; b < batches.length; b++) {
+        if (isRateLimited()) {
+          scoutFFPulling.message = 'Rate-limited; aborted at '
+                                 + scoutFFPulling.current + '/' + targets.length;
+          break;
+        }
+        const batch = batches[b];
+        const ids = batch.map(function (m) { return m.id; });
+        let results;
+        try {
+          results = await fetchFFScouter(ids);
+        } catch (e) {
+          // Hard error on a batch: tag each id in the batch with the error
+          // so we don't retry immediately, and abort the rest of the pull.
+          const msg = String(e && e.message ? e.message : e);
+          for (const m of batch) {
+            ffCache[m.id] = Object.assign(ffCache[m.id] || {}, {
+              error: msg, fetchedAt: nowSec(),
+            });
+          }
+          store('ffCache', ffCache);
+          scoutFFPulling.message = 'Stopped at batch ' + (b + 1) + '/' + batches.length
+                                 + ': ' + msg;
+          break;
+        }
+        // Map results back to player IDs and commit the cache.
+        const seen = new Set();
+        for (const raw of results) {
+          if (raw && raw.player_id) {
+            ffCache[raw.player_id] = normalizeFFEntry(raw);
+            seen.add(raw.player_id);
+          }
+        }
+        // Any ids the server didn't echo back get a "no data" stub so we
+        // don't keep asking for them every roster fetch.
+        for (const m of batch) {
+          if (!seen.has(m.id)) {
+            ffCache[m.id] = { noData: true, fetchedAt: nowSec() };
+          }
+        }
+        store('ffCache', ffCache);
+        scoutFFPulling.current = Math.min(targets.length,
+                                          scoutFFPulling.current + batch.length);
+        renderActive();
+        // Small pause between batches even though we're well under the
+        // 100/min ceiling — keeps us polite if the API budget tightens.
+        if (b < batches.length - 1) {
+          await new Promise(function (r) { setTimeout(r, 500); });
+        }
+      }
+    } finally {
+      const completionMsg = scoutFFPulling.message
+        || 'Pulled ' + scoutFFPulling.current + ' / ' + targets.length;
+      scoutFFPulling.message = completionMsg;
+      scoutFFPulling.current = scoutFFPulling.total;
+      renderActive();
+      setTimeout(function () {
+        scoutFFPulling = null;
+        if (panelEl && contentEl && settings.activeTab === 'scout') renderActive();
+      }, 2000);
+    }
+  }
+
+  // Roughened-band classifier. TDup's policy doesn't require us to
+  // roughen output, but we volunteer it: precise BSP numbers stay a
+  // reason to subscribe to BSP itself; TECH surfaces the strategic
+  // takeaway. Returns one of:
+  //   'soft'   — clearly weaker (TBS ratio: you ≥ 1.5× them)
+  //   'matched' — even or close (0.75× – 1.5×)
+  //   'dangerous' — they have edge (0.4× – 0.75×)
+  //   'out-of-league' — significantly stronger (< 0.4×)
+  // ratio = myTotal / theirTBS, so higher = easier for you.
+  function classifyBspBand(myTotal, theirTbs) {
+    if (!Number.isFinite(myTotal) || myTotal <= 0) return null;
+    if (!Number.isFinite(theirTbs) || theirTbs <= 0) return null;
+    const ratio = myTotal / theirTbs;
+    if (ratio >= 1.5)  return 'soft';
+    if (ratio >= 0.75) return 'matched';
+    if (ratio >= 0.4)  return 'dangerous';
+    return 'out-of-league';
+  }
+  const BSP_BAND_LABELS = {
+    'soft':          'Soft target',
+    'matched':       'Matched',
+    'dangerous':     'Dangerous',
+    'out-of-league': 'Out-of-league',
+  };
 
   // v0.6.54 — Sequential bulk-fetch of TornStats spy data for every member
   // of a scouted faction roster. Triggered by the "Pull spies" button on
@@ -2021,6 +2524,99 @@
       renderActive();
       setTimeout(function () {
         scoutSpyPulling = null;
+        if (panelEl && contentEl && settings.activeTab === 'scout') renderActive();
+      }, 2000);
+    }
+  }
+
+  // v1.0.1 — Bulk BSP prediction pull for a scouted roster. Mirrors
+  // pullSpiesForRoster: sequential, 250ms-paced, rate-limit-aware, aborts
+  // on first hard error. Uses the 5-day BSP cache (BSP_PREDICTION_VALID_SEC)
+  // so a freshly scouted roster only re-hits BSP for entries missing or
+  // stale. Subscription-gated: bails out immediately if the user's sub
+  // has lapsed, surfacing a message instead of churning calls.
+  let scoutBspPulling = null;
+  async function pullBSPForRoster(roster) {
+    if (scoutBspPulling) return;
+    if (!roster || !Array.isArray(roster.members)) return;
+    if (!settings.apiKey) return;
+    if (!settings.bspEnabled) return;
+    if (bspSubscriptionActive() === false) {
+      scoutBspPulling = { factionId: roster.factionId, current: 0, total: 0,
+                          message: 'BSP subscription lapsed — see settings to resubscribe' };
+      renderActive();
+      setTimeout(function () { scoutBspPulling = null; renderActive(); }, 2500);
+      return;
+    }
+
+    const now = nowSec();
+    const targets = roster.members.filter(function (m) {
+      if (m.id === meta.userId) return false;
+      const cached = bspCache[m.id];
+      if (!cached) return true;
+      // v1.1.0-dev — explicit user click is a "try again" signal; cached
+      // errors are always retryable on Pull BSP, no cooldown. Stops the
+      // "lapsed sub then resubbed but TECH won't recheck for 5 min" case.
+      if (cached.error) return true;
+      // Re-fetch good data only after the BSP-side validity window.
+      if (cached.fetchedAt
+          && (now - cached.fetchedAt) >= BSP_PREDICTION_VALID_SEC) return true;
+      return false;
+    });
+
+    if (targets.length === 0) {
+      scoutBspPulling = { factionId: roster.factionId, current: 0, total: 0,
+                          message: 'All BSP predictions already cached' };
+      renderActive();
+      setTimeout(function () { scoutBspPulling = null; renderActive(); }, 1500);
+      return;
+    }
+
+    scoutBspPulling = { factionId: roster.factionId, current: 0,
+                        total: targets.length, message: null };
+    renderActive();
+
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        if (isRateLimited()) {
+          scoutBspPulling.message = 'Rate-limited; aborted at ' + i + '/' + targets.length;
+          break;
+        }
+        // Subscription may lapse mid-pull (clock crosses SubscriptionEnd).
+        // Each fetch refreshes meta.bspSubscriptionEnd via parseBspSubEnd,
+        // so this re-check catches that case cleanly.
+        if (bspSubscriptionActive() === false) {
+          scoutBspPulling.message = 'Subscription lapsed mid-pull; aborted at '
+                                   + i + '/' + targets.length;
+          break;
+        }
+        const m = targets[i];
+        scoutBspPulling.current = i + 1;
+        try {
+          const pred = await fetchBSPPrediction(m.id);
+          bspCache[m.id] = pred;
+          store('bspCache', bspCache);
+        } catch (e) {
+          bspCache[m.id] = Object.assign(bspCache[m.id] || {}, {
+            error: String(e && e.message ? e.message : e),
+            fetchedAt: nowSec(),
+          });
+          store('bspCache', bspCache);
+          scoutBspPulling.message = 'Stopped at ' + (i + 1) + '/' + targets.length
+                                  + ': ' + (e && e.message ? e.message : e);
+          break;
+        }
+        if ((i + 1) % 5 === 0) renderActive();
+        await new Promise(function (r) { setTimeout(r, SCOUT_SPY_DELAY_MS); });
+      }
+    } finally {
+      const completionMsg = scoutBspPulling.message
+        || 'Pulled ' + scoutBspPulling.current + ' / ' + targets.length;
+      scoutBspPulling.message = completionMsg;
+      scoutBspPulling.current = scoutBspPulling.total;
+      renderActive();
+      setTimeout(function () {
+        scoutBspPulling = null;
         if (panelEl && contentEl && settings.activeTab === 'scout') renderActive();
       }, 2000);
     }
@@ -5508,6 +6104,31 @@
     .tech-scout-row.verdict-unknown   .tech-scout-verdict .verdict{color:#9ca3af;font-style:italic;}
     .tech-scout-row.verdict-nohistory .tech-scout-verdict .verdict{color:#6b7280;font-style:italic;}
 
+    /* v0.7.x — Scout War Priority sort: banner above the row list + green
+       decoration on the top row. The banner uses a soft green-to-violet
+       gradient so it reads as "action mode" without competing with the
+       red WAR scorecard pill on the Dashboard. */
+    .tech-scout-war-banner{margin:10px 0 6px;padding:8px 12px;border-radius:5px;
+      background:linear-gradient(90deg,rgba(52,211,153,.14) 0%,rgba(168,85,247,.06) 100%);
+      border:1px solid #059669;border-left:3px solid #34d399;
+      font:700 11px/1.2 system-ui,sans-serif;text-transform:uppercase;
+      letter-spacing:1.5px;color:#34d399;
+      box-shadow:0 0 8px rgba(52,211,153,.18);}
+    .tech-scout-war-banner-icon{margin-right:2px;
+      text-shadow:0 0 6px rgba(52,211,153,.6);}
+    .tech-scout-war-banner strong{color:#f3f4f6;}
+    .tech-scout-war-banner-sub{color:#9ca3af;text-transform:none;letter-spacing:.5px;
+      font-weight:500;margin-left:6px;}
+    .tech-scout-row.war-priority-top{
+      border-left:3px solid #34d399 !important;
+      background:rgba(52,211,153,.06);
+      box-shadow:inset 4px 0 12px -8px rgba(52,211,153,.5);
+      position:relative;}
+    .tech-scout-row.war-priority-top::after{
+      content:'⚡';position:absolute;top:50%;right:10px;
+      transform:translateY(-50%);font-size:18px;color:#34d399;
+      text-shadow:0 0 8px rgba(52,211,153,.7);pointer-events:none;}
+
     /* Target queue (v0.6.39) — Dashboard pinned opponents + star toggle */
     .tech-star-btn{margin-left:auto;background:transparent;border:1px solid #2a1f2e;
       color:#c4b5fd;border-radius:4px;padding:3px 9px;
@@ -7413,6 +8034,281 @@
     }
   }
 
+  // v1.0.1 — BSP (Battle Stats Predictor) intel card.
+  // Renders only when the user has opted in (settings.bspEnabled).
+  // Output is roughened to coarse bands so BSP's precise TBS / BScore
+  // numbers stay a reason to subscribe to BSP directly. Subscription
+  // gate respected — lapsed subs see a "subscribe" nudge, not data.
+  // Link to BSP's Torn forum thread for sign-up/info:
+  //   forums.php#/p=threads&f=67&t=16290324
+  const BSP_FORUM_URL = 'https://www.torn.com/forums.php#/p=threads&f=67&t=16290324';
+  // v1.1.0-dev — Theme-aligned band palette. Cool → warm escalation:
+  // icy cyan → TECH purple (matches the spy card header) → gold (matches
+  // the spy total number) → orange. Keeps BSP visually consistent with
+  // the rest of the panel instead of using generic traffic-light colors.
+  const BSP_BAND_COLORS = {
+    'soft':          '#67e8f9', // icy cyan — clearly weaker
+    'matched':       '#a855f7', // TECH purple — 50/50
+    'dangerous':     '#fde047', // gold — they have edge
+    'out-of-league': '#fb923c', // orange — don't engage
+  };
+  function renderBSPCard(host, opponentId) {
+    if (!settings.bspEnabled) return; // toggle off → render nothing
+    const cached = bspCache[opponentId];
+    const fetchedAge = (cached && cached.fetchedAt)
+      ? fmtAgo(cached.fetchedAt)
+      : 'never';
+
+    const headerRow = el('div', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               marginBottom: '6px', fontSize: '10px',
+               textTransform: 'uppercase', letterSpacing: '1.2px',
+               color: '#60a5fa', fontWeight: '700' },
+    },
+      el('span', {}, 'BSP estimate'),
+      el('span', { style: { color: '#6b7280', fontWeight: '500',
+                            textTransform: 'none', letterSpacing: '.5px' } },
+        '· last poll ' + fetchedAge),
+      el('button', {
+        type: 'button',
+        class: 'tech-targets-refresh',
+        title: 'Refresh BSP prediction now',
+        style: { marginLeft: 'auto' },
+        'on:click': function () {
+          maybeFetchBSP(opponentId, true);
+        },
+      }, '↻'),
+    );
+    host.appendChild(headerRow);
+
+    // Subscription gate — if we know the sub has lapsed, surface the
+    // subscribe nudge instead of any data. Active drives TECH traffic to
+    // BSP signups (the deal we made with TDup).
+    if (bspSubscriptionActive() === false) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#cbd5e1',
+                 background: '#0f0a12', border: '1px solid #2a1f2e',
+                 borderRadius: '3px', padding: '8px 10px',
+                 marginBottom: '11px', lineHeight: '1.5' },
+      },
+        'Your BSP subscription has lapsed. ',
+        el('a', {
+          href: BSP_FORUM_URL, target: '_blank', rel: 'noopener',
+          style: { color: '#60a5fa', textDecoration: 'underline' },
+        }, 'Subscribe at BSP'),
+        ' to re-enable strength predictions.',
+      ));
+      return;
+    }
+
+    if (!cached) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#6b7280', fontStyle: 'italic',
+                 marginBottom: '11px' },
+      }, 'Fetching BSP prediction…'));
+      return;
+    }
+
+    if (cached.error) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#f87171', marginBottom: '11px' },
+      }, '⚠ ' + cached.error));
+      return;
+    }
+
+    if (cached.noData) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#6b7280', marginBottom: '11px' },
+      }, 'BSP could not produce a prediction for this player.'));
+      return;
+    }
+
+    // Roughened band — compare BSP's TBS to user's own total. Falls back
+    // to neutral copy if we don't know the user's stats yet.
+    const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
+      ? meta.battleStats.total : 0;
+    const band = classifyBspBand(myTotal, cached.tbs);
+    const bandLabel = band ? BSP_BAND_LABELS[band] : 'Estimate pending';
+    const bandColor = band ? BSP_BAND_COLORS[band] : '#9ca3af';
+
+    const bandLine = el('div', {
+      style: { display: 'flex', alignItems: 'baseline', gap: '10px',
+               marginBottom: '8px' },
+    },
+      el('span', { style: { fontSize: '10px', textTransform: 'uppercase',
+                            letterSpacing: '1px', color: '#6b7280',
+                            fontWeight: '700' } }, 'Verdict'),
+      el('span', { style: { fontFamily: "Impact, 'Oswald', 'Arial Narrow', sans-serif",
+                            fontSize: '18px', color: bandColor,
+                            textShadow: '0 0 6px ' + bandColor + '40',
+                            letterSpacing: '.5px' } },
+        bandLabel),
+      cached.isHof
+        ? el('span', { style: { fontSize: '9px', color: '#fbbf24',
+                                fontWeight: '700', marginLeft: 'auto',
+                                background: '#3a2a0a', padding: '2px 6px',
+                                borderRadius: '3px' } }, 'HOF')
+        : null,
+    );
+    host.appendChild(bandLine);
+
+    // Attribution + subscribe link — credits BSP visibly, per agreement
+    // with TDup. Doubles as a churn-recovery nudge if the user lets the
+    // sub expire while still using TECH.
+    host.appendChild(el('div', {
+      style: { fontSize: '10px', color: '#6b7280', marginBottom: '11px',
+               lineHeight: '1.5' },
+    },
+      'Roughened from BSP TBS · ',
+      el('a', {
+        href: BSP_FORUM_URL, target: '_blank', rel: 'noopener',
+        style: { color: '#60a5fa', textDecoration: 'none' },
+      }, 'BSP info'),
+    ));
+  }
+
+  // v1.1.0-dev — FF Scouter intel card. Renders only when the user has
+  // opted in (settings.ffEnabled). Uses the same theme-aligned band
+  // palette as BSP for visual consistency. Surfaces the raw FF rating
+  // alongside the band so users can see the underlying signal — FF
+  // Scouter doesn't have a subscription model (free tier provides the
+  // data we surface), so there's no nudge step like BSP.
+  function renderFFCard(host, opponentId) {
+    if (!settings.ffEnabled) return; // toggle off → render nothing
+    const cached = ffCache[opponentId];
+    const fetchedAge = (cached && cached.fetchedAt)
+      ? fmtAgo(cached.fetchedAt)
+      : 'never';
+
+    const headerRow = el('div', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               marginBottom: '6px', fontSize: '10px',
+               textTransform: 'uppercase', letterSpacing: '1.2px',
+               color: '#34d399', fontWeight: '700' },
+    },
+      el('span', {}, 'FF Scouter'),
+      el('span', { style: { color: '#6b7280', fontWeight: '500',
+                            textTransform: 'none', letterSpacing: '.5px' } },
+        '· last poll ' + fetchedAge),
+      el('button', {
+        type: 'button',
+        class: 'tech-targets-refresh',
+        title: 'Refresh FF Scouter prediction now',
+        style: { marginLeft: 'auto' },
+        'on:click': function () {
+          maybeFetchFFScouter(opponentId, true);
+        },
+      }, '↻'),
+    );
+    host.appendChild(headerRow);
+
+    if (!cached) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#6b7280', fontStyle: 'italic',
+                 marginBottom: '11px' },
+      }, 'Fetching FF Scouter prediction…'));
+      return;
+    }
+
+    if (cached.error) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#f87171', marginBottom: '11px' },
+      }, '⚠ ' + cached.error));
+      return;
+    }
+
+    if (cached.noData) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#6b7280', marginBottom: '11px' },
+      }, 'FF Scouter has no data on this player.'));
+      return;
+    }
+
+    // Band classification — prefer bs_estimate (same shape as BSP),
+    // fall back to FF rating mapping if bs_estimate is missing.
+    const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
+      ? meta.battleStats.total : 0;
+    let band = null;
+    if (typeof cached.bsEstimate === 'number' && cached.bsEstimate > 0) {
+      band = classifyBspBand(myTotal, cached.bsEstimate);
+    } else if (typeof cached.ff === 'number') {
+      // FF rating → band: 1.0 = soft, 2.0 = matched, 3.0 = dangerous, 4.0+ = out-of-league
+      const ff = cached.ff;
+      if      (ff <= 1.5) band = 'soft';
+      else if (ff <= 2.5) band = 'matched';
+      else if (ff <= 3.5) band = 'dangerous';
+      else                band = 'out-of-league';
+    }
+    const bandLabel = band ? BSP_BAND_LABELS[band] : 'Estimate pending';
+    const bandColor = band ? BSP_BAND_COLORS[band] : '#9ca3af';
+
+    const bandLine = el('div', {
+      style: { display: 'flex', alignItems: 'baseline', gap: '10px',
+               marginBottom: '8px' },
+    },
+      el('span', { style: { fontSize: '10px', textTransform: 'uppercase',
+                            letterSpacing: '1px', color: '#6b7280',
+                            fontWeight: '700' } }, 'Verdict'),
+      el('span', { style: { fontFamily: "Impact, 'Oswald', 'Arial Narrow', sans-serif",
+                            fontSize: '18px', color: bandColor,
+                            textShadow: '0 0 6px ' + bandColor + '40',
+                            letterSpacing: '.5px' } },
+        bandLabel),
+      typeof cached.ff === 'number'
+        ? el('span', { style: { fontSize: '11px', color: '#9ca3af',
+                                marginLeft: 'auto' } },
+            'FF ' + cached.ff.toFixed(2))
+        : null,
+    );
+    host.appendChild(bandLine);
+
+    // Stat-estimate line (FF Scouter's bs_estimate_human is a pre-formatted
+    // string like "~10M"). Only shows when the server returned an estimate.
+    if (cached.bsEstimateHuman) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#cbd5e1', marginBottom: '6px' },
+      },
+        el('span', { style: { color: '#6b7280', marginRight: '6px' } }, 'Est. stats:'),
+        cached.bsEstimateHuman,
+      ));
+    }
+
+    // Premium-tier top-stats distribution. Shown when present; otherwise
+    // surface an upgrade-prompt line per FF Scouter's own UI pattern.
+    if (cached.distributionHuman) {
+      host.appendChild(el('div', {
+        style: { fontSize: '11px', color: '#cbd5e1', marginBottom: '8px',
+                 lineHeight: '1.4' },
+      },
+        el('span', { style: { color: '#6b7280', marginRight: '6px' } }, 'Top stats:'),
+        cached.distributionHuman,
+      ));
+    } else if (cached.premiumAvailable) {
+      host.appendChild(el('div', {
+        style: { fontSize: '10px', color: '#9ca3af', marginBottom: '8px',
+                 fontStyle: 'italic' },
+      },
+        'Premium data available · ',
+        el('a', {
+          href: FFSCOUTER_PREMIUM_URL, target: '_blank', rel: 'noopener',
+          style: { color: '#34d399', textDecoration: 'underline' },
+        }, 'Upgrade FF Scouter'),
+      ));
+    }
+
+    // Attribution.
+    host.appendChild(el('div', {
+      style: { fontSize: '10px', color: '#6b7280', marginBottom: '11px',
+               lineHeight: '1.5' },
+    },
+      'Powered by FF Scouter · ',
+      el('a', {
+        href: 'https://ffscouter.com', target: '_blank', rel: 'noopener',
+        style: { color: '#34d399', textDecoration: 'none' },
+      }, 'ffscouter.com'),
+    ));
+  }
+
   // ─── DRILL: OPPONENT INTEL ──────────────────────────────────────────────
   // Rendered in place of the active tab when currentDrill is set.
   function renderOpponentDrill(host, opponentId) {
@@ -7462,6 +8358,21 @@
       const spySec = el('div', { class: 'tech-section' });
       renderSpyCard(spySec, opponentId);
       host.appendChild(spySec);
+
+      // v1.0.1 — BSP card in the same pre-fight strategic slot. Renders
+      // nothing if the user hasn't opted in, so existing UX is unchanged
+      // by default.
+      if (settings.bspEnabled) {
+        const bspSec = el('div', { class: 'tech-section' });
+        renderBSPCard(bspSec, opponentId);
+        host.appendChild(bspSec);
+      }
+      // v1.1.0-dev — FF Scouter card alongside BSP. Same opt-in pattern.
+      if (settings.ffEnabled) {
+        const ffSec = el('div', { class: 'tech-section' });
+        renderFFCard(ffSec, opponentId);
+        host.appendChild(ffSec);
+      }
 
       host.appendChild(el('div', { class: 'tech-empty' },
         el('strong', {}, 'No fights with this opponent yet'),
@@ -7534,6 +8445,23 @@
     const spySec = el('div', { class: 'tech-section' });
     renderSpyCard(spySec, intel.id);
     host.appendChild(spySec);
+
+    // v1.0.1 — BSP card pairs with spy. Same strategic question (current
+    // strength) from a different source: modeled instead of measured.
+    // Renders nothing when the user hasn't opted in.
+    if (settings.bspEnabled) {
+      const bspSec = el('div', { class: 'tech-section' });
+      renderBSPCard(bspSec, intel.id);
+      host.appendChild(bspSec);
+    }
+    // v1.1.0-dev — FF Scouter card pairs with BSP. Provides the same
+    // strategic answer for users who haven't subscribed to BSP, plus an
+    // independent cross-check for those who have.
+    if (settings.ffEnabled) {
+      const ffSec = el('div', { class: 'tech-section' });
+      renderFFCard(ffSec, intel.id);
+      host.appendChild(ffSec);
+    }
 
     // Row 1: fights · win rate · respect net
     const winRateCard = intel.asAttacker >= 1
@@ -7916,6 +8844,24 @@
         'Get one in API preferences'),
       '. Stored locally only.'));
 
+    // v1.1.0-dev — Optional TornStats key override. TornStats uses your
+    // Torn API key for auth (no separate key); some users have a different
+    // Torn key registered there than the one in the main field above.
+    // Empty = use the main key. Same pattern as the BSP / FF Scouter
+    // overrides further down in this form.
+    const tornStatsKeyInput = el('input', {
+      type: 'password',
+      class: 'tech-input',
+      placeholder: 'TornStats-registered Torn key (optional — leave blank to use main key above)',
+      value: settings.tornStatsApiKey || '',
+      style: { width: '100%', marginTop: '6px', fontSize: '11px' },
+    });
+    form.appendChild(tornStatsKeyInput);
+    tornStatsKeyInput.addEventListener('change', function () {
+      settings.tornStatsApiKey = tornStatsKeyInput.value.trim();
+      store('settings', settings);
+    });
+
     form.appendChild(el('label', {}, 'Poll interval'));
     const intervalSel = el('select', {});
     for (const sec of POLL_OPTIONS_SEC) {
@@ -8038,6 +8984,121 @@
         chainHint.textContent = 'Chain-break notifications off.';
       }
       settings.notifyChainBreak = chainCb.checked;
+      store('settings', settings);
+    });
+
+    // v1.0.1 — BSP (Battle Stats Predictor) integration toggle.
+    // Cleared by TDup 2026-06-01 with one condition: each TECH user must
+    // have their own active BSP subscription. We enforce that by reading
+    // SubscriptionEnd off every BSP response — when it falls in the past
+    // we disable the feature and surface the "subscribe at BSP" link.
+    // Output is roughened to coarse bands ("Soft / Matched / Dangerous /
+    // Out-of-league") so BSP's precise TBS numbers stay a reason to
+    // subscribe directly.
+    form.appendChild(el('label', {}, 'BSP predictions'));
+    const bspCb = el('input', { type: 'checkbox' });
+    bspCb.checked = !!settings.bspEnabled;
+    const bspLabel = el('label', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               textTransform: 'none', letterSpacing: '0', color: '#e5e7eb',
+               fontWeight: '500', cursor: 'pointer', margin: '0' },
+    },
+      bspCb,
+      el('span', {}, 'Roughened battle-stat estimates from BSP (requires your own active BSP subscription)'),
+    );
+    form.appendChild(bspLabel);
+
+    // Hint reflects current subscription state if we've called BSP before;
+    // otherwise prompts the user to enable and run a probe.
+    function bspHintText() {
+      if (!settings.bspEnabled) {
+        return 'Off. Toggle on to show BSP’s rough strength bands on Scout rows and Opponent Intel.';
+      }
+      const state = bspSubscriptionActive();
+      if (state === true) {
+        const endDate = new Date(meta.bspSubscriptionEnd * 1000);
+        return 'BSP subscription active until ' + endDate.toLocaleDateString() + '. Bands appear once a target is scouted.';
+      }
+      if (state === false) {
+        return 'Your BSP subscription has lapsed. Predictions are paused; resubscribe to re-enable. (See BSP’s Torn forum thread.)';
+      }
+      return 'Checking subscription on next scout… if you’ve never subscribed to BSP, predictions will stay off and a subscribe link will appear here.';
+    }
+    const bspHint = el('div', { class: 'hint' }, bspHintText());
+    form.appendChild(bspHint);
+
+    // v1.1.0-dev — Optional per-service API key override. Empty = use the
+    // main TECH key. Useful when the user registered a different Torn
+    // limited key with BSP (security partitioning, multi-key setup, etc.).
+    const bspKeyInput = el('input', {
+      type: 'password',
+      class: 'tech-input',
+      placeholder: 'BSP-registered Torn key (optional — leave blank to use main key above)',
+      value: settings.bspApiKey || '',
+      style: { width: '100%', marginTop: '6px', fontSize: '11px' },
+    });
+    form.appendChild(bspKeyInput);
+    bspKeyInput.addEventListener('change', function () {
+      settings.bspApiKey = bspKeyInput.value.trim();
+      store('settings', settings);
+    });
+
+    bspCb.addEventListener('change', function () {
+      settings.bspEnabled = bspCb.checked;
+      store('settings', settings);
+      bspHint.textContent = bspHintText();
+      // Kick a probe against the user's own ID on opt-in so the hint can
+      // reflect real subscription state on the next render — no need to
+      // wait for a scout to discover the answer.
+      if (settings.bspEnabled && meta.userId) {
+        maybeFetchBSP(meta.userId, /* force */ true);
+        // Re-paint the hint a moment after the probe lands.
+        setTimeout(function () { bspHint.textContent = bspHintText(); }, 3000);
+      }
+    });
+
+    // v1.1.0-dev — FF Scouter predictions toggle.
+    // Public API per the FF Scouter author (Glasnost/rDacted); 1-hour cache
+    // cap baked in. No subscription gate for the basic data layer we surface
+    // (fair_fight + bs_estimate); only the "top stats distribution" premium
+    // feature gates and we display the upgrade prompt in the card UI.
+    form.appendChild(el('label', {}, 'FF Scouter predictions'));
+    const ffCb = el('input', { type: 'checkbox' });
+    ffCb.checked = !!settings.ffEnabled;
+    const ffLabel = el('label', {
+      style: { display: 'flex', alignItems: 'center', gap: '8px',
+               textTransform: 'none', letterSpacing: '0', color: '#e5e7eb',
+               fontWeight: '500', cursor: 'pointer', margin: '0' },
+    },
+      ffCb,
+      el('span', {}, 'Fair Fight + battle-stat estimates from FF Scouter (free, batched, 1h cache)'),
+    );
+    form.appendChild(ffLabel);
+    form.appendChild(el('div', { class: 'hint' },
+      settings.ffEnabled
+        ? 'On. Bands appear on Scout rows and Opponent Intel once a target is scouted; the Pull FF Scouter button bulk-fetches an entire roster in one request.'
+        : 'Off. Toggle on to show FF Scouter’s rough strength bands on Scout rows and Opponent Intel. Needs your Torn API key registered with FF Scouter (free).',
+    ));
+
+    // v1.1.0-dev — Optional per-service API key override. Same pattern as
+    // BSP: empty = use main key. Lets the user point at whichever Torn
+    // key is registered at ffscouter.com if it's different from the one
+    // in the main API key field at the top of Settings.
+    const ffKeyInput = el('input', {
+      type: 'password',
+      class: 'tech-input',
+      placeholder: 'FF Scouter-registered Torn key (optional — leave blank to use main key above)',
+      value: settings.ffApiKey || '',
+      style: { width: '100%', marginTop: '6px', fontSize: '11px' },
+    });
+    form.appendChild(ffKeyInput);
+    ffKeyInput.addEventListener('change', function () {
+      settings.ffApiKey = ffKeyInput.value.trim();
+      store('settings', settings);
+    });
+
+    ffCb.addEventListener('change', function () {
+      settings.ffEnabled = ffCb.checked;
       store('settings', settings);
     });
 
@@ -8542,6 +9603,142 @@
     danger: 0, tank: 1, stale: 2, neutral: 3, unknown: 4, fav: 5,
   };
 
+  // ─── WAR PRIORITY SCORING (v0.7.x ranked-war wave, Phase 2) ─────────────
+  // Scout-tab "act now" sort, active only when scouting the user's current
+  // ranked-war target. Each roster member gets a 0..1 priority blending:
+  //   beatability (40%) — likelihood you win
+  //   speed       (30%) — how fast you finish them
+  //   availability(30%) — hittable right now
+  //
+  // Beatability has a graceful degradation chain so we work today without
+  // BSP (which is gated on TDup permission) and slot BSP in cleanly later:
+  //   1. BSP prediction      (future — once TDup approves)
+  //   2. TornStats spy total
+  //   3. fair_fight modifier from prior outgoing fight (direction-correct)
+  //   4. neutral 0.5
+  // Speed uses your historical avg outgoing-fight duration vs this opponent.
+  // Availability tiers from statusState + lastActionStatus.
+
+  // Walk all fights ONCE to build a per-opponent stats Map for the supplied
+  // roster IDs. Outgoing only — FF + duration mean different things from
+  // the defender side. Keyed by opponent id; values { fights, wins,
+  // durationSum, durationN, lastFF, lastFFTs }.
+  function buildPriorityContext(memberIdSet) {
+    const stats = new Map();
+    if (!meta.userId) return stats;
+    for (const code in fights) {
+      const raw = fights[code];
+      if (raw.attacker_id !== meta.userId) continue;
+      const oppId = raw.defender_id;
+      if (!memberIdSet.has(oppId)) continue;
+      let row = stats.get(oppId);
+      if (!row) {
+        row = { fights: 0, wins: 0, durationSum: 0, durationN: 0,
+                lastFF: null, lastFFTs: 0 };
+        stats.set(oppId, row);
+      }
+      row.fights++;
+      const v = deriveFightView(raw, meta.userId);
+      if (v.outcome.win) row.wins++;
+      if (v.durationSec > 0) { row.durationSum += v.durationSec; row.durationN++; }
+      if (typeof v.fairFight === 'number' && v.fairFight > 0
+          && (!row.lastFF || v.tsEnded > row.lastFFTs)) {
+        row.lastFF = v.fairFight;
+        row.lastFFTs = v.tsEnded;
+      }
+    }
+    return stats;
+  }
+
+  // Beatability 0..1, higher = easier to win.
+  // Chain: spy → BSP (if subscribed) → FF Scouter → local FF history → neutral.
+  //
+  // Layer rationale:
+  //   1. Spy — measured ground truth (gold standard)
+  //   2. BSP — modeled TBS, subscription-gated; TDup's specialised service
+  //   3. FF Scouter — modeled FF + bs_estimate, free tier; widely available
+  //      so it's the catch-most-cases layer for non-BSP users
+  //   4. Local FF history — what *we* have seen first-hand against this id
+  //   5. Neutral 0.5 — unknown
+  function getBeatabilityScore(memberId, oppStats, myTotal) {
+    const spy = spyCache[memberId];
+    if (spy && !spy.error && !spy.noData
+        && typeof spy.total === 'number' && spy.total > 0 && myTotal > 0) {
+      const ratio = spy.total / myTotal;
+      return Math.max(0, Math.min(1, 1 - ratio));
+    }
+    // BSP: only consult if user has it enabled AND has an active sub. We
+    // never *issue* a call from here (that's maybeFetchBSP's job) — we
+    // only read whatever is already cached.
+    if (settings.bspEnabled && bspSubscriptionActive() !== false) {
+      const bsp = bspCache[memberId];
+      if (bsp && !bsp.error && !bsp.noData
+          && typeof bsp.tbs === 'number' && bsp.tbs > 0 && myTotal > 0) {
+        const ratio = bsp.tbs / myTotal;
+        return Math.max(0, Math.min(1, 1 - ratio));
+      }
+    }
+    // FF Scouter: opt-in via settings.ffEnabled. Prefer bs_estimate (same
+    // shape as BSP's TBS) so the bands stay consistent; fall back to the
+    // fair_fight rating if bs_estimate is missing (rare but possible).
+    if (settings.ffEnabled) {
+      const ff = ffCache[memberId];
+      if (ff && !ff.error && !ff.noData) {
+        if (typeof ff.bsEstimate === 'number' && ff.bsEstimate > 0 && myTotal > 0) {
+          const ratio = ff.bsEstimate / myTotal;
+          return Math.max(0, Math.min(1, 1 - ratio));
+        }
+        if (typeof ff.ff === 'number') {
+          // FF rating: 1.0 ≈ opp ≤25% your stats (very beatable),
+          // 3.0 ≈ at-or-above (hard), 4.5+ ≈ unwinnable. Map onto 0..1.
+          return Math.max(0, Math.min(1, (3.0 - ff.ff) / 2.0));
+        }
+      }
+    }
+    // Local FF from past fights. Same formula as the FF Scouter fallback
+    // since both use the same FF scale.
+    if (oppStats && typeof oppStats.lastFF === 'number') {
+      return Math.max(0, Math.min(1, (3.0 - oppStats.lastFF) / 2.0));
+    }
+    return 0.5;
+  }
+
+  // Speed 0..1, higher = faster fights. 30s → 1.0, 60s → 0.66, 120s+ → 0.
+  // Thin history (< 1 timed fight) yields neutral 0.5 — speed shouldn't
+  // dominate when we don't actually know how fast they go down.
+  function getSpeedScore(oppStats) {
+    if (!oppStats || !oppStats.durationN || oppStats.durationN < 1) return 0.5;
+    const avg = oppStats.durationSum / oppStats.durationN;
+    return Math.max(0, Math.min(1, 1 - (avg - 30) / 90));
+  }
+
+  // Availability 0..1, higher = hittable right now.
+  function getAvailabilityScore(member) {
+    const state = member.statusState || null;
+    const lastStat = member.lastActionStatus || null;
+    if (state === 'Hospital' || state === 'Jail' || state === 'Federal') {
+      const remaining = (member.statusUntil || 0) - nowSec();
+      if (remaining > 0 && remaining < 60) return 0.5;
+      return state === 'Hospital' ? 0.1 : 0.05;
+    }
+    if (state === 'Traveling' || state === 'Abroad') return 0.0;
+    if (lastStat === 'Online') return 1.0;
+    if (lastStat === 'Idle')   return 0.85;
+    return 0.7;
+  }
+
+  function computeWarPriority(member, priorityCtx, myTotal) {
+    const oppStats = priorityCtx.get(member.id);
+    const beat  = getBeatabilityScore(member.id, oppStats, myTotal);
+    const speed = getSpeedScore(oppStats);
+    const avail = getAvailabilityScore(member);
+    return {
+      priority: beat * 0.40 + speed * 0.30 + avail * 0.30,
+      beat: beat, speed: speed, avail: avail,
+      sample: oppStats ? oppStats.fights : 0,
+    };
+  }
+
   function renderScoutTab(host) {
     if (!settings.apiKey) return renderNoKey(host);
     if (!meta.userId)     return renderWaiting(host, 'Identifying account…');
@@ -8568,7 +9765,15 @@
 
     // v0.6.35 — controls bar: sort dropdown + two filter toggles. Hidden
     // until a roster is rendered (no point sorting nothing).
-    const SCOUT_SORTS = [
+    const SCOUT_SORTS = [];
+    // v0.7.x — when a ranked war is detected, expose the "War Priority"
+    // sort at the top of the dropdown. Behaviour is gated per-render to
+    // the war target faction so it doesn't silently misorder unrelated
+    // scouts (see the sortKey downgrade in renderRoster below).
+    if (meta.activeWarTarget) {
+      SCOUT_SORTS.push({ key: 'war_priority', label: '⚡ War Priority (act now)' });
+    }
+    SCOUT_SORTS.push(
       { key: 'verdict',   label: 'Verdict (danger first)' },
       { key: 'hospSoon',  label: 'Hospital (out soonest)' },
       { key: 'status',    label: 'Status (hittable first)' },
@@ -8579,7 +9784,7 @@
       { key: 'recent',    label: 'Last action (recent first)' },
       { key: 'oldest',    label: 'Last action (oldest first)' },
       { key: 'name',      label: 'Name (A → Z)' },
-    ];
+    );
     const sortSel = el('select', { class: 'tech-scout-sort' });
     for (const s of SCOUT_SORTS) {
       const opt = el('option', { value: s.key }, s.label);
@@ -8607,6 +9812,36 @@
       const cached = scoutData[fid];
       if (cached) pullSpiesForRoster(cached);
     });
+    // v1.0.1 — companion Pull BSP button. Only rendered when the BSP
+    // feature is enabled. Label state mirrors pullSpyBtn — populated by
+    // renderRoster based on scoutBspPulling progress + cached entries.
+    const pullBspBtn = el('button', {
+      type: 'button',
+      class: 'tech-btn',
+      style: { padding: '4px 9px', fontSize: '10px' },
+      title: 'Bulk-fetch BSP predictions for every roster member without a fresh cache (subscription-gated)',
+    }, 'Pull BSP');
+    pullBspBtn.addEventListener('click', function () {
+      const fid = parseInt(idInput.value, 10);
+      if (!Number.isFinite(fid)) return;
+      const cached = scoutData[fid];
+      if (cached) pullBSPForRoster(cached);
+    });
+    // v1.1.0-dev — Pull FF Scouter button. Batched endpoint means an entire
+    // roster is a single HTTP call, so this is much faster than Pull spies
+    // or Pull BSP (no per-target 250ms pacing needed).
+    const pullFFBtn = el('button', {
+      type: 'button',
+      class: 'tech-btn',
+      style: { padding: '4px 9px', fontSize: '10px' },
+      title: 'Bulk-fetch FF Scouter predictions for every roster member (one batched request)',
+    }, 'Pull FF');
+    pullFFBtn.addEventListener('click', function () {
+      const fid = parseInt(idInput.value, 10);
+      if (!Number.isFinite(fid)) return;
+      const cached = scoutData[fid];
+      if (cached) pullFFScouterForRoster(cached);
+    });
 
     const controlsRow = el('div', { class: 'tech-scout-controls', style: { display: 'none' } },
       el('label', { class: 'tech-scout-ctrl' },
@@ -8620,6 +9855,8 @@
         hideTravelCb, el('span', {}, 'Hide traveling'),
       ),
       pullSpyBtn,
+      settings.bspEnabled ? pullBspBtn : null,
+      settings.ffEnabled ? pullFFBtn : null,
     );
     host.appendChild(controlsRow);
 
@@ -8687,6 +9924,64 @@
         pullSpyBtn.disabled = false;
       }
 
+      // v1.0.1 — Pull BSP button label state. Same logic as Pull spies
+      // but reads bspCache + BSP_PREDICTION_VALID_SEC. Only meaningful
+      // when the button is rendered (settings.bspEnabled === true).
+      if (settings.bspEnabled) {
+        if (scoutBspPulling && scoutBspPulling.factionId === roster.factionId) {
+          if (scoutBspPulling.message && scoutBspPulling.current === scoutBspPulling.total) {
+            pullBspBtn.textContent = scoutBspPulling.message;
+          } else {
+            pullBspBtn.textContent = 'Pulling ' + scoutBspPulling.current
+                                   + '/' + scoutBspPulling.total + '…';
+          }
+          pullBspBtn.disabled = true;
+        } else if (bspSubscriptionActive() === false) {
+          pullBspBtn.textContent = 'BSP sub lapsed';
+          pullBspBtn.disabled = true;
+        } else {
+          const nowTs = nowSec();
+          let needPullBsp = 0;
+          for (const m of roster.members) {
+            if (m.id === meta.userId) continue;
+            const c = bspCache[m.id];
+            if (!c) { needPullBsp++; continue; }
+            if (c.fetchedAt && (nowTs - c.fetchedAt) >= BSP_PREDICTION_VALID_SEC) needPullBsp++;
+          }
+          pullBspBtn.textContent = needPullBsp > 0
+            ? 'Pull BSP (' + needPullBsp + ')'
+            : 'Pull BSP';
+          pullBspBtn.disabled = false;
+        }
+      }
+
+      // v1.1.0-dev — Pull FF Scouter button label state. Mirrors the BSP
+      // pattern but reads ffCache + FFSCOUTER_PREDICTION_VALID_SEC.
+      if (settings.ffEnabled) {
+        if (scoutFFPulling && scoutFFPulling.factionId === roster.factionId) {
+          if (scoutFFPulling.message && scoutFFPulling.current === scoutFFPulling.total) {
+            pullFFBtn.textContent = scoutFFPulling.message;
+          } else {
+            pullFFBtn.textContent = 'Pulling ' + scoutFFPulling.current
+                                  + '/' + scoutFFPulling.total + '…';
+          }
+          pullFFBtn.disabled = true;
+        } else {
+          const nowTs = nowSec();
+          let needPullFF = 0;
+          for (const m of roster.members) {
+            if (m.id === meta.userId) continue;
+            const c = ffCache[m.id];
+            if (!c) { needPullFF++; continue; }
+            if (c.fetchedAt && (nowTs - c.fetchedAt) >= FFSCOUTER_PREDICTION_VALID_SEC) needPullFF++;
+          }
+          pullFFBtn.textContent = needPullFF > 0
+            ? 'Pull FF (' + needPullFF + ')'
+            : 'Pull FF';
+          pullFFBtn.disabled = false;
+        }
+      }
+
       // Filter out the user's own ID — if they scout a faction they're in,
       // lookupOpponentSummary would surface a meaningless fightCount equal
       // to every fight they've ever had (same bug v0.6.26 fixed for the
@@ -8710,13 +10005,39 @@
         return true;
       });
 
+      // v0.7.x — detect whether this is the active ranked-war target. Powers
+      // the War Priority sort, the banner, and the top-row decoration below.
+      const isWarTarget = !!(meta.activeWarTarget
+                             && roster.factionId === meta.activeWarTarget.factionId);
+
+      // Auto-switch to War Priority on first entry of a war-target scout —
+      // but only if the user hasn't explicitly chosen a non-default sort.
+      // Their explicit choice persists across renders via settings.scoutSort,
+      // so switching once is enough; they can override and it sticks.
+      if (isWarTarget && (!settings.scoutSort || settings.scoutSort === 'verdict')) {
+        settings.scoutSort = 'war_priority';
+        store('settings', settings);
+        if (sortSel) sortSel.value = 'war_priority';
+      }
+
+      // Build the per-opponent stats Map once (single walk over fights) for
+      // any roster whose sort needs priority scoring. Skipped entirely when
+      // priority isn't relevant — keeps non-war scouts zero-cost.
+      let priorityCtx = null;
+      const myStatsTotal = (meta.battleStats && meta.battleStats.total) || 0;
+      const needsPriority = isWarTarget || settings.scoutSort === 'war_priority';
+      if (needsPriority) {
+        const memberIdSet = new Set(filtered.map(function (m) { return m.id; }));
+        priorityCtx = buildPriorityContext(memberIdSet);
+      }
+
       // Enrich each member with their TECH verdict from local history.
       const rows = filtered.map(function (m) {
         const sum = lookupOpponentSummary(m.id) || {
           id: m.id, name: m.name, fightCount: 0, lastFairFight: null, verdict: null,
         };
         const verdictKey = sum.verdict ? sum.verdict.key : null;
-        return {
+        const row = {
           member: m,
           summary: sum,
           verdictKey,
@@ -8724,6 +10045,12 @@
                   ? (SCOUT_VERDICT_RANK[verdictKey] != null ? SCOUT_VERDICT_RANK[verdictKey] : 7)
                   : 6,  // no-history
         };
+        if (priorityCtx) {
+          const p = computeWarPriority(m, priorityCtx, myStatsTotal);
+          row.priority = p.priority;
+          row.priorityScores = p;
+        }
+        return row;
       });
 
       // v0.6.35 — sort by selected key. Verdict (default) keeps the
@@ -8731,11 +10058,30 @@
       // sorts push null levels to the end. Last-action sorts push 0
       // (never seen) to the end. All sorts fall back to name for stable
       // ordering at the leaf.
-      const sortKey = settings.scoutSort || 'verdict';
+      // v0.7.x — war_priority is only meaningful when scouting the active
+      // war target; if a stored value of 'war_priority' bleeds into a
+      // non-war scout, downgrade to verdict to avoid silently alphabetising.
+      let sortKey = settings.scoutSort || 'verdict';
+      if (sortKey === 'war_priority' && !isWarTarget) sortKey = 'verdict';
       function nameCmp(a, b) {
         return (a.member.name || '').localeCompare(b.member.name || '');
       }
       rows.sort(function (a, b) {
+        if (sortKey === 'war_priority') {
+          // Higher priority first. Tiebreak: more fight history (more
+          // confidence in the score), then raw beatability (cleaner kill
+          // beats balanced score), then alphabetical for stability.
+          const ap = a.priority != null ? a.priority : 0;
+          const bp = b.priority != null ? b.priority : 0;
+          if (Math.abs(ap - bp) > 0.001) return bp - ap;
+          const as = a.priorityScores ? a.priorityScores.sample : 0;
+          const bs = b.priorityScores ? b.priorityScores.sample : 0;
+          if (as !== bs) return bs - as;
+          const ab = a.priorityScores ? a.priorityScores.beat : 0;
+          const bb = b.priorityScores ? b.priorityScores.beat : 0;
+          if (Math.abs(ab - bb) > 0.001) return bb - ab;
+          return nameCmp(a, b);
+        }
         if (sortKey === 'verdict') {
           if (a.rank !== b.rank) return a.rank - b.rank;
           if (b.summary.fightCount !== a.summary.fightCount) {
@@ -8869,8 +10215,21 @@
         listHost.appendChild(sumLine);
       }
 
+      // v0.7.x — War Priority banner. Renders only when the sort is active
+      // AND we have a war-target match (sort downgrade above guards the
+      // other path). Top row gets the green border + ⚡ via a CSS class.
+      if (sortKey === 'war_priority' && isWarTarget) {
+        listHost.appendChild(el('div', { class: 'tech-scout-war-banner' },
+          el('span', { class: 'tech-scout-war-banner-icon' }, '⚡'),
+          el('span', {}, ' WAR PRIORITY · vs '),
+          el('strong', {}, meta.activeWarTarget.factionName),
+          el('span', { class: 'tech-scout-war-banner-sub' }, ' · top row = hit now'),
+        ));
+      }
+
       // Member rows
-      for (const row of rows) {
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        const row = rows[rowIndex];
         const m = row.member;
         const sum = row.summary;
         const vk = row.verdictKey || 'nohistory';
@@ -8928,9 +10287,89 @@
           }
         }
 
+        // v1.0.1 — BSP roughened band. Only shows when the user has opted in
+        // and BSP returned a usable estimate. Subscription-lapsed and noData
+        // states render nothing here (the band would just be noise without
+        // context — Opponent Intel surfaces those states properly).
+        //
+        // v1.1.0-dev — render as a colored span so the user can scan a 100-
+        // member roster at a glance. Bullet+label share the band color so
+        // each entry reads as a single styled chunk rather than text noise.
+        let bspBit = null;
+        if (settings.bspEnabled && bspSubscriptionActive() !== false) {
+          const cachedBsp = bspCache[m.id];
+          if (cachedBsp && !cachedBsp.error && !cachedBsp.noData
+              && typeof cachedBsp.tbs === 'number') {
+            const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
+              ? meta.battleStats.total : 0;
+            const band = classifyBspBand(myTotal, cachedBsp.tbs);
+            if (band) {
+              bspBit = el('span', {
+                style: {
+                  color: BSP_BAND_COLORS[band],
+                  fontWeight: '600',
+                  marginLeft: '4px',
+                },
+              }, '· bsp ' + BSP_BAND_LABELS[band]);
+            }
+          }
+        }
+
+        // v1.1.0-dev — FF Scouter roughened band. Same colored-span pattern
+        // as BSP. Same band classifier when bsEstimate is available; falls
+        // back to FF-rating mapping when only the FF score is present.
+        let ffBitScouter = null;
+        if (settings.ffEnabled) {
+          const cachedFF = ffCache[m.id];
+          if (cachedFF && !cachedFF.error && !cachedFF.noData) {
+            const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
+              ? meta.battleStats.total : 0;
+            let band = null;
+            if (typeof cachedFF.bsEstimate === 'number' && cachedFF.bsEstimate > 0) {
+              band = classifyBspBand(myTotal, cachedFF.bsEstimate);
+            } else if (typeof cachedFF.ff === 'number') {
+              const ff = cachedFF.ff;
+              if      (ff <= 1.5) band = 'soft';
+              else if (ff <= 2.5) band = 'matched';
+              else if (ff <= 3.5) band = 'dangerous';
+              else                band = 'out-of-league';
+            }
+            if (band) {
+              ffBitScouter = el('span', {
+                style: {
+                  color: BSP_BAND_COLORS[band],
+                  fontWeight: '600',
+                  marginLeft: '4px',
+                },
+              }, '· ff ' + BSP_BAND_LABELS[band]);
+            }
+          }
+        }
+
+        // v0.7.x — War Priority readout + tooltip breakdown. Only renders
+        // when the active sort is war_priority (so it doesn't clutter other
+        // views). Tooltip exposes the sub-scores so the user can see WHY
+        // a row was ranked where it was.
+        let priBit = '';
+        let priTitleExtra = '';
+        if (sortKey === 'war_priority' && row.priorityScores) {
+          priBit = ' · pri ' + row.priority.toFixed(2);
+          priTitleExtra =
+            '\nPriority: ' + row.priority.toFixed(2)
+            + '\n  Beatability: ' + row.priorityScores.beat.toFixed(2)
+            + '\n  Speed:       ' + row.priorityScores.speed.toFixed(2)
+            + '\n  Availability:' + row.priorityScores.avail.toFixed(2)
+            + (row.priorityScores.sample ? ' (' + row.priorityScores.sample + 'f sample)' : '');
+        }
+
+        // Top-priority row in war_priority sort gets the green-border + ⚡
+        // decoration via a class so the user's eye lands on it instantly.
+        const rowClasses = 'tech-scout-row clickable verdict-' + vk
+          + ((sortKey === 'war_priority' && rowIndex === 0) ? ' war-priority-top' : '');
+
         const memberRow = el('div', {
-          class: 'tech-scout-row clickable verdict-' + vk,
-          title: 'Open Opponent Intel for ' + m.name,
+          class: rowClasses,
+          title: 'Open Opponent Intel for ' + m.name + priTitleExtra,
         },
           el('span', { class: 'tech-target-dot ' + dotClass, title: dotTitle }),
           el('div', { class: 'tech-scout-main' },
@@ -8946,6 +10385,9 @@
               ffBit,
               fightsBit,
               spyBit,
+              bspBit,
+              ffBitScouter,
+              priBit,
               lastBit,
               statusEl ? document.createTextNode(' · ') : null,
               statusEl,
@@ -9138,6 +10580,12 @@
     // Throttled to 1 hour/target so opening + closing the drill repeatedly
     // doesn't burn calls. Fire-and-forget; resolves into spyCache + re-renders.
     maybeFetchSpy(id);
+    // v1.0.1 — same pattern for BSP. maybeFetchBSP gates itself on
+    // settings.bspEnabled + subscription state, so a no-op when off.
+    maybeFetchBSP(id);
+    // v1.1.0-dev — and the same for FF Scouter. Gated by settings.ffEnabled,
+    // 1-hour cache TTL per the author's request.
+    maybeFetchFFScouter(id);
   }
   // v0.6.38 — Faction Intel drill open helper. Same shape as the
   // opponent drill but uses kind:'faction' so renderActive routes to

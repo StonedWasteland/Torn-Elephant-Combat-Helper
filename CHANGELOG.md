@@ -6,6 +6,46 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.1.0 — Hub-not-silo integrations
+
+The integration milestone. TECH stops being a closed loop over your own fight history and starts orchestrating data from the rest of the Torn ecosystem: BSP (Battle Stats Predictor), FF Scouter, and TornStats all feed the same Opponent Intel and Scout views. Positioning is explicit: TECH is a hub, not a silo — we want users running BSP, TornTools, TornStats, and FF Scouter alongside TECH, not picking between them.
+
+### What's new
+
+1. **BSP integration** (TDup-blessed 2026-06-01). Opt-in via Settings. Requires the user's own active BSP subscription — verified on every response via `SubscriptionEnd`, with a "Subscribe at BSP" nudge when lapsed. Output is roughened to coarse strength bands (Soft target / Matched / Dangerous / Out-of-league) so BSP's precise TBS stays a reason to subscribe directly. Roughened BSP card in Opponent Intel, color-coded `bsp` band in scout rows, **Pull BSP** bulk button.
+
+2. **FF Scouter integration** (Glasnost/rDacted public API). Opt-in via Settings. Free tier provides FF rating + battle-stat estimate; the Premium tier "Top stats distribution" is surfaced when available. Batched endpoint = one HTTP call for an entire 100-member roster (much friendlier on the API budget than per-target calls). 1-hour cache TTL per the author's request. FF Scouter card in Opponent Intel + `ff` band in scout rows + **Pull FF** bulk button.
+
+3. **Beatability cascade for Phase 2 War Priority Queue.** The scout sort that auto-activates when scouting your ranked war target now reads from the richest available signal: spy → BSP (subscriber-gated) → FF Scouter → local FF history → neutral. Each layer fills gaps the next can't, so users without one service still get useful priority scoring.
+
+4. **Per-service Torn API key overrides.** Some Torn players keep multiple limited keys registered with different services. Three optional override fields in Settings — TornStats / BSP / FF Scouter — fall back to the main key when empty. Lets TECH talk to each service using whichever key the user registered there.
+
+5. **Theme-aligned BSP / FF Scouter band palette.** Soft target = icy cyan, Matched = TECH purple, Dangerous = gold, Out-of-league = orange. Cool→warm escalation reads naturally.
+
+6. **Pull-button retry-on-error behaviour.** Pull BSP / Pull FF now treat cached errors as immediately retryable on explicit user click. The 5-minute cooldown exists to prevent automatic hammering — it shouldn't gate a user's "try again" intent.
+
+### Caveat — Phase 2 War Priority Queue early-access
+
+Phase 2 (the war-target-aware priority scoring + auto-sort) is **war-untested in production**. It's gated dormant for users who aren't in an active ranked war (`meta.activeWarTarget` null), so non-war users see no change. War users get a clearly-marked early-access cycle; please report any glitches you see during a real war so we can refine.
+
+### Cost
+
++1 batched HTTP call to BSP / FF Scouter per scouted roster *when those features are enabled*. Both opt-in, both default off. Cross-tab cache (v1.0.1) absorbs most repeat calls across multiple Torn tabs.
+
+---
+
+## v1.0.1 — Cross-tab API cache
+
+A targeted fix for users who keep multiple Torn tabs open. Without it, each tab independently re-fetched the same endpoints — multiplying the Torn API budget by the number of open tabs and triggering rate-limit code 5 under normal multi-tab use.
+
+`apiGet` now routes a freshness check through `GM_setValue` (shared across all tabs of the same userscript): before fetching, look up the stripped URL in a shared `xtcache` blob; if a fresh entry exists, resolve from cache and skip the network call. Default TTL 45 s — slightly under the default 60 s poll interval so two tabs with offset timers cover a full cycle without serving data older than one poll tick.
+
+Cache key strips `_`, `key`, `comment` so identical "logical" calls from different tabs share a key. Error responses (anything with a top-level `error` field) are never cached — caching a rate-limit response would propagate it to every tab for the full TTL window, the exact thing we're trying to prevent. Hard eviction window is 24 h so long-TTL entries (catalog-style endpoints) get full cross-tab dedup without unbounded blob growth.
+
+Validated on the author's install: poll cycle dropped from 73 s → 47 s under multi-tab usage, rate-limit code 5 errors eliminated. Companion patch shipped in TEEM v6.7.0.
+
+---
+
 ## v1.0.0 — Stability declaration
 
 The v0.7.0 feature set, war-validated in the TNU vs Infernum Perdition ranked war on 2026-05-29, is now the stable production version. No new features in this release — it's a milestone: TECH is feature-complete by design, and v1.0 declares the codebase production-quality for daily use.
