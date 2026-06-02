@@ -6,6 +6,14 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.2.1 — Mobile viewport fix
+
+Panel was using a hardcoded `width:430px`. On Firefox mobile (and any browser with a viewport narrower than 446px after padding), the panel extended off the left edge of the screen — left content like the `DASHBOARD` tab label got clipped to `ASHBOARD`, settings rows lost the start of their labels, etc.
+
+Replaced with `width:min(430px, calc(100vw - 24px))` plus `box-sizing:border-box` so the panel caps at 430px on desktop and shrinks gracefully to the viewport width minus 12px on each side on mobile. No other changes.
+
+---
+
 ## v1.2.0 — Cross-source consensus + TornStats faction-spy bulk
 
 Two synthesis layers on top of v1.1.0's three integrations. The data is already flowing in from spy / BSP / FF Scouter — v1.2.0 makes that data easier to *use*.
