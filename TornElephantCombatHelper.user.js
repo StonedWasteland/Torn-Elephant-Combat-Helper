@@ -1,12 +1,12 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.2.2
+// @version      1.2.3
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
 // @match        https://www.torn.com/*
-// @updateURL    https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/TornElephantCombatHelper.user.js
+// @updateURL    https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/TornElephantCombatHelper.meta.js
 // @downloadURL  https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/TornElephantCombatHelper.user.js
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -127,7 +127,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.2.2';
+  const SCRIPT_VERSION    = '1.2.3';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over

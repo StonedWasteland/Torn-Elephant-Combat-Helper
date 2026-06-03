@@ -6,6 +6,18 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.2.3 — Lightweight auto-update mechanism
+
+Switched the `@updateURL` from the full `.user.js` file to a tiny `.meta.js` file that contains *only* the metadata block. Tampermonkey hits the meta file (~1 KB) on every update check instead of pulling the full ~500 KB user.js — saves bandwidth, reduces pressure on GitHub's raw-URL rate limits, and makes update checks faster for everyone.
+
+`@downloadURL` still points at the full `.user.js` — TM only fetches the big file when it actually detects a new version in the meta.
+
+A GitHub Action (`.github/workflows/update-meta.yml`) regenerates `TornElephantCombatHelper.meta.js` automatically on every push to `main` that touches the `.user.js` file, by extracting the metadata block via `sed`. Drift between the two files is impossible by design — the meta is always derived from the user.js header.
+
+No behaviour changes for users. Anyone on v1.2.2 or earlier needs to update once (their TM will pull v1.2.3 within the next 24h auto-check, or sooner via "Check for userscript updates"), after which all future updates flow through the much lighter `.meta.js` URL.
+
+---
+
 ## v1.2.2 — TEST tab Specific dropdown mobile fix
 
 The Specific (named-weapon) dropdown on the TEST simulator was clipping its closed-state text on mobile — selected weapons like "Jackhammer · dmg 71.5 · acc 65" displayed as "Jackhammer · dmg 71.5" with the trailing `acc` field hidden off-screen.
