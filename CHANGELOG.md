@@ -6,6 +6,25 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.3.5 — Roll back the PDA experiment
+
+Experimental Torn PDA support introduced in v1.3.0 never produced visible TECH on PDA across four rapid patch attempts (v1.3.0 → v1.3.4). The user-confirmed verdict: TECH's complexity and DOM coupling don't translate cleanly to PDA's Flutter WebView, at least not without dedicated phone-in-hand debugging that isn't feasible right now.
+
+v1.3.5 reverts the user.js file to its v1.2.3 state — the last release that worked correctly on every supported environment (desktop Tampermonkey, mobile Firefox + Tampermonkey). Specifically removed:
+
+- The `_gm.*` shim layer and `IS_PDA` detection block at the top of the IIFE
+- The floating launcher fallback (`createFloatingLauncher`) and mobile-DOM fallback observer
+- The PDA-injected API key auto-application
+- The diagnostic boot banner that was flashing at the top of every page load in v1.3.4
+- The `_PDA_INJECTED_APIKEY` placeholder and multi-signal detection
+- Defensive `typeof` guards on `GM_*` references (no longer needed)
+
+What remains: the v1.2.3 codebase, exactly as it was before the PDA detour, with `@version` and `SCRIPT_VERSION` bumped forward to 1.3.5 so existing v1.3.x installs notice the new release and auto-update (Tampermonkey rejects version downgrades, so we can't simply re-publish 1.2.3).
+
+CHANGELOG entries for v1.3.0–v1.3.4 are kept below for historical accuracy. PDA support is parked indefinitely — if a future revisit happens, it should start from a dedicated test environment with a PDA in hand, not a remote-debug spiral.
+
+---
+
 ## v1.3.4 — Defensive boot diagnostics + multi-signal PDA detection
 
 v1.3.3 fixed one PDA detection failure mode but the user is still reporting TECH invisible on PDA. To stop guessing, this release adds:
