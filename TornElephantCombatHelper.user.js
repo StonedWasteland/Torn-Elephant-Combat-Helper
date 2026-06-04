@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.2.3
+// @version      1.3.0
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,7 +20,30 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.2.0 — Cross-source consensus + bulk spies) ────
+// ─── UPDATE NOTES (1.3.0 — Experimental Torn PDA support) ──────────
+// v1.3.0 ships TECH on Torn PDA (the official mobile app), alongside
+// continued Tampermonkey support. Same .user.js file runs in both
+// environments via a small runtime detection shim at the top of the
+// IIFE: PDA replaces a marker placeholder with the user's API key,
+// and provides PDA_httpGet / PDA_httpPost instead of GM_xmlhttpRequest.
+// Storage shims to localStorage. Tampermonkey is unchanged — the
+// shim passes straight through to GM_* APIs when not in PDA.
+//
+// What works on PDA:
+//   - All API integrations (Torn, TornStats, BSP, FF Scouter)
+//   - Settings, Dashboard, Fights, Scout, Test, Opponent Intel
+//   - Bulk pulls + consensus card + faction-spy endpoint
+//
+// Known gaps:
+//   - No right-click menu (PDA has no menu hook) → use panel buttons
+//   - No browser notifications → use Torn's native chain UI
+//   - Layout may need polish on narrow PDA viewports
+//   - Text encoding: if any emoji/symbol renders garbled (⚡⚠◆↻·
+//     em-dashes), report it so we can fix in v1.3.x
+//
+// This is the experimental rollout — install on PDA, test, report bugs.
+//
+// ─── PRIOR UPDATE NOTES (1.2.0 — Cross-source consensus + bulk spies) ────
 // v1.2.0 layers synthesis on top of v1.1.0's three integrations. The
 // data was already flowing in from spy / BSP / FF Scouter — v1.2.0
 // makes that data easier to *use*.
@@ -127,7 +150,100 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.2.3';
+  const SCRIPT_VERSION    = '1.3.0';
+
+  // ─── PDA COMPATIBILITY SHIM (v1.3.0) ────────────────────────────────
+  // Torn PDA (mobile app) runs userscripts inside a Flutter WebView. At
+  // inject time it substitutes the placeholder `###PDA-APIKEY###` below
+  // with the user's limited Torn API key, and provides PDA_httpGet /
+  // PDA_httpPost in place of GM_xmlhttpRequest. GM_setValue/getValue
+  // don't exist on PDA, so we shim them to localStorage.
+  //
+  // Detection: if the apikey placeholder was substituted (first char
+  // is no longer '#'), we're in PDA. Otherwise we're in Tampermonkey
+  // and the GM_* APIs work as normal — we pass them straight through.
+  //
+  // Reference implementation: FF Scouter v2 (rDacted/Glasnost). Same
+  // pattern, lightly adapted to TECH's storage + xhr conventions.
+  //
+  // DO NOT modify the apikey placeholder below — PDA's injector looks
+  // for it verbatim and won't substitute if the format is off.
+  const _PDA_INJECTED_APIKEY = "###PDA-APIKEY###";
+  const IS_PDA = _PDA_INJECTED_APIKEY[0] !== '#';
+  const _gm = {};
+  if (IS_PDA) {
+    try { console.log('[TECH] PDA environment detected — wiring shims'); } catch (e) {}
+    // GM_setValue / GM_getValue -> localStorage. We auto-JSON-stringify
+    // any non-string value on the way in so callers that pass objects
+    // (sentinel writes, etc.) still work. On the way out we return raw
+    // strings — TECH's load() does its own JSON.parse on top.
+    _gm.setValue = function (key, value) {
+      try {
+        const v = (typeof value === 'string') ? value : JSON.stringify(value);
+        localStorage.setItem(key, v);
+      } catch (e) {
+        try { console.warn('[TECH] PDA setValue failed for ' + key + ':', e); } catch (e2) {}
+      }
+    };
+    _gm.getValue = function (key, defaultValue) {
+      try {
+        const v = localStorage.getItem(key);
+        if (v === null || v === undefined) return defaultValue;
+        return v;
+      } catch (e) {
+        return defaultValue;
+      }
+    };
+    // GM_xmlhttpRequest -> PDA_httpGet / PDA_httpPost. Mirrors the FF
+    // Scouter shim: callback-style API (details.onload / onerror) on top
+    // of PDA's Promise-returning httpGet/httpPost. timeout + ontimeout
+    // from the GM_xhr details are ignored — TECH's apiGet() already
+    // races against a hard timeout at the application layer.
+    _gm.xmlhttpRequest = function (details) {
+      const method = (details.method || 'GET').toLowerCase();
+      const onload = details.onload || function () {};
+      const onerror = details.onerror || function (e) {
+        try { console.warn('[TECH] PDA xhr error:', e); } catch (e2) {}
+      };
+      try {
+        if (method === 'get') {
+          return PDA_httpGet(details.url).then(onload).catch(onerror);
+        }
+        if (method === 'post') {
+          return PDA_httpPost(
+            details.url,
+            details.headers || {},
+            details.body || details.data || ''
+          ).then(onload).catch(onerror);
+        }
+        try { console.warn('[TECH] PDA xhr — unsupported method:', method); } catch (e2) {}
+      } catch (e) {
+        onerror(e);
+      }
+    };
+    // GM_addStyle -> manual <style> element. PDA's WebView supports
+    // direct DOM injection, so this is straight-line.
+    _gm.addStyle = function (css) {
+      try {
+        const s = document.createElement('style');
+        s.textContent = css;
+        (document.head || document.documentElement).appendChild(s);
+      } catch (e) {
+        try { console.warn('[TECH] PDA addStyle failed:', e); } catch (e2) {}
+      }
+    };
+    // PDA has no right-click menu hook. No-op.
+    _gm.registerMenuCommand = function () {};
+  } else {
+    // Tampermonkey / Greasemonkey environment — pass-through.
+    _gm.setValue = GM_setValue;
+    _gm.getValue = GM_getValue;
+    _gm.xmlhttpRequest = GM_xmlhttpRequest;
+    _gm.addStyle = GM_addStyle;
+    _gm.registerMenuCommand = (typeof GM_registerMenuCommand === 'function')
+      ? GM_registerMenuCommand
+      : function () {};
+  }
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -528,7 +644,7 @@
   let lastStoreError = null;
   function store(key, val) {
     try {
-      GM_setValue(SCRIPT_KEY + key, JSON.stringify(val));
+      _gm.setValue(SCRIPT_KEY + key, JSON.stringify(val));
     } catch (e) {
       lastStoreError = { key, at: Date.now(), msg: String(e && e.message ? e.message : e) };
       try { console.warn('[TECH] Storage write failed for ' + SCRIPT_KEY + key + ':', e); } catch (e2) {}
@@ -536,7 +652,7 @@
   }
   function load(key, def) {
     try {
-      const v = GM_getValue(SCRIPT_KEY + key);
+      const v = _gm.getValue(SCRIPT_KEY + key);
       if (v === undefined || v === null || v === '') return def;
       const parsed = JSON.parse(v);
       if (Array.isArray(def) && !Array.isArray(parsed)) return def;
@@ -547,7 +663,7 @@
       try {
         console.warn('[TECH] Storage parse failed for ' + SCRIPT_KEY + key + ', resetting to default:', e);
       } catch (e2) {}
-      try { GM_setValue(SCRIPT_KEY + key, JSON.stringify(def)); } catch (e3) {}
+      try { _gm.setValue(SCRIPT_KEY + key, JSON.stringify(def)); } catch (e3) {}
       return def;
     }
   }
@@ -560,19 +676,19 @@
   (function migrateLegacyStorage() {
     const SENTINEL = SCRIPT_KEY + 'migrated_from_tiqc';
     try {
-      if (GM_getValue(SENTINEL)) return;
+      if (_gm.getValue(SENTINEL)) return;
       const LEGACY_KEYS = ['settings', 'fights', 'meta'];
       let moved = 0;
       for (const k of LEGACY_KEYS) {
-        const legacy = GM_getValue('tiqc_' + k);
+        const legacy = _gm.getValue('tiqc_' + k);
         if (legacy === undefined || legacy === null || legacy === '') continue;
-        const current = GM_getValue(SCRIPT_KEY + k);
+        const current = _gm.getValue(SCRIPT_KEY + k);
         if (current === undefined || current === null || current === '') {
-          GM_setValue(SCRIPT_KEY + k, legacy);
+          _gm.setValue(SCRIPT_KEY + k, legacy);
           moved++;
         }
       }
-      GM_setValue(SENTINEL, { ts: Date.now(), moved });
+      _gm.setValue(SENTINEL, { ts: Date.now(), moved });
       if (moved > 0) console.log(`[TECH] Migrated ${moved} key(s) from the TornIQ era (tiqc_* → tech_*).`);
     } catch (e) {
       console.warn('[TECH] Legacy storage migration skipped:', e);
@@ -607,6 +723,18 @@
     ffApiKey:        '',
     tornStatsApiKey: '',
   });
+
+  // v1.3.0 — PDA auto-injects the user's limited Torn API key via the
+  // placeholder substitution at the top of this file. When we detect that,
+  // copy it into settings.apiKey so the user doesn't have to paste it
+  // manually on first run. We only overwrite when settings.apiKey is
+  // blank — never clobber a key the user has explicitly set.
+  if (IS_PDA && _PDA_INJECTED_APIKEY && _PDA_INJECTED_APIKEY[0] !== '#'
+      && (!settings.apiKey || !settings.apiKey.trim())) {
+    settings.apiKey = _PDA_INJECTED_APIKEY;
+    store('settings', settings);
+    try { console.log('[TECH] PDA-provided API key applied to settings'); } catch (e) {}
+  }
 
   // v0.6.34 — Scout cache. Last roster fetch per faction ID. We keep
   // these persisted so reopening the panel after a fresh-tab close
@@ -720,7 +848,7 @@
   (function migrateDedupV1V2Fights() {
     const SENTINEL = SCRIPT_KEY + 'dedup_v1v2_done';
     try {
-      if (GM_getValue(SENTINEL)) return;
+      if (_gm.getValue(SENTINEL)) return;
       const groups = {};
       for (const code in fights) {
         const f = fights[code];
@@ -750,7 +878,7 @@
         console.log('[TECH] Dedup migration removed ' + removed
                   + ' duplicate fight record(s) from the v1->v2 era.');
       }
-      GM_setValue(SENTINEL, { ts: Date.now(), removed });
+      _gm.setValue(SENTINEL, { ts: Date.now(), removed });
     } catch (e) {
       console.warn('[TECH] Dedup migration skipped:', e);
     }
@@ -975,7 +1103,7 @@
   function _gmFetch(url, headers) {
     return new Promise((resolve, reject) => {
       try {
-        GM_xmlhttpRequest({
+        _gm.xmlhttpRequest({
           method: 'GET',
           url,
           headers: headers || undefined,
@@ -5699,7 +5827,7 @@
   // Theme: tactical wasteland — charcoal/gunmetal recesses, electric violet edge,
   // hot orange ember accents, chrome highlights. Win/loss greens & reds preserved
   // because legibility outranks aesthetics on a stats panel.
-  GM_addStyle(`
+  _gm.addStyle(`
     /* ── Header launcher: <li> injected into Torn's ul.toolbar ─────────────
        Inherits Torn's drop-shadow + sizing via .top_header_button on the
        inner <button>. The mark is a PNG <img> rendered at 22px with a
@@ -11383,13 +11511,15 @@
   // trigger common actions without opening the panel. Wrapped in a typeof
   // guard so the script still loads if a manager doesn't expose this API.
   function registerMenuCommands() {
-    if (typeof GM_registerMenuCommand !== 'function') return;
+    // v1.3.0 — route through the PDA shim; on PDA this is a no-op (no
+    // right-click menu in the WebView), on Tampermonkey it passes
+    // straight through to GM_registerMenuCommand.
     try {
-      GM_registerMenuCommand(`${SCRIPT_NAME}: Toggle panel`, () => togglePanel());
-      GM_registerMenuCommand(`${SCRIPT_NAME}: Poll now`,     () => poll());
-      GM_registerMenuCommand(`${SCRIPT_NAME}: Export fights (JSON)`, () => exportFights());
-      GM_registerMenuCommand(`${SCRIPT_NAME}: TEST sanity check`, () => testRunSanityChecks());
-      GM_registerMenuCommand(`${SCRIPT_NAME}: Reset panel position`, () => {
+      _gm.registerMenuCommand(`${SCRIPT_NAME}: Toggle panel`, () => togglePanel());
+      _gm.registerMenuCommand(`${SCRIPT_NAME}: Poll now`,     () => poll());
+      _gm.registerMenuCommand(`${SCRIPT_NAME}: Export fights (JSON)`, () => exportFights());
+      _gm.registerMenuCommand(`${SCRIPT_NAME}: TEST sanity check`, () => testRunSanityChecks());
+      _gm.registerMenuCommand(`${SCRIPT_NAME}: Reset panel position`, () => {
         settings.panelPos = { right: 20, bottom: 80 };
         store('settings', settings);
         if (panelEl) {

@@ -6,6 +6,39 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.3.0 — Experimental Torn PDA support
+
+Torn PDA (the official mobile app) runs userscripts inside a Flutter WebView with its own `PDA_httpGet` / `PDA_httpPost` APIs instead of `GM_xmlhttpRequest`, no `GM_setValue` / `GM_getValue` (so storage has to use `localStorage`), and an API-key auto-injection mechanism at script load time. This release adds the shim layer that translates between TECH's existing call patterns and PDA's runtime, so the same `.user.js` file now runs in both Tampermonkey and PDA without code branching at call sites.
+
+### How it works
+
+At the top of the IIFE, TECH detects which environment it's running in by checking whether PDA substituted the `###PDA-APIKEY###` placeholder. If yes, a small `_gm.*` shim wires `GM_setValue` / `GM_getValue` to `localStorage`, `GM_xmlhttpRequest` to `PDA_httpGet` / `PDA_httpPost` (callback-style on top of PDA's Promise API), and `GM_addStyle` to manual `<style>` injection. On Tampermonkey the shim is a pass-through to the real `GM_*` APIs, so Tampermonkey behaviour is unchanged.
+
+PDA-injected API keys are auto-applied to `settings.apiKey` on first run, so PDA users don't have to paste a key manually. Existing keys are never overwritten.
+
+### What's expected to work
+
+- All API integrations (Torn, TornStats, BSP, FF Scouter) via the shimmed XHR
+- Settings persistence via localStorage
+- All read-only / display features (Dashboard, Fights tab, Scout, Test simulator, Settings)
+- Pull spies / Pull BSP / Pull FF bulk fetches
+- Cross-source consensus and faction-spy bulk endpoint (v1.2.0 features)
+
+### Known gaps & rough edges
+
+- **Right-click menu** doesn't exist in PDA — the menu-command registrations become no-ops. Use the panel's UI buttons instead.
+- **Browser notifications** (chain-break / target-ready) don't fire on PDA — the Notification API isn't available; the script gracefully no-ops these, but you won't get push alerts. Use Torn's native chain UI.
+- **Layout** — narrow PDA viewport may produce some clipping or scroll oddness, especially on the Scout tab where row content is dense and Settings where the form is long. Layout polish will land in v1.3.x as feedback rolls in.
+- **Text encoding** — PDA's WebView has historically misread UTF-8 as Latin-1 in some versions, which could garble emoji/symbol characters. Whether the current PDA still has this issue is unknown — if you see ⚡ / ⚠ / ◆ / ↻ / · / em-dashes rendering as garbled glyphs, please report which page/element so we can fix in v1.3.x.
+
+This is the **experimental** rollout — install on PDA, use it, and report anything that looks broken so we can iterate. Tampermonkey users are unaffected; the shim layer is dormant in that environment.
+
+### Reference
+
+The shim pattern is adapted from FF Scouter v2 (rDacted / Glasnost), which has had stable PDA support for a while. Their approach has been textbook for the userscript ecosystem.
+
+---
+
 ## v1.2.3 — Lightweight auto-update mechanism
 
 Switched the `@updateURL` from the full `.user.js` file to a tiny `.meta.js` file that contains *only* the metadata block. Tampermonkey hits the meta file (~1 KB) on every update check instead of pulling the full ~500 KB user.js — saves bandwidth, reduces pressure on GitHub's raw-URL rate limits, and makes update checks faster for everyone.
