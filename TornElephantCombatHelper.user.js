@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.3.0
+// @version      1.3.1
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,8 +20,8 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.3.0 — Experimental Torn PDA support) ──────────
-// v1.3.0 ships TECH on Torn PDA (the official mobile app), alongside
+// ─── UPDATE NOTES (1.3.1 — Experimental Torn PDA support) ──────────
+// v1.3.1 ships TECH on Torn PDA (the official mobile app), alongside
 // continued Tampermonkey support. Same .user.js file runs in both
 // environments via a small runtime detection shim at the top of the
 // IIFE: PDA replaces a marker placeholder with the user's API key,
@@ -150,9 +150,9 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.3.0';
+  const SCRIPT_VERSION    = '1.3.1';
 
-  // ─── PDA COMPATIBILITY SHIM (v1.3.0) ────────────────────────────────
+  // ─── PDA COMPATIBILITY SHIM (v1.3.1) ────────────────────────────────
   // Torn PDA (mobile app) runs userscripts inside a Flutter WebView. At
   // inject time it substitutes the placeholder `###PDA-APIKEY###` below
   // with the user's limited Torn API key, and provides PDA_httpGet /
@@ -724,7 +724,7 @@
     tornStatsApiKey: '',
   });
 
-  // v1.3.0 — PDA auto-injects the user's limited Torn API key via the
+  // v1.3.1 — PDA auto-injects the user's limited Torn API key via the
   // placeholder substitution at the top of this file. When we detect that,
   // copy it into settings.apiKey so the user doesn't have to paste it
   // manually on first run. We only overwrite when settings.apiKey is
@@ -11373,6 +11373,53 @@
     pip.className = 'tech-launcher-pip' + (cls ? ' ' + cls : '');
   }
 
+  // v1.3.1 — Floating launcher fallback for environments where Torn's
+  // desktop toolbar doesn't exist (Torn PDA mobile view, occasionally
+  // mobile-Firefox-on-narrow-viewport renders where Torn skips the
+  // toolbar entirely). Renders a position:fixed circular FAB pinned to
+  // the bottom-right corner with the same mascot mark + same toggle
+  // handler. Idempotent like createLauncher.
+  function createFloatingLauncher() {
+    if (document.getElementById('tech-floating-launcher')) {
+      return document.getElementById('tech-floating-launcher');
+    }
+    const fab = el('button', {
+      id: 'tech-floating-launcher',
+      type: 'button',
+      'aria-label': `Open ${SCRIPT_NAME}`,
+      title: `${SCRIPT_NAME} — ${SCRIPT_LONG_NAME}`,
+      html: launcherMarkHTML(),
+      'on:click': function (e) { e.preventDefault(); togglePanel(); },
+      style: {
+        position: 'fixed',
+        right: '12px',
+        bottom: '12px',
+        width: '46px',
+        height: '46px',
+        borderRadius: '50%',
+        border: '1px solid #2a1f2e',
+        background: 'linear-gradient(180deg,#1a1117 0%,#0f0a12 100%)',
+        boxShadow: '0 0 0 1px rgba(168,85,247,.22),0 8px 22px rgba(0,0,0,.7),0 0 18px rgba(168,85,247,.2)',
+        cursor: 'pointer',
+        padding: '0',
+        // Above Torn's UI but below TECH's panel so the panel renders on top.
+        zIndex: '2147483644',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      },
+    });
+    // The launcher mark inside is an <img>; resize it for the round FAB.
+    const img = fab.querySelector('.tech-launcher-mark');
+    if (img) {
+      img.style.width = '26px';
+      img.style.height = '26px';
+      img.style.display = 'block';
+    }
+    document.body.appendChild(fab);
+    return fab;
+  }
+
   // Watch the persistent header region. Torn's SPA navigation can re-render
   // the toolbar; we re-inject on any childList change rather than trying to
   // be clever about which mutations matter. createLauncher() is cheap when
@@ -11381,9 +11428,22 @@
   function mountLauncher() {
     let attempts = 0;
     let observer = null;
+    let floatingLauncher = null;
+
+    function removeFloatingLauncher() {
+      if (floatingLauncher) {
+        try { floatingLauncher.remove(); } catch (e) {}
+        floatingLauncher = null;
+      }
+      const stray = document.getElementById('tech-floating-launcher');
+      if (stray) { try { stray.remove(); } catch (e) {} }
+    }
 
     function attach() {
       createLauncher();
+      // Header version is in — clean up any floating fallback so we don't
+      // show two launchers at once.
+      if (document.getElementById('tech-launcher')) removeFloatingLauncher();
       const root = document.querySelector('.header-navigation') || document.body;
       if (observer) observer.disconnect();
       observer = new MutationObserver(() => createLauncher());
@@ -11393,10 +11453,21 @@
     if (findHeaderCluster()) { attach(); return; }
 
     // Header isn't in the DOM yet (script may have raced page render).
-    // Poll briefly via rAF, then fall back to a single-shot body observer.
+    // Poll briefly via rAF, then fall back to a single-shot body observer
+    // AND spawn the floating launcher so the user has a way to open the
+    // panel on PDA / mobile views that don't render Torn's desktop
+    // toolbar at all.
     const waitForHeader = () => {
       if (findHeaderCluster()) { attach(); return; }
       if (++attempts < 60) { requestAnimationFrame(waitForHeader); return; }
+
+      // Header still missing after ~1 second of rAF polling. This is the
+      // PDA / mobile-no-toolbar case. Spawn the floating launcher so the
+      // panel becomes openable RIGHT NOW. Keep a body observer running in
+      // case Torn lazy-renders the toolbar later; attach() removes the
+      // floating launcher if it does appear.
+      floatingLauncher = createFloatingLauncher();
+
       const bodyObs = new MutationObserver(() => {
         if (findHeaderCluster()) { bodyObs.disconnect(); attach(); }
       });
@@ -11511,7 +11582,7 @@
   // trigger common actions without opening the panel. Wrapped in a typeof
   // guard so the script still loads if a manager doesn't expose this API.
   function registerMenuCommands() {
-    // v1.3.0 — route through the PDA shim; on PDA this is a no-op (no
+    // v1.3.1 — route through the PDA shim; on PDA this is a no-op (no
     // right-click menu in the WebView), on Tampermonkey it passes
     // straight through to GM_registerMenuCommand.
     try {

@@ -6,6 +6,18 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.3.1 — Floating launcher fallback for PDA
+
+v1.3.0 turned out to ship with TECH effectively invisible on Torn PDA: the script ran, but the launcher button injected into Torn's desktop top-bar (anchored on `#recent-history-wrapper`) never appeared because that element doesn't exist in PDA's mobile DOM. No launcher = no way to open the panel = TECH appears completely silent.
+
+v1.3.1 adds a **floating launcher fallback** — a circular mascot FAB pinned to the bottom-right corner of the screen, spawned automatically after ~1 second when the desktop toolbar can't be found. Clicking it toggles the TECH panel exactly like the toolbar version would. On desktop browsers where the toolbar exists, behavior is unchanged — the floating launcher never appears.
+
+Body-MutationObserver continues watching for the desktop toolbar to lazy-render, and when it does, the floating launcher is removed automatically so you never see both at once.
+
+This makes TECH actually usable on PDA. Other PDA gaps (settings layout polish, possible text encoding) still pending feedback.
+
+---
+
 ## v1.3.0 — Experimental Torn PDA support
 
 Torn PDA (the official mobile app) runs userscripts inside a Flutter WebView with its own `PDA_httpGet` / `PDA_httpPost` APIs instead of `GM_xmlhttpRequest`, no `GM_setValue` / `GM_getValue` (so storage has to use `localStorage`), and an API-key auto-injection mechanism at script load time. This release adds the shim layer that translates between TECH's existing call patterns and PDA's runtime, so the same `.user.js` file now runs in both Tampermonkey and PDA without code branching at call sites.
