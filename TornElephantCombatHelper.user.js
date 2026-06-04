@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.3.3
+// @version      1.3.4
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,8 +20,8 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.3.3 — Experimental Torn PDA support) ──────────
-// v1.3.3 ships TECH on Torn PDA (the official mobile app), alongside
+// ─── UPDATE NOTES (1.3.4 — Experimental Torn PDA support) ──────────
+// v1.3.4 ships TECH on Torn PDA (the official mobile app), alongside
 // continued Tampermonkey support. Same .user.js file runs in both
 // environments via a small runtime detection shim at the top of the
 // IIFE: PDA replaces a marker placeholder with the user's API key,
@@ -150,9 +150,9 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.3.3';
+  const SCRIPT_VERSION    = '1.3.4';
 
-  // ─── PDA COMPATIBILITY SHIM (v1.3.3) ────────────────────────────────
+  // ─── PDA COMPATIBILITY SHIM (v1.3.4) ────────────────────────────────
   // Torn PDA (mobile app) runs userscripts inside a Flutter WebView. At
   // inject time it substitutes the placeholder `###PDA-APIKEY###` below
   // with the user's limited Torn API key, and provides PDA_httpGet /
@@ -170,17 +170,57 @@
   // for it verbatim. PDA only substitutes it when the user has set a
   // per-script custom API key, which they may or may not have done.
   //
-  // v1.3.3 fix — environment detection uses `typeof PDA_httpGet` instead
-  // of the placeholder substitution. The placeholder check is unreliable
-  // because PDA users who haven't configured a custom API key in PDA's
-  // per-script settings leave the placeholder intact — which would
-  // misroute them into the Tampermonkey branch and silently crash on the
-  // first reference to GM_setValue (undefined on PDA). PDA_httpGet is
-  // ALWAYS present on PDA and ALWAYS absent on Tampermonkey, so it's a
-  // reliable environment signal independent of user configuration.
+  // v1.3.4 — robust multi-signal PDA detection + visible boot banner.
+  // Earlier versions tied PDA detection to a single signal (the API key
+  // placeholder, then PDA_httpGet). Neither alone is enough — different
+  // PDA installs may expose these differently. We now check ALL plausible
+  // PDA signals and treat any positive as "we're on PDA." Failing into
+  // the PDA branch in a non-PDA environment is harmless (the shims still
+  // work); failing into the TM branch on PDA crashes on GM_* references.
+  // Better to be wrong in the safe direction.
   const _PDA_INJECTED_APIKEY = "###PDA-APIKEY###";
-  const IS_PDA = (typeof PDA_httpGet === 'function');
-  try { console.log('[TECH] v' + SCRIPT_VERSION + ' loading. IS_PDA=' + IS_PDA); } catch (e) {}
+  const _pdaSignals = {
+    apikey:     _PDA_INJECTED_APIKEY[0] !== '#',
+    httpGet:    typeof PDA_httpGet  !== 'undefined',
+    httpPost:   typeof PDA_httpPost !== 'undefined',
+    flutterUA:  /Flutter|TornPDA/i.test(navigator.userAgent || ''),
+    noGM:       typeof GM_setValue === 'undefined',
+  };
+  const IS_PDA = _pdaSignals.apikey || _pdaSignals.httpGet || _pdaSignals.httpPost
+              || _pdaSignals.flutterUA || _pdaSignals.noGM;
+
+  // Visible boot banner so we can confirm script load on PDA without
+  // needing access to PDA's developer console. Auto-dismisses after 6s
+  // and is dismissable by tap.
+  try {
+    const _bootBanner = document.createElement('div');
+    _bootBanner.id = 'tech-boot-banner';
+    _bootBanner.textContent = '[TECH] v' + SCRIPT_VERSION
+      + ' loaded · IS_PDA=' + IS_PDA
+      + ' (' + Object.keys(_pdaSignals).filter(k => _pdaSignals[k]).join(',') + ')';
+    _bootBanner.style.cssText =
+      'position:fixed;top:0;left:0;right:0;background:#a855f7;color:white;' +
+      'font-weight:700;padding:8px 12px;z-index:2147483647;text-align:center;' +
+      'font-family:system-ui,sans-serif;font-size:12px;line-height:1.3;' +
+      'border-bottom:2px solid #6b21a8;box-shadow:0 2px 8px rgba(0,0,0,.5);' +
+      'cursor:pointer;';
+    _bootBanner.addEventListener('click', function () {
+      try { _bootBanner.remove(); } catch (e) {}
+    });
+    const _bootMount = function () {
+      if (!document.body) {
+        setTimeout(_bootMount, 50);
+        return;
+      }
+      try { document.body.appendChild(_bootBanner); } catch (e) {}
+      setTimeout(function () {
+        try { _bootBanner.remove(); } catch (e) {}
+      }, 6000);
+    };
+    _bootMount();
+  } catch (e) {}
+
+  try { console.log('[TECH] v' + SCRIPT_VERSION + ' loading. IS_PDA=' + IS_PDA, _pdaSignals); } catch (e) {}
   const _gm = {};
   if (IS_PDA) {
     try { console.log('[TECH] PDA environment detected — wiring shims'); } catch (e) {}
@@ -246,11 +286,21 @@
     // PDA has no right-click menu hook. No-op.
     _gm.registerMenuCommand = function () {};
   } else {
-    // Tampermonkey / Greasemonkey environment — pass-through.
-    _gm.setValue = GM_setValue;
-    _gm.getValue = GM_getValue;
-    _gm.xmlhttpRequest = GM_xmlhttpRequest;
-    _gm.addStyle = GM_addStyle;
+    // Tampermonkey / Greasemonkey environment — pass-through with defensive
+    // typeof guards so an exotic environment that's neither PDA nor TM still
+    // limps along rather than crashing the IIFE on a ReferenceError.
+    _gm.setValue = (typeof GM_setValue === 'function')
+      ? GM_setValue
+      : function (k, v) { try { localStorage.setItem(k, typeof v === 'string' ? v : JSON.stringify(v)); } catch (e) {} };
+    _gm.getValue = (typeof GM_getValue === 'function')
+      ? GM_getValue
+      : function (k, d) { try { const v = localStorage.getItem(k); return (v === null || v === undefined) ? d : v; } catch (e) { return d; } };
+    _gm.xmlhttpRequest = (typeof GM_xmlhttpRequest === 'function')
+      ? GM_xmlhttpRequest
+      : function () { try { console.warn('[TECH] no xhr available'); } catch (e) {} };
+    _gm.addStyle = (typeof GM_addStyle === 'function')
+      ? GM_addStyle
+      : function (css) { try { const s = document.createElement('style'); s.textContent = css; (document.head || document.documentElement).appendChild(s); } catch (e) {} };
     _gm.registerMenuCommand = (typeof GM_registerMenuCommand === 'function')
       ? GM_registerMenuCommand
       : function () {};
@@ -735,7 +785,7 @@
     tornStatsApiKey: '',
   });
 
-  // v1.3.3 — PDA auto-injects the user's limited Torn API key via the
+  // v1.3.4 — PDA auto-injects the user's limited Torn API key via the
   // placeholder substitution at the top of this file. When we detect that,
   // copy it into settings.apiKey so the user doesn't have to paste it
   // manually on first run. We only overwrite when settings.apiKey is
@@ -11384,7 +11434,7 @@
     pip.className = 'tech-launcher-pip' + (cls ? ' ' + cls : '');
   }
 
-  // v1.3.3 — Floating launcher fallback for environments where Torn's
+  // v1.3.4 — Floating launcher fallback for environments where Torn's
   // desktop toolbar doesn't exist (Torn PDA mobile view, occasionally
   // mobile-Firefox-on-narrow-viewport renders where Torn skips the
   // toolbar entirely). Renders a position:fixed circular FAB pinned to
@@ -11402,7 +11452,7 @@
       html: launcherMarkHTML(),
       'on:click': function (e) { e.preventDefault(); togglePanel(); },
       style: {
-        // v1.3.3 — position on the vertical-middle of the right edge so we
+        // v1.3.4 — position on the vertical-middle of the right edge so we
         // sit clear of PDA's top status bar AND its bottom toolbar (both
         // of which can be 60–120px tall and would otherwise hide a corner-
         // pinned launcher). transform centers us relative to top:50%.
@@ -11599,7 +11649,7 @@
   // trigger common actions without opening the panel. Wrapped in a typeof
   // guard so the script still loads if a manager doesn't expose this API.
   function registerMenuCommands() {
-    // v1.3.3 — route through the PDA shim; on PDA this is a no-op (no
+    // v1.3.4 — route through the PDA shim; on PDA this is a no-op (no
     // right-click menu in the WebView), on Tampermonkey it passes
     // straight through to GM_registerMenuCommand.
     try {

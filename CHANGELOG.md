@@ -6,6 +6,20 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.3.4 — Defensive boot diagnostics + multi-signal PDA detection
+
+v1.3.3 fixed one PDA detection failure mode but the user is still reporting TECH invisible on PDA. To stop guessing, this release adds:
+
+1. **Visible boot banner.** A purple banner appears at the top of the page for 6 seconds (tap to dismiss) reading `[TECH] v1.3.4 loaded · IS_PDA=true/false (signals…)`. If you see this banner, the script reached our code; if you don't, PDA isn't running TECH at all and the problem is upstream of our IIFE entry.
+
+2. **Multi-signal PDA detection.** No longer relies on one indicator. Checks five plausible PDA signals (placeholder substitution, `PDA_httpGet`/`PDA_httpPost` presence, Flutter/TornPDA in user agent, absence of `GM_setValue`). Any positive flips us into the PDA branch.
+
+3. **Defensive `typeof` guards** on every `GM_*` reference in the Tampermonkey branch. If detection still puts us on the wrong path in an exotic environment, the script no longer crashes on `ReferenceError` — it falls back to a localStorage shim and limps along.
+
+This is a diagnostic release. The next move depends on what the boot banner shows.
+
+---
+
 ## v1.3.3 — Critical PDA detection fix
 
 The actual root cause of TECH being invisible on PDA. The v1.3.0 environment detection (`IS_PDA = _PDA_INJECTED_APIKEY[0] !== '#'`) checked whether PDA had substituted the API key placeholder — but PDA only substitutes that placeholder if the user has set a per-script Custom API Key in PDA's settings. If they haven't, the placeholder stays intact, our detection returns `false`, and the script falls into the Tampermonkey branch — which then crashes silently on the first reference to `GM_setValue` (undefined in PDA).
