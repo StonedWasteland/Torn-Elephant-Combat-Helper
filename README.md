@@ -10,9 +10,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/StonedWasteland/Torn-Elephant-Combat-Helper/raw/main/TornElephantCombatHelper.user.js"><strong>Install via Tampermonkey</strong></a> ·
+  <a href="https://github.com/StonedWasteland/Torn-Elephant-Combat-Helper/raw/main/TornElephantCombatHelper.user.js"><strong>Install (Desktop &amp; Torn PDA)</strong></a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="https://github.com/StonedWasteland/Torn-Elephant-Economy-Manager">Sibling: TEEM</a>
+</p>
+
+<p align="center">
+  <sub><strong>Just one file to install</strong> → <code>TornElephantCombatHelper.user.js</code><br>
+  Works the same in Tampermonkey (desktop &amp; Firefox mobile) and Torn PDA (official mobile app).<br>
+  The <code>.meta.js</code> file you see in this repo is <em>not</em> a script — it's the tiny update-check file your script manager polls automatically. Don't install it.</sub>
 </p>
 
 ---
@@ -36,6 +42,10 @@ If you've ever lost a chain because you mistimed a target's release, or punched 
 
 ## Install
 
+TECH ships as a single userscript file (`TornElephantCombatHelper.user.js`). The same file works in three environments — pick whichever matches your setup.
+
+### Desktop browser (Tampermonkey)
+
 1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser (Chrome, Firefox, Edge, Opera, Safari).
 2. Open the [latest userscript](https://github.com/StonedWasteland/Torn-Elephant-Combat-Helper/raw/main/TornElephantCombatHelper.user.js) — Tampermonkey will prompt to install. Hit **Install**.
 3. Refresh any `torn.com` page. The mascot launcher appears in Torn's top-right toolbar (next to your avatar).
@@ -44,9 +54,24 @@ If you've ever lost a chain because you mistimed a target's release, or punched 
 
 **Hotkey:** `Alt+I` toggles the panel from anywhere on torn.com.
 
+### Mobile browser (Firefox Android + Tampermonkey)
+
+Same as desktop — install Tampermonkey on Firefox for Android, then install the userscript from the same raw URL above. The panel auto-shrinks to fit narrow viewports.
+
+### Torn PDA (official mobile app) — experimental in v1.3.0
+
+1. Open the Torn PDA app on your phone.
+2. Go to **Userscripts** in PDA's settings.
+3. Add a new userscript using this URL:
+   `https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/TornElephantCombatHelper.user.js`
+4. Enable the script and refresh Torn inside the app.
+5. Your PDA-configured API key is auto-injected — no need to paste it manually.
+
+**PDA is experimental as of v1.3.0.** Most features work, but the right-click menu commands don't exist (use the panel buttons instead), browser notifications don't fire (use Torn's in-app chain UI), and layout may have rough edges on narrow viewports. If anything renders as garbled glyphs (e.g. `?`-boxes for ⚡/⚠/◆), please open an issue with a screenshot — that's the encoding sweep we'll do in v1.3.x.
+
 ### Updating
 
-Tampermonkey checks for updates automatically. To force an update, open the dashboard, find TECH, click **Check for userscript updates**.
+Your script manager checks for updates automatically against a tiny `.meta.js` file (~1 KB). When a new version is published it'll prompt you, or update silently if you've configured that. To force a check now: open Tampermonkey / PDA's userscript manager, find TECH, and trigger "Check for updates."
 
 ---
 
