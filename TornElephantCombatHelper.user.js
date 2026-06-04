@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.3.1
+// @version      1.3.2
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,8 +20,8 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.3.1 — Experimental Torn PDA support) ──────────
-// v1.3.1 ships TECH on Torn PDA (the official mobile app), alongside
+// ─── UPDATE NOTES (1.3.2 — Experimental Torn PDA support) ──────────
+// v1.3.2 ships TECH on Torn PDA (the official mobile app), alongside
 // continued Tampermonkey support. Same .user.js file runs in both
 // environments via a small runtime detection shim at the top of the
 // IIFE: PDA replaces a marker placeholder with the user's API key,
@@ -150,9 +150,9 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.3.1';
+  const SCRIPT_VERSION    = '1.3.2';
 
-  // ─── PDA COMPATIBILITY SHIM (v1.3.1) ────────────────────────────────
+  // ─── PDA COMPATIBILITY SHIM (v1.3.2) ────────────────────────────────
   // Torn PDA (mobile app) runs userscripts inside a Flutter WebView. At
   // inject time it substitutes the placeholder `###PDA-APIKEY###` below
   // with the user's limited Torn API key, and provides PDA_httpGet /
@@ -724,7 +724,7 @@
     tornStatsApiKey: '',
   });
 
-  // v1.3.1 — PDA auto-injects the user's limited Torn API key via the
+  // v1.3.2 — PDA auto-injects the user's limited Torn API key via the
   // placeholder substitution at the top of this file. When we detect that,
   // copy it into settings.apiKey so the user doesn't have to paste it
   // manually on first run. We only overwrite when settings.apiKey is
@@ -11373,7 +11373,7 @@
     pip.className = 'tech-launcher-pip' + (cls ? ' ' + cls : '');
   }
 
-  // v1.3.1 — Floating launcher fallback for environments where Torn's
+  // v1.3.2 — Floating launcher fallback for environments where Torn's
   // desktop toolbar doesn't exist (Torn PDA mobile view, occasionally
   // mobile-Firefox-on-narrow-viewport renders where Torn skips the
   // toolbar entirely). Renders a position:fixed circular FAB pinned to
@@ -11391,15 +11391,20 @@
       html: launcherMarkHTML(),
       'on:click': function (e) { e.preventDefault(); togglePanel(); },
       style: {
+        // v1.3.2 — position on the vertical-middle of the right edge so we
+        // sit clear of PDA's top status bar AND its bottom toolbar (both
+        // of which can be 60–120px tall and would otherwise hide a corner-
+        // pinned launcher). transform centers us relative to top:50%.
         position: 'fixed',
-        right: '12px',
-        bottom: '12px',
-        width: '46px',
-        height: '46px',
+        right: '8px',
+        top: '50%',
+        transform: 'translateY(-50%)',
+        width: '52px',
+        height: '52px',
         borderRadius: '50%',
         border: '1px solid #2a1f2e',
         background: 'linear-gradient(180deg,#1a1117 0%,#0f0a12 100%)',
-        boxShadow: '0 0 0 1px rgba(168,85,247,.22),0 8px 22px rgba(0,0,0,.7),0 0 18px rgba(168,85,247,.2)',
+        boxShadow: '0 0 0 1px rgba(168,85,247,.28),0 8px 22px rgba(0,0,0,.75),0 0 22px rgba(168,85,247,.25)',
         cursor: 'pointer',
         padding: '0',
         // Above Torn's UI but below TECH's panel so the panel renders on top.
@@ -11412,11 +11417,12 @@
     // The launcher mark inside is an <img>; resize it for the round FAB.
     const img = fab.querySelector('.tech-launcher-mark');
     if (img) {
-      img.style.width = '26px';
-      img.style.height = '26px';
+      img.style.width = '30px';
+      img.style.height = '30px';
       img.style.display = 'block';
     }
     document.body.appendChild(fab);
+    try { console.log('[TECH] Floating launcher mounted (PDA / mobile fallback)'); } catch (e) {}
     return fab;
   }
 
@@ -11582,7 +11588,7 @@
   // trigger common actions without opening the panel. Wrapped in a typeof
   // guard so the script still loads if a manager doesn't expose this API.
   function registerMenuCommands() {
-    // v1.3.1 — route through the PDA shim; on PDA this is a no-op (no
+    // v1.3.2 — route through the PDA shim; on PDA this is a no-op (no
     // right-click menu in the WebView), on Tampermonkey it passes
     // straight through to GM_registerMenuCommand.
     try {

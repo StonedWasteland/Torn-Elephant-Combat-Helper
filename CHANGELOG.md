@@ -6,6 +6,16 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.3.2 — Reposition floating launcher above PDA toolbars
+
+v1.3.1 spawned the floating launcher at `bottom: 12px` — directly underneath PDA's persistent bottom toolbar, which is 100–150px tall and hides anything corner-pinned in that zone. Result: the launcher was technically there but invisible behind PDA's UI.
+
+v1.3.2 moves the launcher to the **vertical middle of the right edge** (`top: 50%; transform: translateY(-50%)`), clear of both PDA's top status bar and bottom toolbar. Also bumped its size to 52px (Material's recommended touch target) and the mascot mark to 30px for better fingertip targeting on mobile.
+
+Added a `[TECH] Floating launcher mounted` console log on first spawn so PDA debug consoles can confirm whether the script is reaching this code path.
+
+---
+
 ## v1.3.1 — Floating launcher fallback for PDA
 
 v1.3.0 turned out to ship with TECH effectively invisible on Torn PDA: the script ran, but the launcher button injected into Torn's desktop top-bar (anchored on `#recent-history-wrapper`) never appeared because that element doesn't exist in PDA's mobile DOM. No launcher = no way to open the panel = TECH appears completely silent.
