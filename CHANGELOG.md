@@ -6,6 +6,16 @@ The most recent versions live inline at the top of `TornElephantCombatHelper.use
 
 ---
 
+## v1.3.3 — Critical PDA detection fix
+
+The actual root cause of TECH being invisible on PDA. The v1.3.0 environment detection (`IS_PDA = _PDA_INJECTED_APIKEY[0] !== '#'`) checked whether PDA had substituted the API key placeholder — but PDA only substitutes that placeholder if the user has set a per-script Custom API Key in PDA's settings. If they haven't, the placeholder stays intact, our detection returns `false`, and the script falls into the Tampermonkey branch — which then crashes silently on the first reference to `GM_setValue` (undefined in PDA).
+
+v1.3.3 changes the detection to `typeof PDA_httpGet === 'function'`. This function is provided by PDA's WebView itself, always present on PDA and always absent in Tampermonkey, independent of any user configuration. TECH now works on PDA whether you've set a per-script Custom API Key or not — if you haven't, you just paste your API key into TECH's Settings tab like on desktop.
+
+Also added a `[TECH] vX.Y.Z loading. IS_PDA=…` console log on script entry so PDA debug views can confirm the script reached this code path. If you can see that line, TECH loaded; if you can't, PDA never injected our script and the issue is upstream.
+
+---
+
 ## v1.3.2 — Reposition floating launcher above PDA toolbars
 
 v1.3.1 spawned the floating launcher at `bottom: 12px` — directly underneath PDA's persistent bottom toolbar, which is 100–150px tall and hides anything corner-pinned in that zone. Result: the launcher was technically there but invisible behind PDA's UI.

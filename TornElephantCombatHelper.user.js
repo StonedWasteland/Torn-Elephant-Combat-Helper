@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.3.2
+// @version      1.3.3
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,8 +20,8 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.3.2 — Experimental Torn PDA support) ──────────
-// v1.3.2 ships TECH on Torn PDA (the official mobile app), alongside
+// ─── UPDATE NOTES (1.3.3 — Experimental Torn PDA support) ──────────
+// v1.3.3 ships TECH on Torn PDA (the official mobile app), alongside
 // continued Tampermonkey support. Same .user.js file runs in both
 // environments via a small runtime detection shim at the top of the
 // IIFE: PDA replaces a marker placeholder with the user's API key,
@@ -150,9 +150,9 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.3.2';
+  const SCRIPT_VERSION    = '1.3.3';
 
-  // ─── PDA COMPATIBILITY SHIM (v1.3.2) ────────────────────────────────
+  // ─── PDA COMPATIBILITY SHIM (v1.3.3) ────────────────────────────────
   // Torn PDA (mobile app) runs userscripts inside a Flutter WebView. At
   // inject time it substitutes the placeholder `###PDA-APIKEY###` below
   // with the user's limited Torn API key, and provides PDA_httpGet /
@@ -167,9 +167,20 @@
   // pattern, lightly adapted to TECH's storage + xhr conventions.
   //
   // DO NOT modify the apikey placeholder below — PDA's injector looks
-  // for it verbatim and won't substitute if the format is off.
+  // for it verbatim. PDA only substitutes it when the user has set a
+  // per-script custom API key, which they may or may not have done.
+  //
+  // v1.3.3 fix — environment detection uses `typeof PDA_httpGet` instead
+  // of the placeholder substitution. The placeholder check is unreliable
+  // because PDA users who haven't configured a custom API key in PDA's
+  // per-script settings leave the placeholder intact — which would
+  // misroute them into the Tampermonkey branch and silently crash on the
+  // first reference to GM_setValue (undefined on PDA). PDA_httpGet is
+  // ALWAYS present on PDA and ALWAYS absent on Tampermonkey, so it's a
+  // reliable environment signal independent of user configuration.
   const _PDA_INJECTED_APIKEY = "###PDA-APIKEY###";
-  const IS_PDA = _PDA_INJECTED_APIKEY[0] !== '#';
+  const IS_PDA = (typeof PDA_httpGet === 'function');
+  try { console.log('[TECH] v' + SCRIPT_VERSION + ' loading. IS_PDA=' + IS_PDA); } catch (e) {}
   const _gm = {};
   if (IS_PDA) {
     try { console.log('[TECH] PDA environment detected — wiring shims'); } catch (e) {}
@@ -724,7 +735,7 @@
     tornStatsApiKey: '',
   });
 
-  // v1.3.2 — PDA auto-injects the user's limited Torn API key via the
+  // v1.3.3 — PDA auto-injects the user's limited Torn API key via the
   // placeholder substitution at the top of this file. When we detect that,
   // copy it into settings.apiKey so the user doesn't have to paste it
   // manually on first run. We only overwrite when settings.apiKey is
@@ -11373,7 +11384,7 @@
     pip.className = 'tech-launcher-pip' + (cls ? ' ' + cls : '');
   }
 
-  // v1.3.2 — Floating launcher fallback for environments where Torn's
+  // v1.3.3 — Floating launcher fallback for environments where Torn's
   // desktop toolbar doesn't exist (Torn PDA mobile view, occasionally
   // mobile-Firefox-on-narrow-viewport renders where Torn skips the
   // toolbar entirely). Renders a position:fixed circular FAB pinned to
@@ -11391,7 +11402,7 @@
       html: launcherMarkHTML(),
       'on:click': function (e) { e.preventDefault(); togglePanel(); },
       style: {
-        // v1.3.2 — position on the vertical-middle of the right edge so we
+        // v1.3.3 — position on the vertical-middle of the right edge so we
         // sit clear of PDA's top status bar AND its bottom toolbar (both
         // of which can be 60–120px tall and would otherwise hide a corner-
         // pinned launcher). transform centers us relative to top:50%.
@@ -11588,7 +11599,7 @@
   // trigger common actions without opening the panel. Wrapped in a typeof
   // guard so the script still loads if a manager doesn't expose this API.
   function registerMenuCommands() {
-    // v1.3.2 — route through the PDA shim; on PDA this is a no-op (no
+    // v1.3.3 — route through the PDA shim; on PDA this is a no-op (no
     // right-click menu in the WebView), on Tampermonkey it passes
     // straight through to GM_registerMenuCommand.
     try {
