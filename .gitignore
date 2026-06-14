@@ -31,3 +31,11 @@ references/
 
 # Working-tree backups from staged refactor work.
 .tech-*-backup.js
+
+# Spy/calibration datasets — aggregate-only outputs ship in source as
+# constants (TYPICAL_STATS_BY_LEVEL etc.); the raw individual-spy rows
+# must NEVER reach GitHub. The players in those files have a reasonable
+# expectation their stats stay inside TornStats, not republished publicly.
+TS_Faction_Spies_*.csv
+*_spies_*.csv
+*spy*.csv

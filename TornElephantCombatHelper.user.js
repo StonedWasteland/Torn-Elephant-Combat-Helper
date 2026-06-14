@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.3.5
+// @version      1.4.0
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,7 +20,46 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.2.0 — Cross-source consensus + bulk spies) ────
+// ─── UPDATE NOTES (1.4.0 — Empirical estimate fallback) ────────────
+// v1.4.0 closes the "no data on this player" dead end in Opponent Intel.
+// When spy / BSP / FF Scouter all return nothing for an opponent, the
+// drill now surfaces an Empirical Estimate card based on a calibrated
+// population baseline (1518 TornStats spies, 24-month freshness filter):
+// "Typical L40 player total: 4.4M · range p25 1.5M – p95 3.0B."
+//
+// What's in v1.4.0:
+//
+// 1. TYPICAL_STATS_BY_LEVEL constant — 11 level buckets (L1, L10-19, …,
+//    L100) with p25/p50/p75/p95 total-stat percentiles each. Derived from
+//    1518 cleaned-and-filtered TornStats faction-spy records (full pipeline
+//    + ethics rationale documented in the project_tech_spy_calibration
+//    memory file). Aggregate-only: no individual spy data ships in the
+//    constant; you can't reverse-engineer any specific player from these
+//    medians.
+//
+// 2. Empirical Estimate card in Opponent Intel. Renders ONLY when none
+//    of spy / BSP / FF Scouter has usable data on the target AND the
+//    opponent's level is known. Includes amber "treat as a wide range"
+//    caveats for L1 (bimodal: stat-builders vs fresh accounts) and L10-19
+//    (n=12, thin sample). Always closes with: "This is a population
+//    baseline, not a prediction for this individual."
+//
+// 3. hasAnyExternalData(opponentId) helper — cheap cache check used to
+//    gate the empirical card. No new API calls; the card just fills the
+//    void when the existing sources couldn't answer.
+//
+// Why this matters: every Opponent Intel drill on a fresh enemy was
+// reading as blank below the verdict pill — three "no data" cards in
+// a row. With v1.4.0 you get a level-bucketed strength baseline as the
+// floor, so the decision "do I engage" is never made on zero information.
+//
+// What does NOT change: no new feature in the FAB, no new tab, no new
+// API integration, no new TECH lookup tool that exposes individual spies.
+// The empirical baseline is a calibration artifact, not a runtime
+// dataset. Per ecosystem-ethics line: TECH routes users to spy sources
+// (TornStats / BSP / FF Scouter), it doesn't replace them.
+//
+// ─── PRIOR UPDATE NOTES (1.2.0 — Cross-source consensus + bulk spies) ────
 // v1.2.0 layers synthesis on top of v1.1.0's three integrations. The
 // data was already flowing in from spy / BSP / FF Scouter — v1.2.0
 // makes that data easier to *use*.
@@ -127,7 +166,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.3.5';
+  const SCRIPT_VERSION    = '1.4.0';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -515,6 +554,43 @@
   function dotsString(dots) {
     const filled = Math.max(0, Math.min(5, dots));
     return '⬤'.repeat(filled) + '◯'.repeat(5 - filled);
+  }
+
+  // ─── EMPIRICAL STAT CURVE (v1.4.0 calibration) ──────────────────────────
+  // Derived from 1518 spies (TornStats faction export, 24-month filter,
+  // pillar consistency check). Used as a FALLBACK estimate in Opponent
+  // Intel when spy / BSP / FF Scouter all return no-data. Aggregate-only
+  // — no individual spy rows ship in this constant. Methodology lives in
+  // memory/project_tech_spy_calibration.md.
+  //
+  // Each entry: { n, p25, p50, p75, p95 } in raw total-stat units.
+  // p50 = typical player at that level; p95 = elite outlier threshold.
+  // `bimodal: true` flags L1 (split between dedicated stat-builders +
+  // fresh accounts; median is high but the spread is enormous).
+  // `thin: true` flags L10-19 where n=12 is too few to trust the tail.
+  const TYPICAL_STATS_BY_LEVEL = {
+    '1':     { n: 535, p25: 11430536,   p50: 1210649147, p75: 4002927714, p95: 9161605338,  bimodal: true },
+    '10-19': { n:  12, p25: 21134,      p50: 165483,     p75: 10035397,   p95: 2332591000,  thin: true    },
+    '20-29': { n:  42, p25: 74395,      p50: 267540,     p75: 138067205,  p95: 1415701646 },
+    '30-39': { n:  60, p25: 580665,     p50: 1405056,    p75: 37074506,   p95: 2240235271 },
+    '40-49': { n:  74, p25: 1520582,    p50: 4430247,    p75: 96208228,   p95: 2991277280 },
+    '50-59': { n: 118, p25: 8572415,    p50: 31541365,   p75: 414380165,  p95: 1558860710 },
+    '60-69': { n: 118, p25: 57675497,   p50: 243150023,  p75: 693109432,  p95: 2864782936 },
+    '70-79': { n: 110, p25: 345873504,  p50: 888924281,  p75: 1656590443, p95: 2949411937 },
+    '80-89': { n: 107, p25: 1045130285, p50: 1618088145, p75: 2243535447, p95: 3489190201 },
+    '90-99': { n: 200, p25: 2097849942, p50: 2864626751, p75: 4182107879, p95: 6570862299 },
+    '100':   { n: 142, p25: 4131259727, p50: 5700962620, p75: 7258037839, p95: 15274788374 },
+  };
+
+  // Returns the percentile block for a given level, or null when level is
+  // outside the calibrated range. L1 maps to '1', L100 maps to '100',
+  // everything else maps to its decade bucket ('20-29', '30-39', …).
+  function typicalStatsForLevel(level) {
+    if (!Number.isFinite(level) || level < 1) return null;
+    if (level === 1)   return TYPICAL_STATS_BY_LEVEL['1'];
+    if (level >= 100)  return TYPICAL_STATS_BY_LEVEL['100'];
+    const decade = Math.floor(level / 10) * 10;
+    return TYPICAL_STATS_BY_LEVEL[decade + '-' + (decade + 9)] || null;
   }
 
   // ─── STORAGE ────────────────────────────────────────────────────────────
@@ -6007,6 +6083,24 @@
       font-style:italic;}
     .tech-effect-list{display:flex;flex-wrap:wrap;gap:4px;}
 
+    /* v1.4.0 — Empirical estimate card. Renders in Opponent Intel only
+       when spy / BSP / FF Scouter all return no-data. Visually muted vs
+       the high-confidence source cards above; the headline is the
+       population p50 with a clear "population baseline" caveat. */
+    .tech-empirical-meta{color:#6b7280;font-weight:500;text-transform:none;
+      letter-spacing:.5px;font-size:10px;margin-left:6px;}
+    .tech-empirical-line{font-size:12px;color:#cbd5e1;margin:3px 0 4px;
+      line-height:1.5;}
+    .tech-empirical-line strong{color:#fde047;font-size:14px;
+      font-variant-numeric:tabular-nums;}
+    .tech-empirical-range{font-size:10px;color:#9ca3af;
+      font-variant-numeric:tabular-nums;margin-bottom:6px;}
+    .tech-empirical-caveat{font-size:11px;color:#fbbf24;line-height:1.4;
+      margin-top:4px;padding:5px 8px;background:#1f1a0a;
+      border-left:2px solid #d97706;border-radius:2px;}
+    .tech-empirical-foot{font-size:10px;color:#6b7280;font-style:italic;
+      margin-top:6px;line-height:1.4;}
+
     /* Leveling Trap Detector card. Severity tints the verdict + left edge. */
     .tech-trap{border-left:3px solid #4b5563;padding-left:10px;}
     .tech-trap.good{border-left-color:#34d399;}
@@ -8711,6 +8805,61 @@
     ));
   }
 
+  // v1.4.0 — "Does any external source have usable data on this player?"
+  // Used by the empirical estimate fallback below to decide whether to
+  // render. We check cache state only (no fetches); the drill's own fetch
+  // kicks happen elsewhere on open. Returns true if ANY of spy / BSP /
+  // FF Scouter has produced a non-error, non-noData entry.
+  function hasAnyExternalData(opponentId) {
+    const spy = spyCache[opponentId];
+    if (spy && !spy.error && !spy.noData) return true;
+    if (settings.bspEnabled) {
+      const bsp = bspCache[opponentId];
+      if (bsp && !bsp.error && !bsp.noData) return true;
+    }
+    if (settings.ffEnabled) {
+      const ff = ffCache[opponentId];
+      if (ff && !ff.error && !ff.noData) return true;
+    }
+    return false;
+  }
+
+  // v1.4.0 — Empirical estimate card. Renders only when no external
+  // source has data on this opponent AND we know their level. Surfaces
+  // typical-stats percentiles for the level bucket as a baseline so the
+  // drill never reads as "blank, sorry". Numbers come from a 1518-row
+  // TornStats spy aggregate; methodology in the project_tech_spy_calibration
+  // memory file. Aggregate-only — no individual spy data ships.
+  function renderEmpiricalEstimateCard(host, opponentLevel) {
+    const typ = typicalStatsForLevel(opponentLevel);
+    if (!typ) return;
+    host.appendChild(el('div', { class: 'tech-section' },
+      el('div', { class: 'tech-section-title' },
+        el('span', {}, 'Empirical estimate'),
+        el('span', { class: 'tech-empirical-meta' },
+          '· based on ' + typ.n + ' spies'),
+      ),
+      el('div', { class: 'tech-empirical-line' },
+        'Typical L' + opponentLevel + ' player total: ',
+        el('strong', {}, fmtNum(typ.p50, 1)),
+      ),
+      el('div', { class: 'tech-empirical-range' },
+        'Range: p25 ' + fmtNum(typ.p25, 1)
+        + ' · p75 ' + fmtNum(typ.p75, 1)
+        + ' · p95 ' + fmtNum(typ.p95, 1),
+      ),
+      typ.bimodal ? el('div', { class: 'tech-empirical-caveat' },
+        '⚠ L1 cohort splits between stat-builders (heavy) and fresh accounts (light). Treat as a wide range, not a point estimate.',
+      ) : null,
+      typ.thin ? el('div', { class: 'tech-empirical-caveat' },
+        '⚠ Thin sample (n=' + typ.n + ') — wide confidence interval.',
+      ) : null,
+      el('div', { class: 'tech-empirical-foot' },
+        'No spy, BSP, or FF Scouter data on this player. This is a population baseline, not a prediction for this individual.',
+      ),
+    ));
+  }
+
   // ─── DRILL: OPPONENT INTEL ──────────────────────────────────────────────
   // Rendered in place of the active tab when currentDrill is set.
   function renderOpponentDrill(host, opponentId) {
@@ -8783,6 +8932,15 @@
         const ffSec = el('div', { class: 'tech-section' });
         renderFFCard(ffSec, opponentId);
         host.appendChild(ffSec);
+      }
+
+      // v1.4.0 — Empirical estimate fallback. Renders when none of the
+      // external sources above produced usable data AND we know the
+      // opponent's level. cachedTarget.level comes from a prior pinned-
+      // target fetch; we don't fire one just for this. Aggregate-only
+      // baseline so the drill never reads as totally blank.
+      if (!hasAnyExternalData(opponentId) && cachedTarget.level != null) {
+        renderEmpiricalEstimateCard(host, cachedTarget.level);
       }
 
       host.appendChild(el('div', { class: 'tech-empty' },
@@ -8881,6 +9039,15 @@
       const ffSec = el('div', { class: 'tech-section' });
       renderFFCard(ffSec, intel.id);
       host.appendChild(ffSec);
+    }
+
+    // v1.4.0 — Empirical estimate fallback. Even with fight history, if
+    // none of the external sources have stat data on this player, render
+    // the population baseline so the user has SOMETHING to ground their
+    // engagement decision on. Prefers intel.levelLast (most recent level
+    // seen in fight records).
+    if (!hasAnyExternalData(intel.id) && intel.levelLast != null) {
+      renderEmpiricalEstimateCard(host, intel.levelLast);
     }
 
     // Row 1: fights · win rate · respect net
