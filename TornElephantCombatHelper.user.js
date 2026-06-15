@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.4.0
+// @version      1.5.1
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -20,44 +20,106 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ─── UPDATE NOTES (1.4.0 — Empirical estimate fallback) ────────────
-// v1.4.0 closes the "no data on this player" dead end in Opponent Intel.
-// When spy / BSP / FF Scouter all return nothing for an opponent, the
-// drill now surfaces an Empirical Estimate card based on a calibrated
-// population baseline (1518 TornStats spies, 24-month freshness filter):
-// "Typical L40 player total: 4.4M · range p25 1.5M – p95 3.0B."
+// ─── UPDATE NOTES (1.5.1 — Polish: B-tier formatting + settings backfill) ───
+// Two fixes on top of v1.5.0's TECH Estimate:
 //
-// What's in v1.4.0:
+// 1. fmtNum() now emits a Billion tier. Numbers ≥ 1e9 format as e.g.
+//    "4.5B" instead of "4536.1M". Affects every readout that uses the
+//    helper: TECH Estimate headline + credible range, TornStats spy
+//    totals, BSP/FF cards, level histograms — anywhere a stat in the
+//    billions would have read as "thousands of millions" before.
 //
-// 1. TYPICAL_STATS_BY_LEVEL constant — 11 level buckets (L1, L10-19, …,
-//    L100) with p25/p50/p75/p95 total-stat percentiles each. Derived from
-//    1518 cleaned-and-filtered TornStats faction-spy records (full pipeline
-//    + ethics rationale documented in the project_tech_spy_calibration
-//    memory file). Aggregate-only: no individual spy data ships in the
-//    constant; you can't reverse-engineer any specific player from these
-//    medians.
+// 2. Long-time install backfill for settings.consensusEnabled. The
+//    storage layer's `load()` returns saved settings AS-IS; new keys
+//    added in later versions (like consensusEnabled in v1.2.0) were
+//    never auto-filled from the defaults object. Users who saved
+//    settings before v1.2.0 ended up with consensusEnabled = undefined.
+//    The Settings UI treated undefined as "on" (`!== false`), but
+//    v1.5.0's render gate checked `!setting` which is true for undefined
+//    — so the TECH Estimate card silently failed to render despite the
+//    toggle showing as enabled. Now backfilled to `true` once on first
+//    v1.5.1+ load when the key is undefined. Doesn't override explicit
+//    user choices (true OR false).
 //
-// 2. Empirical Estimate card in Opponent Intel. Renders ONLY when none
-//    of spy / BSP / FF Scouter has usable data on the target AND the
-//    opponent's level is known. Includes amber "treat as a wide range"
-//    caveats for L1 (bimodal: stat-builders vs fresh accounts) and L10-19
-//    (n=12, thin sample). Always closes with: "This is a population
-//    baseline, not a prediction for this individual."
+// ─── PRIOR UPDATE NOTES (1.5.0 — TECH Estimate: Bayesian synthesis) ─────────
+// v1.5.0 promotes the headline opponent-stat read from a band-median
+// "consensus" into a Bayesian posterior — the TECH Estimate. Spy, BSP,
+// FF Scouter, and the level-bucketed empirical baseline are weighted by
+// their respective uncertainties and combined into a single posterior
+// distribution. Output is the median stat estimate, an 80% credible
+// range, and a confidence pill that summarises posterior width.
 //
-// 3. hasAnyExternalData(opponentId) helper — cheap cache check used to
-//    gate the empirical card. No new API calls; the card just fills the
-//    void when the existing sources couldn't answer.
+// What changed under the hood:
 //
-// Why this matters: every Opponent Intel drill on a fresh enemy was
-// reading as blank below the verdict pill — three "no data" cards in
-// a row. With v1.4.0 you get a level-bucketed strength baseline as the
-// floor, so the decision "do I engage" is never made on zero information.
+// 1. Math in log-space (stats are log-normal). Each percentile bucket is
+//    fit to a normal (μ, σ). Each real source contributes a likelihood
+//    (μ_obs, σ_obs). Posterior = precision-weighted update:
+//      1/σ_post² = 1/σ_prior² + Σ 1/σ_source²
+//      μ_post    = σ_post² · (μ_prior/σ_prior² + Σ μ_source/σ_source²)
+//    The empirical baseline is no longer a separate fallback card — it
+//    is the PRIOR baked into every estimate, dominated by real sources
+//    when they exist and surfaced as the headline when they don't.
 //
-// What does NOT change: no new feature in the FAB, no new tab, no new
-// API integration, no new TECH lookup tool that exposes individual spies.
-// The empirical baseline is a calibration artifact, not a runtime
-// dataset. Per ecosystem-ethics line: TECH routes users to spy sources
-// (TornStats / BSP / FF Scouter), it doesn't replace them.
+// 2. Per-source noise models (v1 defaults — calibration ongoing):
+//    - Spy: freshness-decayed σ. <30d ≈ ±10% (80% CI), <6mo ≈ ±30%,
+//      <1yr ≈ ±75%, >1yr ≈ ±2.5x. Uses TornStats `total_timestamp`
+//      (when the spy was taken) not when we polled — staleness that
+//      matters is "how long since this was true."
+//    - BSP: σ such that 80% CI is ±2x. Single point estimate from a
+//      modeled service; defensible without calibration data.
+//    - FF Scouter: σ same as BSP for v1. Open calibration debt: with
+//      paired spy/FF data we can fit residual σ properly.
+//
+// 3. Confidence pill thresholds (UX heuristics, not statistical):
+//    High = upper/median ratio < 1.5x (narrow range, fresh spy or strong
+//    agreement). Medium < 2.5x. Low otherwise.
+//
+// 4. Card UI:
+//    - Headline median (large yellow numeral).
+//    - "80% likely between X – Y" sub-line — credible range, not a guess.
+//    - Verdict band (Soft/Matched/Dangerous/Out-of-league) preserved
+//      for visual parity with BSP/FF cards.
+//    - Per-contributor chips: each source's value + weight share %,
+//      plus the empirical prior's chip (recedes visually when its
+//      weight is small).
+//    - Caveats only when honest: "no real evidence" info chip,
+//      L1 bimodal warning, L10-19 thin-sample warning.
+//    - Footer always shows prior weight + "σ defaults v1" callout so
+//      the calibration debt stays visible.
+//
+// 5. Settings toggle: the v1.2.0 `settings.consensusEnabled` key is
+//    preserved (your saved preference carries over), but the label and
+//    hint text now describe TECH Estimate. Turning it off restores
+//    v1.1.0 scout-row behaviour (separate bsp/ff bits) and hides the
+//    Opponent Intel card. Per-source cards always remain visible.
+//
+// What's retired:
+//    - renderConsensusCard (v1.2.0 band-median synthesis).
+//    - renderEmpiricalEstimateCard (v1.4.0 standalone baseline card —
+//      its data is now the Bayesian prior).
+//    - hasAnyExternalData helper (no longer needed; the new card always
+//      has SOMETHING to render when opponent level is known).
+//
+// What does NOT change: no new tab, no new FAB action, no new API
+// integration, no new TECH lookup tool. The scout-row consensus pill
+// (Quick Wins panel) still uses the v1.2.0 band-median logic —
+// reserved for future v1.5.x upgrade. Faction Intel + WAR cards
+// untouched.
+//
+// Calibration debt (tracked openly so we can close it):
+//    - FF Scouter σ vs spy ground truth (needs paired data).
+//    - BSP σ vs spy ground truth (same).
+//    - Spy freshness curve refinement (stat-builders grow faster).
+//    - L1 bimodal — currently inflated σ; a two-component mixture
+//      would be more honest but harder to ship as a constant.
+//
+// ─── PRIOR UPDATE NOTES (1.4.0 — Empirical estimate fallback) ─────────
+// v1.4.0 closed the "no data on this player" dead end with a level-
+// bucketed empirical card. v1.5.0 makes that baseline a first-class
+// Bayesian prior rather than a fallback — the underlying numbers
+// (TYPICAL_STATS_BY_LEVEL, 1518 cleaned TornStats spies, 24mo freshness
+// filter) remain the source of truth. Ethics line unchanged: aggregate
+// only, no individual-spy lookup feature.
 //
 // ─── PRIOR UPDATE NOTES (1.2.0 — Cross-source consensus + bulk spies) ────
 // v1.2.0 layers synthesis on top of v1.1.0's three integrations. The
@@ -166,7 +228,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.4.0';
+  const SCRIPT_VERSION    = '1.5.1';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -684,6 +746,21 @@
     tornStatsApiKey: '',
   });
 
+  // v1.5.1 — Backfill defaults for long-time installs. load() returns the
+  // stored settings AS-IS when a saved value exists; new keys added in
+  // later versions DON'T get filled in from the defaults object, so users
+  // who saved settings before v1.2.0 ended up with consensusEnabled =
+  // undefined. The Settings UI treats undefined as "on" (`!== false`),
+  // but v1.5.0 render gates checked `!setting` which is true for undefined
+  // → TECH Estimate card silently hidden. Backfilling here writes the
+  // default value once on first v1.5.1+ load so the value is explicit
+  // forever after. Only fires when the key is undefined, never overrides
+  // an explicit user choice (true OR false).
+  if (settings.consensusEnabled === undefined) {
+    settings.consensusEnabled = true;
+    store('settings', settings);
+  }
+
   // v0.6.34 — Scout cache. Last roster fetch per faction ID. We keep
   // these persisted so reopening the panel after a fresh-tab close
   // doesn't re-hit the API for the same enemy faction. Shape:
@@ -978,6 +1055,7 @@
   function fmtNum(n, digits = 1) {
     if (n === null || n === undefined || !isFinite(n)) return '—';
     const abs = Math.abs(n);
+    if (abs >= 1e9) return (n / 1e9).toFixed(digits) + 'B';
     if (abs >= 1e6) return (n / 1e6).toFixed(digits) + 'M';
     if (abs >= 1e3) return (n / 1e3).toFixed(digits) + 'k';
     if (Number.isInteger(n)) return String(n);
@@ -2740,6 +2818,219 @@
     'minor':     '#fbbf24', // amber — caution
     'major':     '#f87171', // red — split / suspect
   };
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // TECH Estimate (v1.5.0) — Bayesian synthesis of opponent stat estimates.
+  //
+  // Replaces the v1.2.0 band-median consensus and the v1.4.0 standalone
+  // empirical card. The empirical population baseline is no longer its own
+  // card — it becomes the PRIOR in a Bayesian update, dominated by real
+  // sources when they exist and surfaced as the headline when they don't.
+  //
+  // Math: everything happens in log-space (stats are log-normal — they grow
+  // exponentially with level, training, drugs). The bucket percentiles are
+  // fit to a log-normal (μ, σ). Each real source contributes a likelihood
+  // (μ_obs, σ_obs). The posterior is a precision-weighted update:
+  //
+  //   1/σ_post² = 1/σ_prior² + Σ 1/σ_source²
+  //   μ_post    = σ_post² · (μ_prior/σ_prior² + Σ μ_source/σ_source²)
+  //
+  // Output: point = exp(μ_post), 80% credible range = exp(μ_post ± 1.28·σ_post).
+  // A source's weight in the posterior is precision_i / total_precision —
+  // displayed in the breakdown so the user can see WHY a number landed.
+  //
+  // Source σ defaults are "v1 calibration" — defensible but not derived from
+  // paired-source ground truth. Refine when paired data becomes available.
+  //
+  // Φ⁻¹(0.25) = -0.6745, Φ⁻¹(0.75) = +0.6745, Φ⁻¹(0.95) = +1.6449
+  // 80% CI uses Φ⁻¹(0.90) = +1.2816 on each side.
+  // ──────────────────────────────────────────────────────────────────────────
+  const TECH_EST_Z_80 = 1.2816;   // 80% credible interval half-width in σ units
+  const TECH_EST_Z_75 = 0.6745;   // p25 / p75 offset from median in σ units
+  const TECH_EST_Z_95 = 1.6449;   // p95 offset from median in σ units
+
+  // Fit a log-normal (μ, σ) to a percentile block {p25, p50, p75, p95}.
+  // We average the three σ estimates derivable from the percentile pairs
+  // (p25↔p50, p50↔p75, p50↔p95) for robustness — single-pair fits are
+  // sensitive to one extreme value being noisy. The L1 bimodal flag inflates
+  // σ to be honest about the stat-builder/fresh-account split (no clean
+  // log-normal fits a two-mode distribution); the L10-19 thin flag does the
+  // same for small-n buckets.
+  function fitLogNormalFromBucket(bucket) {
+    if (!bucket || !(bucket.p50 > 0)) return null;
+    const mu = Math.log(bucket.p50);
+    const sigmas = [];
+    if (bucket.p25 > 0) sigmas.push((Math.log(bucket.p50) - Math.log(bucket.p25)) / TECH_EST_Z_75);
+    if (bucket.p75 > 0) sigmas.push((Math.log(bucket.p75) - Math.log(bucket.p50)) / TECH_EST_Z_75);
+    if (bucket.p95 > 0) sigmas.push((Math.log(bucket.p95) - Math.log(bucket.p50)) / TECH_EST_Z_95);
+    if (sigmas.length === 0) return null;
+    let sigma = sigmas.reduce(function (a, b) { return a + b; }, 0) / sigmas.length;
+    if (bucket.bimodal) sigma *= 1.5;  // L1 — be honest about the spread
+    if (bucket.thin)    sigma *= 1.2;  // L10-19 — small n, widen
+    return { mu: mu, sigma: sigma, source: 'prior',
+             bimodal: !!bucket.bimodal, thin: !!bucket.thin };
+  }
+
+  // Spy data → (μ_obs, σ_obs). Freshness decay: a 3-day-old spy is tight
+  // (~±10% at 80% CI); 6-month-old spy is loose (~±50%); year-plus is
+  // basically as wide as the prior. Uses spy.totalTs (when the spy was
+  // actually taken) not spy.fetchedAt (when we polled TornStats) — the
+  // staleness that matters is "how long has it been since this was true."
+  function techEstSpySource(spy) {
+    if (!spy || spy.error || spy.noData) return null;
+    if (!(typeof spy.total === 'number') || spy.total <= 0) return null;
+    const spyTs = (typeof spy.totalTs === 'number' && spy.totalTs > 0)
+      ? spy.totalTs
+      : (typeof spy.fetchedAt === 'number' ? spy.fetchedAt : nowSec());
+    const ageDays = Math.max(0, (nowSec() - spyTs) / 86400);
+    let sigma, freshness;
+    if      (ageDays < 30)  { sigma = Math.log(1.10) / TECH_EST_Z_80; freshness = 'fresh';  }
+    else if (ageDays < 180) { sigma = Math.log(1.30) / TECH_EST_Z_80; freshness = 'recent'; }
+    else if (ageDays < 365) { sigma = Math.log(1.75) / TECH_EST_Z_80; freshness = 'aging';  }
+    else                    { sigma = Math.log(2.50) / TECH_EST_Z_80; freshness = 'stale';  }
+    return { name: 'spy', mu: Math.log(spy.total), sigma: sigma,
+             value: spy.total, ageDays: ageDays, freshness: freshness };
+  }
+
+  // BSP → (μ_obs, σ_obs). BSP returns a point estimate (tbs); we treat it
+  // as moderately noisy — ±2x at 80% CI is a "we believe within a factor
+  // of two" stance. Tighter than the level-bucket prior, looser than a
+  // recent spy. v1 default; refine when paired BSP/spy data is available.
+  function techEstBspSource(bsp) {
+    if (!bsp || bsp.error || bsp.noData) return null;
+    if (!(typeof bsp.tbs === 'number') || bsp.tbs <= 0) return null;
+    const sigma = Math.log(2.0) / TECH_EST_Z_80;
+    return { name: 'bsp', mu: Math.log(bsp.tbs), sigma: sigma, value: bsp.tbs };
+  }
+
+  // FF Scouter → (μ_obs, σ_obs). bsEstimate is the analogue to BSP's tbs.
+  // v1 default σ matches BSP — calibration debt: with paired spy/FF data
+  // we can fit a real residual σ. For now they get equal weight when both
+  // are present, which is honest given we haven't measured either yet.
+  function techEstFfSource(ff) {
+    if (!ff || ff.error || ff.noData) return null;
+    if (!(typeof ff.bsEstimate === 'number') || ff.bsEstimate <= 0) return null;
+    const sigma = Math.log(2.0) / TECH_EST_Z_80;
+    return { name: 'ff', mu: Math.log(ff.bsEstimate), sigma: sigma, value: ff.bsEstimate };
+  }
+
+  // Posterior under conjugate normal-normal update. Each contributor adds
+  // its precision (1/σ²) to the pool; precision-weighted μ is the posterior
+  // mean. Per-source weight = its precision share — used downstream to
+  // show "spy: 70% of the answer" in the breakdown.
+  function bayesUpdateLogNormal(prior, sources) {
+    let precisionSum = 1 / (prior.sigma * prior.sigma);
+    let weightedMuSum = prior.mu * precisionSum;
+    for (let i = 0; i < sources.length; i++) {
+      const s = sources[i];
+      const p = 1 / (s.sigma * s.sigma);
+      precisionSum += p;
+      weightedMuSum += s.mu * p;
+    }
+    const sigmaPost = Math.sqrt(1 / precisionSum);
+    const muPost = weightedMuSum / precisionSum;
+    // Per-contributor weight share (prior + each source).
+    const priorWeight = (1 / (prior.sigma * prior.sigma)) / precisionSum;
+    const sourceWeights = sources.map(function (s) {
+      return (1 / (s.sigma * s.sigma)) / precisionSum;
+    });
+    return { mu: muPost, sigma: sigmaPost,
+             priorWeight: priorWeight, sourceWeights: sourceWeights };
+  }
+
+  // Confidence bucketing — based on posterior σ in log-space. The thresholds
+  // correspond to credible-range widths: high means the 80% range is
+  // tighter than roughly ±50%; medium tighter than roughly ±2.5x; low
+  // anything wider. These thresholds are tuned for "what feels actionable
+  // in combat" — they aren't statistical thresholds, just UX heuristics.
+  function techEstConfidence(sigma) {
+    const widthRatio = Math.exp(sigma * TECH_EST_Z_80); // upper/median ratio
+    if (widthRatio < 1.50) return 'high';
+    if (widthRatio < 2.50) return 'medium';
+    return 'low';
+  }
+
+  // v1.5.0 — TECH Estimate. The headline opponent-stat estimate that
+  // synthesises spy + BSP + FF Scouter + the empirical population baseline
+  // into a single posterior distribution. Returns the median, 80% credible
+  // range, confidence bucket, and a per-source breakdown showing what each
+  // contributor weighted in the answer.
+  //
+  // Returns null only when the opponent's level is unknown AND no source
+  // has data (no prior to anchor on, no evidence to update with). In every
+  // other case it returns SOMETHING — that's the point of v1.5.0.
+  //
+  //   {
+  //     point:        45_000_000,   // median estimate
+  //     lo80, hi80:   12M, 170M,   // 80% credible range
+  //     confidence:   'high'|'medium'|'low',
+  //     mu, sigma:    log-space posterior,
+  //     band:         classifyBspBand(myTotal, point) — back-compat for chips,
+  //     prior:        { mu, sigma, weight, bucket, level },
+  //     sources:      [ { name, value, mu, sigma, weight, freshness?, ageDays? } ],
+  //     hasEvidence:  bool — false means it's the prior alone.
+  //   }
+  function computeTechEstimate(opponentId, myTotal, opponentLevel) {
+    // Build per-source likelihoods. Each may be null when the source has
+    // no data or is disabled.
+    const sources = [];
+    const spyLk = techEstSpySource(spyCache[opponentId]);
+    if (spyLk) sources.push(spyLk);
+    if (settings.bspEnabled && bspSubscriptionActive() !== false) {
+      const bspLk = techEstBspSource(bspCache[opponentId]);
+      if (bspLk) sources.push(bspLk);
+    }
+    if (settings.ffEnabled) {
+      const ffLk = techEstFfSource(ffCache[opponentId]);
+      if (ffLk) sources.push(ffLk);
+    }
+
+    // Prior from level bucket. If the level is unknown AND we have no
+    // real sources, there's nothing to anchor on — return null. If we
+    // have sources but no level, fall back to a very wide non-informative
+    // prior (μ from sources' centroid, σ huge) so the sources alone drive
+    // the answer.
+    const bucket = (typeof opponentLevel === 'number')
+      ? typicalStatsForLevel(opponentLevel) : null;
+    let prior = bucket ? fitLogNormalFromBucket(bucket) : null;
+    if (!prior && sources.length === 0) return null;
+    if (!prior) {
+      // No level info, but we have evidence. Use a wide non-informative
+      // prior anchored at the geometric mean of available source values
+      // so the math doesn't pull toward an arbitrary baseline.
+      const muCentroid = sources.reduce(function (a, s) { return a + s.mu; }, 0) / sources.length;
+      prior = { mu: muCentroid, sigma: Math.log(10), source: 'prior',
+                bimodal: false, thin: false, noLevel: true };
+    }
+
+    const post = bayesUpdateLogNormal(prior, sources);
+    const point = Math.exp(post.mu);
+    const lo80  = Math.exp(post.mu - TECH_EST_Z_80 * post.sigma);
+    const hi80  = Math.exp(post.mu + TECH_EST_Z_80 * post.sigma);
+    const confidence = techEstConfidence(post.sigma);
+    const band = (Number.isFinite(myTotal) && myTotal > 0)
+      ? classifyBspBand(myTotal, point) : null;
+
+    // Attach weights for the breakdown.
+    const sourcesOut = sources.map(function (s, i) {
+      return Object.assign({}, s, { weight: post.sourceWeights[i] });
+    });
+
+    return {
+      point: point,
+      lo80: lo80,
+      hi80: hi80,
+      mu: post.mu,
+      sigma: post.sigma,
+      confidence: confidence,
+      band: band,
+      prior: { mu: prior.mu, sigma: prior.sigma, weight: post.priorWeight,
+               bucket: bucket, level: opponentLevel,
+               bimodal: prior.bimodal, thin: prior.thin, noLevel: !!prior.noLevel },
+      sources: sourcesOut,
+      hasEvidence: sources.length > 0,
+    };
+  }
 
   // v0.6.54 — Sequential bulk-fetch of TornStats spy data for every member
   // of a scouted faction roster. Triggered by the "Pull spies" button on
@@ -6083,22 +6374,44 @@
       font-style:italic;}
     .tech-effect-list{display:flex;flex-wrap:wrap;gap:4px;}
 
-    /* v1.4.0 — Empirical estimate card. Renders in Opponent Intel only
-       when spy / BSP / FF Scouter all return no-data. Visually muted vs
-       the high-confidence source cards above; the headline is the
-       population p50 with a clear "population baseline" caveat. */
-    .tech-empirical-meta{color:#6b7280;font-weight:500;text-transform:none;
-      letter-spacing:.5px;font-size:10px;margin-left:6px;}
-    .tech-empirical-line{font-size:12px;color:#cbd5e1;margin:3px 0 4px;
-      line-height:1.5;}
-    .tech-empirical-line strong{color:#fde047;font-size:14px;
+    /* v1.5.0 — TECH Estimate card. Replaces both the v1.2.0 consensus
+       card and the v1.4.0 empirical card. Headline is the Bayesian
+       posterior median; range is the 80% credible interval; chips show
+       per-contributor weight share (incl. the empirical prior). */
+    .tech-est-headline{display:flex;align-items:baseline;gap:10px;
+      margin:2px 0 2px;}
+    .tech-est-headline .tech-est-label{font-size:10px;
+      text-transform:uppercase;letter-spacing:1px;color:#6b7280;
+      font-weight:700;}
+    .tech-est-headline .tech-est-point{
+      font-family:Impact,'Oswald','Arial Narrow',sans-serif;
+      font-size:26px;color:#fde047;letter-spacing:.5px;
+      text-shadow:0 0 10px #fde04740;
       font-variant-numeric:tabular-nums;}
-    .tech-empirical-range{font-size:10px;color:#9ca3af;
-      font-variant-numeric:tabular-nums;margin-bottom:6px;}
-    .tech-empirical-caveat{font-size:11px;color:#fbbf24;line-height:1.4;
+    .tech-est-range{font-size:11px;color:#cbd5e1;margin-bottom:8px;
+      line-height:1.5;font-variant-numeric:tabular-nums;}
+    .tech-est-range strong{color:#fde047;}
+    .tech-est-breakdown{display:flex;flex-wrap:wrap;gap:6px;
+      margin:6px 0 8px;font-size:10px;}
+    .tech-est-chip{background:#0f0a12;border:1px solid #9ca3af40;
+      border-radius:3px;padding:3px 7px;color:#cbd5e1;font-weight:500;
+      font-variant-numeric:tabular-nums;}
+    .tech-est-chip strong{color:#fde047;font-weight:700;margin-right:1px;}
+    .tech-est-chip-spy   {border-color:#a78bfa60;}
+    .tech-est-chip-spy   strong{color:#a78bfa;}
+    .tech-est-chip-bsp   {border-color:#fb923c60;}
+    .tech-est-chip-bsp   strong{color:#fb923c;}
+    .tech-est-chip-ff    {border-color:#34d39960;}
+    .tech-est-chip-ff    strong{color:#34d399;}
+    .tech-est-chip-prior {border-color:#6b728060;color:#9ca3af;}
+    .tech-est-chip-prior strong{color:#9ca3af;}
+    .tech-est-chip-weight{color:#6b7280;}
+    .tech-est-caveat{font-size:11px;color:#fbbf24;line-height:1.4;
       margin-top:4px;padding:5px 8px;background:#1f1a0a;
       border-left:2px solid #d97706;border-radius:2px;}
-    .tech-empirical-foot{font-size:10px;color:#6b7280;font-style:italic;
+    .tech-est-caveat-info{color:#9ca3af;background:#0f1419;
+      border-left-color:#475569;}
+    .tech-est-foot{font-size:10px;color:#6b7280;font-style:italic;
       margin-top:6px;line-height:1.4;}
 
     /* Leveling Trap Detector card. Severity tints the verdict + left edge. */
@@ -8580,87 +8893,137 @@
   // Honest design: the consensus is the median across available sources,
   // and the agreement chip explicitly says how much the sources agree.
   // We never invent a prediction TECH didn't read from a real service.
-  function renderConsensusCard(host, opponentId) {
+  // v1.5.0 — TECH Estimate card. Replaces the v1.2.0 consensus card AND
+  // the v1.4.0 standalone empirical card. Headline is the Bayesian posterior
+  // median; sub-line is the 80% credible range; per-source breakdown shows
+  // each contributor's value + weight share (including the empirical prior,
+  // which contributes more when real sources are scarce and recedes when
+  // they're not). Confidence pill is a UX summary of the posterior width.
+  const TECH_EST_CONF_COLORS = {
+    'high':   '#34d399',
+    'medium': '#fbbf24',
+    'low':    '#f87171',
+  };
+  const TECH_EST_CONF_LABELS = {
+    'high':   'High confidence',
+    'medium': 'Medium confidence',
+    'low':    'Low confidence',
+  };
+  const TECH_EST_SOURCE_LABELS = { spy: 'Spy', bsp: 'BSP', ff: 'FF' };
+  const TECH_EST_FRESHNESS_LABELS = {
+    'fresh':  '<30d',
+    'recent': '<6mo',
+    'aging':  '<1yr',
+    'stale':  '>1yr',
+  };
+  function renderTechEstimateCard(host, opponentId, opponentLevel) {
     if (!settings.consensusEnabled) return;
     const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
       ? meta.battleStats.total : 0;
-    if (myTotal <= 0) return; // no own-stat anchor → no consensus possible
-    const consensus = computeOpponentConsensus(opponentId, myTotal);
-    if (!consensus) return; // nothing to synthesise
+    const est = computeTechEstimate(opponentId, myTotal, opponentLevel);
+    if (!est) return; // no level AND no real source → nothing to render
 
-    // Header row: title + agreement chip + (no refresh — derived view).
+    // Header row: title + source count chip + confidence pill on the right.
     const headerRow = el('div', {
       style: { display: 'flex', alignItems: 'center', gap: '8px',
                marginBottom: '6px', fontSize: '10px',
                textTransform: 'uppercase', letterSpacing: '1.2px',
                color: '#fde047', fontWeight: '700' },
     },
-      el('span', {}, 'Consensus'),
+      el('span', {}, 'TECH Estimate'),
       el('span', { style: { color: '#6b7280', fontWeight: '500',
                             textTransform: 'none', letterSpacing: '.5px' } },
-        '· ' + consensus.sources.length + ' source' + (consensus.sources.length === 1 ? '' : 's')),
+        est.hasEvidence
+          ? ('· ' + est.sources.length + ' source' + (est.sources.length === 1 ? '' : 's') + ' + baseline')
+          : '· baseline only'),
       el('span', { style: {
         marginLeft: 'auto',
-        color: CONSENSUS_AGREEMENT_COLORS[consensus.agreement] || '#9ca3af',
+        color: TECH_EST_CONF_COLORS[est.confidence] || '#9ca3af',
         fontWeight: '700', fontSize: '9px', letterSpacing: '.5px',
-      } }, CONSENSUS_AGREEMENT_LABELS[consensus.agreement] || ''),
+      } }, TECH_EST_CONF_LABELS[est.confidence] || ''),
     );
     host.appendChild(headerRow);
 
-    // Big verdict band — same visual treatment as the BSP / FF cards.
-    const bandColor = BSP_BAND_COLORS[consensus.consensusBand] || '#9ca3af';
-    const bandLabel = BSP_BAND_LABELS[consensus.consensusBand] || 'Unknown';
-    host.appendChild(el('div', {
-      style: { display: 'flex', alignItems: 'baseline', gap: '10px',
-               marginBottom: '8px' },
-    },
-      el('span', { style: { fontSize: '10px', textTransform: 'uppercase',
-                            letterSpacing: '1px', color: '#6b7280',
-                            fontWeight: '700' } }, 'Verdict'),
-      el('span', { style: { fontFamily: "Impact, 'Oswald', 'Arial Narrow', sans-serif",
-                            fontSize: '20px', color: bandColor,
-                            textShadow: '0 0 8px ' + bandColor + '40',
-                            letterSpacing: '.5px' } },
-        bandLabel),
+    // Headline number — the point estimate, big.
+    host.appendChild(el('div', { class: 'tech-est-headline' },
+      el('span', { class: 'tech-est-label' }, 'Stats'),
+      el('span', { class: 'tech-est-point' }, '~' + fmtNum(est.point, 1)),
     ));
 
-    // Per-source breakdown — small chips so the user can see WHY the
-    // consensus landed where it did. Each chip shows source name + its
-    // own band in its own band color.
-    const breakdown = el('div', {
-      style: { display: 'flex', flexWrap: 'wrap', gap: '6px',
-               marginBottom: '8px', fontSize: '10px' },
-    });
-    const SOURCE_LABELS = { spy: 'Spy', bsp: 'BSP', ff: 'FF' };
-    for (const src of consensus.sources) {
-      const sColor = BSP_BAND_COLORS[src.band] || '#9ca3af';
-      breakdown.appendChild(el('span', {
-        style: { background: '#0f0a12', border: '1px solid ' + sColor + '60',
-                 borderRadius: '3px', padding: '3px 6px',
-                 color: sColor, fontWeight: '600' },
+    // 80% credible range sub-line.
+    host.appendChild(el('div', { class: 'tech-est-range' },
+      '80% likely between ',
+      el('strong', {}, fmtNum(est.lo80, 1)),
+      ' – ',
+      el('strong', {}, fmtNum(est.hi80, 1)),
+    ));
+
+    // Verdict band — keeps visual parity with BSP / FF cards.
+    if (est.band) {
+      const bandColor = BSP_BAND_COLORS[est.band] || '#9ca3af';
+      const bandLabel = BSP_BAND_LABELS[est.band] || 'Unknown';
+      host.appendChild(el('div', {
+        style: { display: 'flex', alignItems: 'baseline', gap: '10px',
+                 marginBottom: '8px', marginTop: '4px' },
       },
-        (SOURCE_LABELS[src.name] || src.name) + ': ' + (BSP_BAND_LABELS[src.band] || '—'),
+        el('span', { style: { fontSize: '10px', textTransform: 'uppercase',
+                              letterSpacing: '1px', color: '#6b7280',
+                              fontWeight: '700' } }, 'Verdict'),
+        el('span', { style: { fontFamily: "Impact, 'Oswald', 'Arial Narrow', sans-serif",
+                              fontSize: '20px', color: bandColor,
+                              textShadow: '0 0 8px ' + bandColor + '40',
+                              letterSpacing: '.5px' } },
+          bandLabel),
       ));
     }
+
+    // Per-contributor breakdown — each source as a chip, plus the
+    // empirical prior. Each chip carries the value and the weight share.
+    const breakdown = el('div', { class: 'tech-est-breakdown' });
+    for (let i = 0; i < est.sources.length; i++) {
+      const s = est.sources[i];
+      const wPct = Math.round(s.weight * 100);
+      const meta1 = (s.name === 'spy' && s.freshness)
+        ? ' · ' + (TECH_EST_FRESHNESS_LABELS[s.freshness] || s.freshness)
+        : '';
+      breakdown.appendChild(el('span', { class: 'tech-est-chip tech-est-chip-' + s.name },
+        el('strong', {}, TECH_EST_SOURCE_LABELS[s.name] || s.name),
+        ': ',
+        fmtNum(s.value, 1),
+        el('span', { class: 'tech-est-chip-weight' }, ' · ' + wPct + '%' + meta1),
+      ));
+    }
+    // Prior chip — always shown; recedes visually when its weight is small.
+    const priorPct = Math.round(est.prior.weight * 100);
+    const priorLabel = est.prior.noLevel
+      ? 'Baseline (no level)'
+      : 'Baseline (L' + est.prior.level + ')';
+    breakdown.appendChild(el('span', { class: 'tech-est-chip tech-est-chip-prior' },
+      el('strong', {}, priorLabel),
+      el('span', { class: 'tech-est-chip-weight' }, ' · ' + priorPct + '%'),
+    ));
     host.appendChild(breakdown);
 
-    // Disagreement explainer — only when sources actually disagree, so it
-    // doesn't waste vertical space on the typical aligned case.
-    if (consensus.agreement === 'major') {
-      host.appendChild(el('div', {
-        style: { fontSize: '10px', color: '#fca5a5', marginBottom: '11px',
-                 lineHeight: '1.4', fontStyle: 'italic' },
-      }, 'Sources span multiple bands — the consensus is the median, but ' +
-         'consider checking the per-source cards below before committing.'));
-    } else if (consensus.agreement === 'minor') {
-      host.appendChild(el('div', {
-        style: { fontSize: '10px', color: '#fbbf24', marginBottom: '11px',
-                 lineHeight: '1.4', fontStyle: 'italic' },
-      }, 'Sources land on adjacent bands — directional agreement, modest uncertainty.'));
-    } else {
-      // 'unanimous' or 'single' — no caveat needed; reserve space-economy.
-      host.appendChild(el('div', { style: { marginBottom: '8px' } }));
+    // Caveats — only when honest to surface.
+    if (!est.hasEvidence) {
+      host.appendChild(el('div', { class: 'tech-est-caveat tech-est-caveat-info' },
+        'No spy, BSP, or FF Scouter data on this player. The estimate is the population baseline for their level — treat it as a wide range, not a point prediction.',
+      ));
     }
+    if (est.prior.bimodal && est.prior.weight > 0.30) {
+      host.appendChild(el('div', { class: 'tech-est-caveat' },
+        '⚠ L1 cohort splits between dedicated stat-builders and fresh accounts. The baseline pulls toward two modes; the range above reflects that.',
+      ));
+    }
+    if (est.prior.thin && est.prior.weight > 0.30) {
+      host.appendChild(el('div', { class: 'tech-est-caveat' },
+        '⚠ Thin sample in this level bucket — baseline is widened to reflect uncertainty in the percentiles.',
+      ));
+    }
+
+    host.appendChild(el('div', { class: 'tech-est-foot' },
+      'Bayesian synthesis · prior weight ' + priorPct + '% · σ defaults v1 (calibration ongoing).',
+    ));
   }
 
   // v1.1.0-dev — FF Scouter intel card. Renders only when the user has
@@ -8805,61 +9168,6 @@
     ));
   }
 
-  // v1.4.0 — "Does any external source have usable data on this player?"
-  // Used by the empirical estimate fallback below to decide whether to
-  // render. We check cache state only (no fetches); the drill's own fetch
-  // kicks happen elsewhere on open. Returns true if ANY of spy / BSP /
-  // FF Scouter has produced a non-error, non-noData entry.
-  function hasAnyExternalData(opponentId) {
-    const spy = spyCache[opponentId];
-    if (spy && !spy.error && !spy.noData) return true;
-    if (settings.bspEnabled) {
-      const bsp = bspCache[opponentId];
-      if (bsp && !bsp.error && !bsp.noData) return true;
-    }
-    if (settings.ffEnabled) {
-      const ff = ffCache[opponentId];
-      if (ff && !ff.error && !ff.noData) return true;
-    }
-    return false;
-  }
-
-  // v1.4.0 — Empirical estimate card. Renders only when no external
-  // source has data on this opponent AND we know their level. Surfaces
-  // typical-stats percentiles for the level bucket as a baseline so the
-  // drill never reads as "blank, sorry". Numbers come from a 1518-row
-  // TornStats spy aggregate; methodology in the project_tech_spy_calibration
-  // memory file. Aggregate-only — no individual spy data ships.
-  function renderEmpiricalEstimateCard(host, opponentLevel) {
-    const typ = typicalStatsForLevel(opponentLevel);
-    if (!typ) return;
-    host.appendChild(el('div', { class: 'tech-section' },
-      el('div', { class: 'tech-section-title' },
-        el('span', {}, 'Empirical estimate'),
-        el('span', { class: 'tech-empirical-meta' },
-          '· based on ' + typ.n + ' spies'),
-      ),
-      el('div', { class: 'tech-empirical-line' },
-        'Typical L' + opponentLevel + ' player total: ',
-        el('strong', {}, fmtNum(typ.p50, 1)),
-      ),
-      el('div', { class: 'tech-empirical-range' },
-        'Range: p25 ' + fmtNum(typ.p25, 1)
-        + ' · p75 ' + fmtNum(typ.p75, 1)
-        + ' · p95 ' + fmtNum(typ.p95, 1),
-      ),
-      typ.bimodal ? el('div', { class: 'tech-empirical-caveat' },
-        '⚠ L1 cohort splits between stat-builders (heavy) and fresh accounts (light). Treat as a wide range, not a point estimate.',
-      ) : null,
-      typ.thin ? el('div', { class: 'tech-empirical-caveat' },
-        '⚠ Thin sample (n=' + typ.n + ') — wide confidence interval.',
-      ) : null,
-      el('div', { class: 'tech-empirical-foot' },
-        'No spy, BSP, or FF Scouter data on this player. This is a population baseline, not a prediction for this individual.',
-      ),
-    ));
-  }
-
   // ─── DRILL: OPPONENT INTEL ──────────────────────────────────────────────
   // Rendered in place of the active tab when currentDrill is set.
   function renderOpponentDrill(host, opponentId) {
@@ -8903,13 +9211,15 @@
       nameLine.appendChild(starBtnEmpty);
       host.appendChild(nameLine);
 
-      // v1.2.0-dev — Consensus card sits at the very top of the intel
-      // stack as the headline read. Renders nothing when no data exists,
-      // so first-encounter zero-history opponents won't get an empty card.
+      // v1.5.0 — TECH Estimate sits at the very top of the intel stack
+      // as the headline read. Subsumes both the v1.2.0 consensus card and
+      // the v1.4.0 empirical fallback — the empirical baseline is now the
+      // Bayesian prior baked into the same posterior. Renders whenever we
+      // have either real source data OR a known opponent level.
       if (settings.consensusEnabled) {
-        const consensusSec = el('div', { class: 'tech-section' });
-        renderConsensusCard(consensusSec, opponentId);
-        if (consensusSec.childNodes.length > 0) host.appendChild(consensusSec);
+        const techEstSec = el('div', { class: 'tech-section' });
+        renderTechEstimateCard(techEstSec, opponentId, cachedTarget.level);
+        if (techEstSec.childNodes.length > 0) host.appendChild(techEstSec);
       }
 
       // v0.6.52 — spy section works even with zero fight history; this is
@@ -8932,15 +9242,6 @@
         const ffSec = el('div', { class: 'tech-section' });
         renderFFCard(ffSec, opponentId);
         host.appendChild(ffSec);
-      }
-
-      // v1.4.0 — Empirical estimate fallback. Renders when none of the
-      // external sources above produced usable data AND we know the
-      // opponent's level. cachedTarget.level comes from a prior pinned-
-      // target fetch; we don't fire one just for this. Aggregate-only
-      // baseline so the drill never reads as totally blank.
-      if (!hasAnyExternalData(opponentId) && cachedTarget.level != null) {
-        renderEmpiricalEstimateCard(host, cachedTarget.level);
       }
 
       host.appendChild(el('div', { class: 'tech-empty' },
@@ -9007,13 +9308,14 @@
       intel.verdict.label));
     host.appendChild(el('div', { class: 'tech-intel-blurb' }, intel.blurb));
 
-    // v1.2.0-dev — Consensus card sits at the top of the strategic stack
-    // for opponents with fight history too. Provides the headline "what's
-    // their strength" read; per-source cards below give the audit trail.
+    // v1.5.0 — TECH Estimate at the top of the strategic stack. Bayesian
+    // posterior across spy + BSP + FF Scouter + level-bucket prior. The
+    // per-source cards below remain as the audit trail showing what each
+    // contributor said before synthesis.
     if (settings.consensusEnabled) {
-      const consensusSec = el('div', { class: 'tech-section' });
-      renderConsensusCard(consensusSec, intel.id);
-      if (consensusSec.childNodes.length > 0) host.appendChild(consensusSec);
+      const techEstSec = el('div', { class: 'tech-section' });
+      renderTechEstimateCard(techEstSec, intel.id, intel.levelLast);
+      if (techEstSec.childNodes.length > 0) host.appendChild(techEstSec);
     }
 
     // v0.6.52 — TornStats spy section. Sits between the behavioural verdict
@@ -9039,15 +9341,6 @@
       const ffSec = el('div', { class: 'tech-section' });
       renderFFCard(ffSec, intel.id);
       host.appendChild(ffSec);
-    }
-
-    // v1.4.0 — Empirical estimate fallback. Even with fight history, if
-    // none of the external sources have stat data on this player, render
-    // the population baseline so the user has SOMETHING to ground their
-    // engagement decision on. Prefers intel.levelLast (most recent level
-    // seen in fight records).
-    if (!hasAnyExternalData(intel.id) && intel.levelLast != null) {
-      renderEmpiricalEstimateCard(host, intel.levelLast);
     }
 
     // Row 1: fights · win rate · respect net
@@ -9689,15 +9982,15 @@
       store('settings', settings);
     });
 
-    // v1.2.0-dev — Cross-source Consensus toggle.
-    // When on (default), TECH synthesises a "headline" consensus band from
-    // whichever of spy / BSP / FF Scouter have data on a target, and flags
-    // when those sources disagree. The Consensus card renders ABOVE the
-    // per-source cards in Opponent Intel; scout rows show a single
-    // consolidated consensus band instead of separate spy/bsp/ff bits.
-    // Turning this off restores the v1.1.0 behaviour (separate bits, no
-    // consolidated view). The per-source cards always still render.
-    form.appendChild(el('label', {}, 'Cross-source consensus'));
+    // v1.5.0 — TECH Estimate toggle (was v1.2.0 "Cross-source consensus").
+    // When on (default), TECH synthesises spy + BSP + FF Scouter + a level-
+    // bucketed population baseline via a Bayesian posterior and surfaces
+    // the headline median + 80% credible range above the per-source cards
+    // in Opponent Intel. The toggle key is preserved (settings.consensusEnabled)
+    // so the user's saved preference carries over. Off → scout rows show
+    // each source separately (v1.1.0 behaviour) and the Opponent Intel
+    // TECH Estimate card is hidden. Per-source cards always remain visible.
+    form.appendChild(el('label', {}, 'TECH Estimate'));
     const consensusCb = el('input', { type: 'checkbox' });
     consensusCb.checked = settings.consensusEnabled !== false;
     const consensusLabel = el('label', {
@@ -9706,13 +9999,12 @@
                fontWeight: '500', cursor: 'pointer', margin: '0' },
     },
       consensusCb,
-      el('span', {}, 'Show a synthesised consensus band + agreement chip across spy / BSP / FF Scouter'),
+      el('span', {}, 'Bayesian synthesis: spy + BSP + FF Scouter + level-bucket baseline → headline estimate with credible range'),
     );
     form.appendChild(consensusLabel);
     form.appendChild(el('div', { class: 'hint' },
-      'TECH picks the median across available sources and flags when they disagree. ' +
-      'Off → scout rows show each source separately (v1.1.0 behaviour) and the ' +
-      'Opponent Intel consensus card is hidden. Per-source cards always remain visible.',
+      'TECH weights each source by reliability (spy freshness, source defaults) and produces a single posterior estimate with an 80% range and confidence pill. ' +
+      'Off → scout rows show each source separately (v1.1.0 behaviour) and the Opponent Intel TECH Estimate card is hidden. Per-source cards always remain visible.',
     ));
     consensusCb.addEventListener('change', function () {
       settings.consensusEnabled = consensusCb.checked;
