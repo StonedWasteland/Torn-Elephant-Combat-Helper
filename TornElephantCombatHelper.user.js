@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.5.1
+// @version      1.5.11
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -228,7 +228,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.5.1';
+  const SCRIPT_VERSION    = '1.5.11';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -655,6 +655,47 @@
     return TYPICAL_STATS_BY_LEVEL[decade + '-' + (decade + 9)] || null;
   }
 
+  // v1.5.2 — L100 stat-shape distribution priors from the same 1518-row
+  // TornStats faction-spy calibration. Each value is the FRACTION of total
+  // stats that goes to that pillar at the named percentile of the L100
+  // population (n=142). p50 is the typical L100 shape (str 27% / def 25% /
+  // spd 25% / dex 22%, sums to 0.99 — rounding artifact in source data,
+  // normalised at split time).
+  //
+  // Defense has the widest spread (10% pure tanks → 43% glass cannons).
+  // Dexterity has the longest low tail (4% at p10 — many players dump dex).
+  // Speed and Strength are narrowest — most players train similar percentages.
+  //
+  // Used as a default split when we have a total stat estimate (typical
+  // bucket median, TECH Estimate posterior, etc.) but no per-pillar
+  // breakdown. NOT a substitute for spy data when a spy exists.
+  const L100_SHAPE_PRIORS = {
+    strength:  { p10: 0.21, p50: 0.27, p90: 0.36 },
+    defense:   { p10: 0.10, p50: 0.25, p90: 0.43 },
+    speed:     { p10: 0.19, p50: 0.25, p90: 0.31 },
+    dexterity: { p10: 0.04, p50: 0.22, p90: 0.36 },
+  };
+
+  // Split a total stat figure into four pillars using L100_SHAPE_PRIORS
+  // at the named percentile. Normalises so the four pillars actually sum
+  // to `total` (source percentages sum to 0.99 for p50, etc; without
+  // renormalising, the user's TEST sim would show a typed total slightly
+  // less than the bucket value and look like a bug).
+  function splitTotalByShape(total, shapePct) {
+    if (!(total > 0)) return null;
+    const pct = shapePct || 'p50';
+    const s = L100_SHAPE_PRIORS;
+    const sum = s.strength[pct] + s.defense[pct] + s.speed[pct] + s.dexterity[pct];
+    if (!(sum > 0)) return null;
+    const k = total / sum;
+    return {
+      strength:  Math.round(s.strength[pct]  * k),
+      defense:   Math.round(s.defense[pct]   * k),
+      speed:     Math.round(s.speed[pct]     * k),
+      dexterity: Math.round(s.dexterity[pct] * k),
+    };
+  }
+
   // ─── STORAGE ────────────────────────────────────────────────────────────
   // v0.6.59 — module-level error surface. `store()` and `load()` used to
   // swallow GM storage errors entirely; now both `console.warn` loudly and
@@ -745,6 +786,48 @@
     ffApiKey:        '',
     tornStatsApiKey: '',
   });
+
+  // v1.5.7 — One-shot reset of meta.basicRefreshedAt on upgrade. v1.5.6's
+  // identifySelf could land on a stale cross-tab cache hit, write the old
+  // level to meta.level, and stamp basicRefreshedAt = now — locking the
+  // stale value in for 24h. Clearing the stamp here forces the next poll
+  // to unconditionally re-fetch (and v1.5.7's cache bypass guarantees the
+  // refetch returns fresh data). Sentinel ensures this runs once per
+  // install — never again, even if a future v1.5.7+ reload happens.
+  (function forceIdentifyRefreshV157() {
+    const SENTINEL = SCRIPT_KEY + 'identify_refreshed_v157';
+    try {
+      if (GM_getValue(SENTINEL)) return;
+      if (meta.basicRefreshedAt) {
+        meta.basicRefreshedAt = 0;
+        store('meta', meta);
+      }
+      GM_setValue(SENTINEL, { ts: Date.now() });
+    } catch (e) {
+      // Sentinel write failed — re-run on next load is harmless.
+    }
+  })();
+
+  // v1.5.9 — One-shot reset of meta.selfStateLastFetch on upgrade. v1.5.8
+  // added /bars `life` capture so the TEST tab's YOU column could prefill
+  // the user's real max HP. But fetchSelfState is throttled to 5 min, so
+  // on upgrade the next poll skips the API call entirely — leaving
+  // meta.life undefined until the throttle elapses (and TEST keeps showing
+  // the wiki formula HP instead of 2027). Clearing the stamp here forces
+  // the next poll to unconditionally re-fetch.
+  (function forceSelfStateRefreshV159() {
+    const SENTINEL = SCRIPT_KEY + 'selfstate_refreshed_v159';
+    try {
+      if (GM_getValue(SENTINEL)) return;
+      if (meta.selfStateLastFetch) {
+        meta.selfStateLastFetch = 0;
+        store('meta', meta);
+      }
+      GM_setValue(SENTINEL, { ts: Date.now() });
+    } catch (e) {
+      // Sentinel write failed — re-run on next load is harmless.
+    }
+  })();
 
   // v1.5.1 — Backfill defaults for long-time installs. load() returns the
   // stored settings AS-IS when a saved value exists; new keys added in
@@ -1020,6 +1103,16 @@
   // When set, the panel content area renders an opponent intel drill instead
   // of the active tab. Cleared by the back button or any tab click.
   let currentDrill = null;  // null | { kind: 'opponent', id, name }
+
+  // v1.5.2 — One-shot TEST tab prefill set by the "Simulate vs this opponent"
+  // button on the Opponent Intel drill. renderTestTab() consumes it when
+  // building the opponent column's initial values, then clears it. Out-of-
+  // band from settings/storage on purpose: this is a UI handoff, not a
+  // persistent preference. Shape:
+  //   { stats: { strength, defense, speed, dexterity },
+  //     level: number, name: string,
+  //     source: 'spy' | 'tech_estimate' | ..., sourceLabel: string }
+  let _pendingTestPrefill = null;
 
   // ─── UTIL ───────────────────────────────────────────────────────────────
   const nowSec = () => Math.floor(Date.now() / 1000);
@@ -1780,18 +1873,61 @@
   }
 
   // ─── POLL CYCLE ─────────────────────────────────────────────────────────
+  // v1.5.6 — Periodic refresh so a user who leveled up doesn't sit on a
+  // stale meta.level for the rest of time. Pre-v1.5.6 only fetched once
+  // and cached forever — when a user crossed a level boundary, the YOU
+  // column in TEST (myLevel = meta.level || 29), Leveling Trap detector,
+  // and every other consumer of meta.level kept showing the OLD level.
+  // 24h cadence is plenty: levels happen on day-scale timescales.
+  //
+  // v1.5.7 — Bypass every cache layer for the identify call. v1.5.6 had a
+  // subtle failure mode: apiGet honours the cross-tab cache (45s TTL), so
+  // the very first v1.5.6 fetch could land on a stale cached response,
+  // write the old level to meta.level, AND stamp basicRefreshedAt = now —
+  // locking the stale value in for the full 24h window. Belt-and-braces
+  // fix: opt out of the cross-tab cache, add a cache-buster `_`, and send
+  // no-cache headers so no intermediate (browser, CDN) can serve old data.
+  const IDENTIFY_REFRESH_SEC = 86400;
+  const IDENTIFY_FETCH_OPTS = {
+    crossTabTtl: 0,    // skip the shared apiGet cache entirely
+  };
+  const IDENTIFY_HEADERS = {
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+  };
   async function identifySelf() {
-    // v0.6.80 — also require gender so v0.7 Phase 2 can pick the right
-    // flavor-name variant (Tricky Tony vs Tricky Tammy, etc). Existing
-    // installs without a cached gender will refetch on next poll.
-    if (meta.userId && meta.level && meta.gender) return;
-    const data = await apiGet(tornUrl('basic'));
-    meta.userId   = data.player_id;
-    meta.userName = data.name;
-    if (typeof data.level === 'number') meta.level = data.level;
-    if (typeof data.gender === 'string') meta.gender = data.gender;
-    if (!meta.firstPollTs) meta.firstPollTs = nowSec();
-    store('meta', meta);
+    // Bootstrap: never fetched before, do the full identify.
+    if (!meta.userId) {
+      const url = tornUrl('basic', { _: String(Date.now()) });
+      const data = await apiGet(url, IDENTIFY_HEADERS, IDENTIFY_FETCH_OPTS);
+      meta.userId   = data.player_id;
+      meta.userName = data.name;
+      if (typeof data.level === 'number') meta.level = data.level;
+      if (typeof data.gender === 'string') meta.gender = data.gender;
+      if (!meta.firstPollTs) meta.firstPollTs = nowSec();
+      meta.basicRefreshedAt = nowSec();
+      store('meta', meta);
+      return;
+    }
+    // v0.6.80 — gender required for v0.7 Phase 2 flavor-name variants
+    // (Tricky Tony vs Tricky Tammy). Pre-v0.6.80 installs lack it and
+    // need a refresh regardless of basicRefreshedAt.
+    const hasGender = !!meta.gender;
+    const freshEnough = meta.basicRefreshedAt
+      && (nowSec() - meta.basicRefreshedAt) < IDENTIFY_REFRESH_SEC;
+    if (freshEnough && hasGender) return;
+    try {
+      const url = tornUrl('basic', { _: String(Date.now()) });
+      const data = await apiGet(url, IDENTIFY_HEADERS, IDENTIFY_FETCH_OPTS);
+      if (typeof data.level === 'number')  meta.level    = data.level;
+      if (typeof data.gender === 'string') meta.gender   = data.gender;
+      if (typeof data.name === 'string')   meta.userName = data.name;
+      meta.basicRefreshedAt = nowSec();
+      store('meta', meta);
+    } catch (e) {
+      // Silent — stale cached values are better than crashing the poll.
+      // Next 24h tick will retry.
+    }
   }
 
   // v0.6.34 — Faction roster fetch for the Scout tab. Hits the v1
@@ -3352,6 +3488,14 @@
       statusUntil:       (typeof st.until === 'number') ? st.until : 0,
       lastActionStatus:  la.status || null,
       lastActionTs:      (typeof la.timestamp === 'number') ? la.timestamp : 0,
+      // v1.5.9 — capture opp's real max HP (merits / education / faction
+      // perks) from the profile endpoint so the TEST tab's Simulate
+      // button can prefill it instead of the wiki formula. A typical L40
+      // is ~500 HP above the formula. Profile selection returns life as
+      // { current, maximum, increment, interval, ticktime, fulltime }.
+      life:              (data.life && typeof data.life.maximum === 'number')
+                         ? { current: data.life.current, maximum: data.life.maximum }
+                         : null,
       fetchedAt:         nowSec(),
       error:             null,
     };
@@ -3820,6 +3964,19 @@
           modifier:   typeof chain.modifier === 'number' ? chain.modifier : 1.0,
           cooldownAt: cd > 0 ? nowSec() + cd : 0,
           fetchedAt:  nowSec(),
+        };
+      }
+      // v1.5.8 — capture max HP from /bars so the TEST tab's YOU column
+      // can prefill the user's real max HP (merits + education + faction
+      // perks) instead of the wiki piecewise formula. The wiki formula
+      // gives 1475 at L32; a typical L32 with full kit lands closer to
+      // 2000+. Same field shape as energy/chain for consistency.
+      const life = data.life || {};
+      if (typeof life.maximum === 'number') {
+        meta.life = {
+          current: life.current,
+          maximum: life.maximum,
+          ts: nowSec(),
         };
       }
       const status = data.status || {};
@@ -5341,7 +5498,20 @@
     defaultLevel: 29,
     weaponDmg: 50,       // stat-only baseline (resolved when class='generic')
     maxTurns: 10,        // Torn caps an attack sequence at 10 turns
-    damageJitter: 0.20,  // +/-20% per-hit variance
+    // Per-shot damage variance. Two regimes:
+    //   damageJitter (0.20) — applied to a class midpoint or scalar fallback.
+    //     Wide because it stands in for BOTH weapon spread AND engine noise
+    //     (no per-weapon wiki range to lean on).
+    //   engineNoise  (0.10) — applied AFTER per-shot wiki sampling
+    //     (_sampleWeaponDmg). The wiki low/high already models weapon
+    //     spread; engineNoise represents non-weapon variance only
+    //     (stat-roll micro-variance, crit-near-miss, etc).
+    // v1.5.2 split this from a single ±20% applied everywhere — that
+    // overstated variance for tight-range weapons (Desert Eagle 59-64
+    // simmed as 49-74) and understated it for wide-range ones (Bug
+    // Swatter 5-10 simmed as 6-9).
+    damageJitter: 0.20,
+    engineNoise:  0.10,
   };
 
   // TEST v0.4 — per-class damage + accuracy, both derived from per-weapon
@@ -5617,6 +5787,24 @@
     return 50;
   }
 
+  // v1.5.2 — Per-shot weapon damage roll from the wiki low/high range.
+  // Returns null when the caller's weapon has no usable range (class default,
+  // scalar fallback from the sanity harness, etc), in which case testRunMatch
+  // falls through to the pre-existing scalar midpoint path. When a real wiki
+  // range is present, samples uniformly so the per-shot spread matches what
+  // Torn publishes (Desert Eagle 59-64 actually rolls 59-64 instead of being
+  // smeared across ±20%).
+  //
+  // Uniform sampling chosen over normal/triangular because the wiki only
+  // publishes the bounds — there's no published mode/mean, and pretending we
+  // know the distribution shape would be overfitting.
+  function _sampleWeaponDmg(weapon, rng) {
+    if (!weapon) return null;
+    if (typeof weapon.dmgLow !== 'number' || typeof weapon.dmgHigh !== 'number') return null;
+    if (weapon.dmgHigh <= weapon.dmgLow) return weapon.dmgLow;
+    return weapon.dmgLow + (weapon.dmgHigh - weapon.dmgLow) * rng();
+  }
+
   // TEST v0.3 — full armor suite. Each swing now rolls a body region using
   // BODY_REGIONS as a weighted distribution; if the defender's armor preset
   // covers that region, damage is reduced by `reduction * coverage[region]`.
@@ -5821,13 +6009,22 @@
   // Calibrated so a typical L29 mirror at 800k total resolves in 4-6 turns
   // (HP ≈ 1700), and a L29 brawler vs L29 defender wins ~70% in ~6 turns.
   // v0.4+ recalibration can refit absScale exponent against captured fights.
-  function testDamage(atkStr, defDef, weaponDmg, rng) {
+  //
+  // v1.5.2 — `wikiSampled` flag picks the right jitter band:
+  //   - true  : weaponDmg was already sampled per-shot from the wiki range
+  //             (_sampleWeaponDmg). Apply only engineNoise on top, since
+  //             weapon spread is already modeled.
+  //   - false : weaponDmg is a class midpoint or scalar fallback. Use the
+  //             wider damageJitter to stand in for both weapon + engine
+  //             variance.
+  function testDamage(atkStr, defDef, weaponDmg, rng, wikiSampled) {
     const s = Math.max(1, atkStr);
     const d = Math.max(1, defDef);
     const absScale = Math.pow(s, 0.45);
     const ratio    = Math.sqrt(s / d);
     const base     = absScale * ratio * (weaponDmg / 50);
-    const jitter   = 1 + (rng() * 2 - 1) * TEST_DEFAULTS.damageJitter;
+    const noisePct = wikiSampled ? TEST_DEFAULTS.engineNoise : TEST_DEFAULTS.damageJitter;
+    const jitter   = 1 + (rng() * 2 - 1) * noisePct;
     return Math.max(1, Math.round(base * jitter));
   }
 
@@ -5870,17 +6067,23 @@
     while (turn < maxT && hpA > 0 && hpB > 0) {
       turn++;
       if (rng() < hitA) {
-        const raw = testDamage(a.strength, b.defense, wpnA, rng);
-        const region = _rollBodyRegion(rng);
-        const dmg = _applyArmor(raw, armB, region);
+        // v1.5.2 — try a per-shot wiki sample first. Null = no usable range,
+        // fall through to the scalar midpoint + wider damageJitter path.
+        const wikiA   = _sampleWeaponDmg(wpnObjA, rng);
+        const dmgIn   = wikiA != null ? wikiA : wpnA;
+        const raw     = testDamage(a.strength, b.defense, dmgIn, rng, wikiA != null);
+        const region  = _rollBodyRegion(rng);
+        const dmg     = _applyArmor(raw, armB, region);
         hpB -= dmg;
         hitsOnB[region.key]++;
         dmgOnB[region.key] += dmg;
       }
       if (rng() < hitB) {
-        const raw = testDamage(b.strength, a.defense, wpnB, rng);
-        const region = _rollBodyRegion(rng);
-        const dmg = _applyArmor(raw, armA, region);
+        const wikiB   = _sampleWeaponDmg(wpnObjB, rng);
+        const dmgIn   = wikiB != null ? wikiB : wpnB;
+        const raw     = testDamage(b.strength, a.defense, dmgIn, rng, wikiB != null);
+        const region  = _rollBodyRegion(rng);
+        const dmg     = _applyArmor(raw, armA, region);
         hpA -= dmg;
         hitsOnA[region.key]++;
         dmgOnA[region.key] += dmg;
@@ -6025,6 +6228,16 @@
     const L29a = function (aA, aB) {
       return { trials: TRIALS, rngSeed: SEED, level: 29, armorA: aA, armorB: aB };
     };
+    // v1.5.2 per-weapon picker harness. Sets both weaponClassA/B AND
+    // weaponA/B so the strike block hits _sampleWeaponDmg's wiki-range path.
+    const L29wpn = function (idA, idB) {
+      const a = getWeaponById(idA), b = getWeaponById(idB);
+      return {
+        trials: TRIALS, rngSeed: SEED, level: 29,
+        weaponClassA: a ? a.class : null, weaponClassB: b ? b.class : null,
+        weaponA: a, weaponB: b,
+      };
+    };
     const cases = [
       ['symmetric (expect ~50% / KOs land)',     testSimulate(sym,   sym,   L29)],
       ['heavy favorite (expect A > 85%)',        testSimulate(fav,   unfav, L29)],
@@ -6046,6 +6259,14 @@
       // because uncovered regions (head/limbs/groin = 45% of rolls) still
       // take full damage.
       ['v0.3 sym stats, naked vs Body only (B > 50%, < Riot)', testSimulate(sym, sym, L29a('naked', 'body'))],
+      // v1.5.2 per-weapon picker — exercises _sampleWeaponDmg's wiki-range
+      // path (separate from L29w which is class-only). Desert Eagle (wiki
+      // 59-64, midpoint 61.5) vs Lorcin 380 (wiki 27-32, midpoint 29.5) —
+      // both pistols, so hit-chance is symmetric and the only differentiator
+      // is per-shot damage. A ~2x damage gap with the same acc should land
+      // DE well above 75% across 1000 trials.
+      ['v1.5.2 sym stats: Desert Eagle vs Lorcin 380 (DE > 75%)',
+        testSimulate(sym, sym, L29wpn('desert_eagle', 'lorcin_380'))],
     ];
     console.group('[TECH][TEST] v0.1 engine sanity check');
     cases.forEach(function (row) {
@@ -6573,6 +6794,29 @@
       letter-spacing:1px;padding:3px 6px;background:#1f1326;color:#f3f4f6;
       border:1px solid #3a2740;border-radius:3px;cursor:pointer;}
     .tech-test-mirror:hover{background:#2a1a33;border-color:#5a3960;}
+
+    /* v1.5.2 — "Simulate vs this opponent" button on the Opponent Intel
+       drill. Sits below the verdict pill; only renders when spy data is
+       complete. Hover lifts the violet edge — same visual language as the
+       panel header gradient. */
+    .tech-test-send-btn{display:inline-flex;align-items:center;gap:6px;
+      font:700 11px/1 system-ui,sans-serif;text-transform:uppercase;
+      letter-spacing:1px;padding:7px 12px;margin:6px 0 10px;
+      background:linear-gradient(180deg,#1f1326 0%,#15101a 100%);
+      color:#fde047;border:1px solid #3a2740;border-radius:4px;cursor:pointer;
+      transition:border-color .15s,box-shadow .15s,color .15s;}
+    .tech-test-send-btn:hover{border-color:#a855f7;color:#f3f4f6;
+      box-shadow:0 0 10px rgba(168,85,247,.35);}
+    .tech-test-send-sub{font-weight:500;color:#9ca3af;text-transform:none;
+      letter-spacing:.4px;font-size:10px;}
+
+    /* v1.5.2 — One-shot prefill banner in the TEST tab. Subtle violet
+       background so the user clocks "this came from somewhere external"
+       without it competing with the actual sim controls below. */
+    .tech-test-prefill-banner{padding:6px 10px;
+      background:rgba(168,85,247,.10);
+      border:1px solid rgba(168,85,247,.30);border-radius:4px;
+      color:#cbd5e1;font:500 11px/1.45 system-ui,sans-serif;}
     .tech-test-lvlrow{display:flex;align-items:center;gap:8px;margin-bottom:8px;
       padding-bottom:8px;border-bottom:1px dashed #2a1f2e;}
     .tech-test-lvlrow label{font:600 10px/1 system-ui,sans-serif;text-transform:uppercase;
@@ -6609,6 +6853,21 @@
       font-size:12px;font-family:inherit;text-overflow:ellipsis;overflow:hidden;
       white-space:nowrap;}
     .tech-test-wpnrow .wpn-select:focus{outline:none;border-color:#a855f7;
+      box-shadow:0 0 0 1px #a855f7;}
+
+    /* v1.5.2 — Opponent "Preset" row. Sits between the level row and the
+       stat grid (above the equipment rows below). Same widget layout as
+       .tech-test-wpnrow but with a violet edge on the select so the user
+       reads this as a stat GENERATOR, not another equipment slot. */
+    .tech-test-presetrow{display:flex;align-items:center;gap:8px;margin-top:8px;
+      margin-bottom:8px;padding-top:8px;border-top:1px dashed #2a1f2e;}
+    .tech-test-presetrow label{font:600 10px/1 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:1px;color:#9ca3af;margin:0;}
+    .tech-test-presetrow .wpn-select{flex:1;min-width:0;padding:4px 6px;
+      background:#08070b;color:#f3f4f6;border:1px solid rgba(168,85,247,.35);
+      border-radius:3px;font-size:12px;font-family:inherit;
+      text-overflow:ellipsis;overflow:hidden;white-space:nowrap;}
+    .tech-test-presetrow .wpn-select:focus{outline:none;border-color:#a855f7;
       box-shadow:0 0 0 1px #a855f7;}
     .tech-test-runbar{display:flex;align-items:center;gap:10px;margin-top:12px;
       padding:10px;background:#0f0a12;border:1px solid #2a1f2e;border-radius:5px;}
@@ -9169,6 +9428,227 @@
   }
 
   // ─── DRILL: OPPONENT INTEL ──────────────────────────────────────────────
+
+  // v1.5.5 — Fetch the opponent's profile (name + level + status) when the
+  // drill opens. Without this, an opponent with no fight history AND no
+  // spy / pinned-target entry would have unknown level, causing both the
+  // TECH Estimate baseline prior to fall back to a wide non-informative
+  // distribution AND the Simulate button to prefill level = 29 (the TEST
+  // tab's defaultLevel) instead of the opponent's real level.
+  //
+  // 1-hour cache so re-opening the drill within an hour doesn't burn the
+  // API budget. Result persists to targetStatus[id] so spy + BSP + FF
+  // + dashboard targets queue all benefit from the same fetch.
+  function maybeFetchOpponentProfile(id) {
+    const playerId = parseInt(id, 10);
+    if (!Number.isFinite(playerId) || playerId <= 0) return;
+    if (!settings.apiKey) return;
+    if (isRateLimited()) return;
+    const cached = targetStatus[playerId];
+    // v1.5.10 — also require the `life` field to be present. v1.5.9 added
+    // life capture but the existing 1-hour cache gate would skip the
+    // re-fetch on any opponent the user had drilled into within the past
+    // hour on an older version — leaving targetStatus[id].life undefined
+    // forever and the Simulate button stuck on the wiki-formula HP. The
+    // `'life' in cached` check distinguishes "API returned null" (we
+    // explicitly store null) from "this entry predates v1.5.9" (field
+    // missing entirely) so it self-heals without an explicit migration.
+    if (cached && cached.fetchedAt && cached.level != null
+        && 'life' in cached
+        && (nowSec() - cached.fetchedAt) < 3600) return;
+    fetchTargetProfile(playerId).then(function (profile) {
+      targetStatus[playerId] = Object.assign({}, targetStatus[playerId] || {}, profile);
+      store('targetStatus', targetStatus);
+      if (currentDrill && currentDrill.kind === 'opponent' && currentDrill.id === playerId
+          && panelEl && contentEl) {
+        renderActive();
+      }
+    }).catch(function () { /* silent — drill still renders, user can correct level in TEST */ });
+  }
+
+  // v1.5.5 — Best-effort opponent level resolution. Walks every known
+  // source and returns the first usable number. Used by both the TECH
+  // Estimate card (level → baseline prior) and the Simulate button
+  // (level → TEST tab default), so they always see the same value.
+  // Falls through to null when no source has level info, in which case
+  // downstream code uses TEST_DEFAULTS.defaultLevel (29) as a last resort
+  // — and the user can correct it in the TEST tab's level input.
+  function resolveOpponentLevel(opponentId, intel) {
+    if (intel && typeof intel.levelLast === 'number' && intel.levelLast > 0) return intel.levelLast;
+    const target = targetStatus[opponentId];
+    if (target && typeof target.level === 'number' && target.level > 0) return target.level;
+    const spy = spyCache[opponentId];
+    if (spy && typeof spy.level === 'number' && spy.level > 0) return spy.level;
+    return null;
+  }
+
+  // v1.5.2 — Spy-completeness gate for the "Simulate vs this opponent"
+  // button. Returns the spy entry only when all four battle stats are
+  // present and positive. Anything less (partial spy, noData, error) and
+  // the button is hidden — we won't feed half-baked numbers into the sim
+  // and surface them as a precise read.
+  function _spyForSimulate(opponentId) {
+    const spy = spyCache[opponentId];
+    if (!spy || spy.noData || spy.error) return null;
+    if (!(spy.strength  > 0)) return null;
+    if (!(spy.defense   > 0)) return null;
+    if (!(spy.speed     > 0)) return null;
+    if (!(spy.dexterity > 0)) return null;
+    return spy;
+  }
+
+  // v1.5.2 — Map a spy's age in days to the same freshness buckets the
+  // TECH Estimate uses for spy weighting (techEstSpySource). Keeps the
+  // user-facing language consistent between the two surfaces.
+  function _spyFreshnessLabel(ageDays) {
+    if (ageDays < 30)  return 'fresh';
+    if (ageDays < 180) return 'recent';
+    if (ageDays < 365) return 'aging';
+    return 'stale';
+  }
+
+  // v1.5.3 — Render the Simulate button. Two-tier source resolution:
+  //   1. Spy with all four stats → exact per-stat prefill. Best path.
+  //   2. TECH Estimate posterior point × L100 shape split. Falls back to
+  //      this when spy is missing OR partial — the user gets a sim seeded
+  //      from BSP + FF Scouter + level-bucket baseline via computeTechEstimate,
+  //      with stats distributed using L100_SHAPE_PRIORS p50 (str 27% /
+  //      def 25% / spd 25% / dex 22%). Banner explicitly labels this as
+  //      an estimate so the user reads the sim's input quality directly.
+  //
+  // Renders nothing only when BOTH paths fail — i.e. no spy AND no level
+  // AND no real sources. In that case the user has no information to feed
+  // the sim anyway.
+  //
+  // Internal helper builds the button element + click handler from a
+  // prefill payload so the two paths share rendering code.
+  function _renderSimulateBtn(host, subLabel, titleText, prefill, opponentId) {
+    const btn = el('button', {
+      class: 'tech-test-send-btn',
+      type: 'button',
+      title: titleText,
+    },
+      '⚔ Simulate vs this opponent ',
+      el('span', { class: 'tech-test-send-sub' }, '(' + subLabel + ')'),
+    );
+    btn.addEventListener('click', function () {
+      // v1.5.11 — Re-read opp HP from targetStatus at click time. The
+      // drill kicks maybeFetchOpponentProfile() async on open; if the
+      // user clicks Simulate before that fetch lands, the prefill that
+      // got captured at render time has oppHp = 0 and the OPP HP input
+      // falls back to the wiki placeholder. Re-reading here lets a
+      // late-arriving profile fetch fill in the real max HP without
+      // forcing the user to re-open the drill or wait for a re-render.
+      // Same closure also picks up a late name capture.
+      if (opponentId) {
+        const target = targetStatus[opponentId] || {};
+        const patch = {};
+        if (target.life && typeof target.life.maximum === 'number' && target.life.maximum > 0) {
+          patch.hp = target.life.maximum;
+        }
+        if (target.name && !prefill.name) {
+          patch.name = target.name;
+        }
+        if (Object.keys(patch).length > 0) {
+          prefill = Object.assign({}, prefill, patch);
+        }
+      }
+      _pendingTestPrefill = prefill;
+      currentDrill = null;
+      settings.activeTab = 'test';
+      store('settings', settings);
+      renderActive();
+    });
+    host.appendChild(btn);
+  }
+
+  function appendSimulateBtn(host, opponentId, opponentName, opponentLevel) {
+    // v1.5.9 — read opp's real max HP from the profile cache populated by
+    // maybeFetchOpponentProfile. When present, it propagates through the
+    // prefill payload so OPP's HP input fills with their real value (e.g.
+    // 2343 for a typical L40) instead of the wiki formula (1875).
+    const target = targetStatus[opponentId] || {};
+    const oppHp = (target.life && typeof target.life.maximum === 'number' && target.life.maximum > 0)
+      ? target.life.maximum
+      : 0;
+
+    // Tier 1 — exact spy.
+    const spy = _spyForSimulate(opponentId);
+    if (spy) {
+      const stamps = [spy.totalTs, spy.strengthTs, spy.defenseTs, spy.speedTs, spy.dexterityTs]
+        .filter(function (t) { return typeof t === 'number' && t > 0; });
+      const newestTs = stamps.length ? Math.max.apply(null, stamps) : (spy.fetchedAt || nowSec());
+      const ageDays = Math.max(0, (nowSec() - newestTs) / 86400);
+      const freshness = _spyFreshnessLabel(ageDays);
+      const ageRounded = Math.round(ageDays);
+      const ageHint = freshness + (ageRounded > 0 ? ', ~' + ageRounded + 'd old' : ', today');
+      _renderSimulateBtn(host,
+        'spy · ' + ageHint,
+        'Open the TEST simulator with this opponent\'s spy stats + level pre-filled in the Opponent column.',
+        {
+          stats: {
+            strength:  spy.strength,
+            defense:   spy.defense,
+            speed:     spy.speed,
+            dexterity: spy.dexterity,
+          },
+          level: (typeof opponentLevel === 'number' && opponentLevel > 0) ? opponentLevel : null,
+          hp: oppHp,
+          name: opponentName || '',
+          source: 'spy',
+          sourceLabel: 'TornStats spy',
+          sourceFreshness: freshness,
+          ageDays: ageDays,
+        },
+        opponentId);
+      return;
+    }
+
+    // Tier 2 — TECH Estimate, split evenly across the four pillars.
+    // computeTechEstimate returns null only when there's nothing to anchor
+    // on (no real source AND no level), in which case the button stays
+    // hidden.
+    //
+    // v1.5.4 — DROPPED the L100 shape weighting (27/25/25/22). Reason: when
+    // we're already in "no measured per-stat data" territory, weighting
+    // pillars by typical-population shape claims precision we don't have.
+    // Even-split (25 each) is the honest representation of "1M total stats
+    // somewhere across the four pillars; don't pretend we know which."
+    // The Preset dropdown in TEST still exposes splitTotalByShape for users
+    // who want the shaped distribution explicitly — it's a one-click opt-in
+    // rather than a silent assumption baked into the prefill.
+    const myTotal = (meta.battleStats && typeof meta.battleStats.total === 'number')
+      ? meta.battleStats.total : 0;
+    const est = computeTechEstimate(opponentId, myTotal, opponentLevel);
+    if (!est || !(est.point > 0)) return;
+    const per = Math.round(est.point / 4);
+    const split = { strength: per, defense: per, speed: per, dexterity: per };
+
+    const confLabel = est.confidence || 'low';
+    const sourceNames = { spy: 'TornStats spy', bsp: 'BSP', ff: 'FF Scouter' };
+    const sourcesText = est.hasEvidence
+      ? est.sources.map(function (s) { return sourceNames[s.name] || s.name; }).join(' + ')
+      : 'population baseline';
+    const shapeNote = 'Pillars split evenly (~' + fmtNum(per, 1) + ' each) — we don\'t know their actual shape without a spy. Pick a Preset in the TEST tab for a stat-shape distribution.';
+    _renderSimulateBtn(host,
+      'TECH Estimate · ' + confLabel + ' confidence',
+      'Open the TEST simulator with this opponent\'s estimated stats + level pre-filled.\n'
+        + 'Total from TECH Estimate (' + sourcesText + '); pillars split evenly.\n'
+        + 'For exact stats, run a spy on them first.',
+      {
+        stats: split,
+        level: (typeof opponentLevel === 'number' && opponentLevel > 0) ? opponentLevel : null,
+        hp: oppHp,
+        name: opponentName || '',
+        source: 'tech_estimate',
+        sourceLabel: 'TECH Estimate (' + sourcesText + ')',
+        sourceFreshness: confLabel + ' confidence',
+        ageDays: null,
+        shapeNote: shapeNote,
+      },
+      opponentId);
+  }
+
   // Rendered in place of the active tab when currentDrill is set.
   function renderOpponentDrill(host, opponentId) {
     const backBtn = el('button', { class: 'tech-intel-back', 'on:click': closeDrill },
@@ -9216,9 +9696,13 @@
       // the v1.4.0 empirical fallback — the empirical baseline is now the
       // Bayesian prior baked into the same posterior. Renders whenever we
       // have either real source data OR a known opponent level.
+      // v1.5.5 — resolveOpponentLevel walks targetStatus → spyCache to
+      // pick up any level info we already have; without this, baseline
+      // prior falls back to a wide non-informative distribution.
+      const drillLevel = resolveOpponentLevel(opponentId, null);
       if (settings.consensusEnabled) {
         const techEstSec = el('div', { class: 'tech-section' });
-        renderTechEstimateCard(techEstSec, opponentId, cachedTarget.level);
+        renderTechEstimateCard(techEstSec, opponentId, drillLevel);
         if (techEstSec.childNodes.length > 0) host.appendChild(techEstSec);
       }
 
@@ -9228,6 +9712,11 @@
       const spySec = el('div', { class: 'tech-section' });
       renderSpyCard(spySec, opponentId);
       host.appendChild(spySec);
+
+      // v1.5.2 — Same Simulate button as the post-history branch. Pre-war
+      // scouting is exactly when this is most useful: no fight log, but
+      // spy + level might be enough to model the matchup before engaging.
+      appendSimulateBtn(host, opponentId, fallbackName, drillLevel);
 
       // v1.0.1 — BSP card in the same pre-fight strategic slot. Renders
       // nothing if the user hasn't opted in, so existing UX is unchanged
@@ -9308,13 +9797,24 @@
       intel.verdict.label));
     host.appendChild(el('div', { class: 'tech-intel-blurb' }, intel.blurb));
 
+    // v1.5.3 — Simulate-vs-this-opponent button. Prefers exact spy stats
+    // when available; otherwise falls back to a TECH Estimate × L100 shape
+    // split (split percentile is editable in the TEST tab's Preset
+    // dropdown). Renders nothing only when there's no spy, no real source,
+    // AND no level — in that case there's nothing to feed the sim anyway.
+    // v1.5.5 — Use resolveOpponentLevel so an opponent whose fight records
+    // pre-date level capture (pre-v0.3.0) still get the right level from
+    // targetStatus or spyCache.
+    const drillLevel = resolveOpponentLevel(intel.id, intel);
+    appendSimulateBtn(host, intel.id, intel.name, drillLevel);
+
     // v1.5.0 — TECH Estimate at the top of the strategic stack. Bayesian
     // posterior across spy + BSP + FF Scouter + level-bucket prior. The
     // per-source cards below remain as the audit trail showing what each
     // contributor said before synthesis.
     if (settings.consensusEnabled) {
       const techEstSec = el('div', { class: 'tech-section' });
-      renderTechEstimateCard(techEstSec, intel.id, intel.levelLast);
+      renderTechEstimateCard(techEstSec, intel.id, drillLevel);
       if (techEstSec.childNodes.length > 0) host.appendChild(techEstSec);
     }
 
@@ -10130,7 +10630,24 @@
       speed:     stats.speed     || 100,
       dexterity: stats.dexterity || 100,
     };
-    const oppInit = { strength: 100, defense: 100, speed: 100, dexterity: 100 };
+    // v1.5.2 — Opponent column accepts a one-shot prefill from the "Simulate
+    // vs this opponent" button on Opponent Intel. Read and clear in one
+    // shot so a subsequent manual tab visit goes back to the 100-baseline.
+    const prefill = _pendingTestPrefill;
+    _pendingTestPrefill = null;
+    const oppInit = prefill && prefill.stats
+      ? {
+          strength:  prefill.stats.strength  || 100,
+          defense:   prefill.stats.defense   || 100,
+          speed:     prefill.stats.speed     || 100,
+          dexterity: prefill.stats.dexterity || 100,
+          // v1.5.9 — opp's real max HP from their profile (when known),
+          // threaded through the Simulate prefill so OPP fills with their
+          // actual buffed HP instead of the wiki formula. statCol below
+          // prefers this over the level-derived placeholder.
+          hp:        (prefill.hp && prefill.hp > 0) ? prefill.hp : 0,
+        }
+      : { strength: 100, defense: 100, speed: 100, dexterity: 100, hp: 0 };
 
     host.appendChild(el('div', { class: 'tech-section-title' },
       'Battle Simulator',
@@ -10140,11 +10657,45 @@
       'Monte Carlo simulator with provisional weapon + armor models. Each landed hit rolls a body region; ',
       'covered regions take reduced damage. Your side prefills from your battle stats and level; edit anything to explore.',
     ));
+    // v1.5.2 — One-shot "prefilled from X" banner. Only renders this paint
+    // (prefill is consumed + cleared above), so navigating away and back
+    // clears it. Communicates source + freshness so the user can read the
+    // sim's input quality directly.
+    //
+    // v1.5.3 — adds an optional shapeNote sub-line for TECH-Estimate-sourced
+    // prefills where pillars came from a typical-shape split rather than
+    // measured values. Honest tagging: spy prefills are exact stats; TECH
+    // Estimate prefills are educated guesses and the user should see that.
+    if (prefill && prefill.sourceLabel) {
+      const ageNote = prefill.sourceFreshness
+        ? prefill.sourceFreshness + (typeof prefill.ageDays === 'number'
+              ? ', ~' + Math.round(prefill.ageDays) + 'd old' : '')
+        : (typeof prefill.ageDays === 'number'
+              ? '~' + Math.round(prefill.ageDays) + 'd old' : '');
+      host.appendChild(el('div', {
+        class: 'tech-test-prefill-banner',
+        style: { marginTop: '8px', fontSize: '11px' },
+      },
+        el('div', {},
+          '📥 Prefilled opponent column from ' + (prefill.name ? prefill.name + "'s " : '')
+            + prefill.sourceLabel
+            + (ageNote ? ' (' + ageNote + ')' : '')
+            + '.',
+        ),
+        prefill.shapeNote
+          ? el('div', { style: { marginTop: '3px', fontSize: '10px',
+                                 opacity: '0.78', lineHeight: '1.4' } },
+              prefill.shapeNote)
+          : null,
+      ));
+    }
 
     const youRefs = {};
     const oppRefs = {};
     const myLevel  = meta.level || TEST_DEFAULTS.defaultLevel;
-    const oppLevel = TEST_DEFAULTS.defaultLevel;
+    const oppLevel = (prefill && typeof prefill.level === 'number' && prefill.level > 0)
+      ? prefill.level
+      : TEST_DEFAULTS.defaultLevel;
 
     function statCol(title, klass, vals, refs, level) {
       const col = el('div', { class: 'tech-test-col ' + klass });
@@ -10156,16 +10707,30 @@
         type: 'number', min: '1', max: '100', step: '1',
         value: String(level), class: 'lvl-input',
       });
-      // HP override (v0.6.22): empty = use level-derived wiki HP; typed =
-      // override (your buffed max HP, or opp's max HP from the attack screen).
-      // Placeholder always reflects the wiki HP for the current level so
-      // users see what the default would be without committing to it.
+      // HP override. For YOU, prefill with the real max HP captured from
+      // Torn's /bars selection (includes merits / education / faction perks).
+      // For OPP, prefer the opponent's profile-derived max HP (threaded in
+      // via vals.hp by the Simulate-vs-opponent button), otherwise leave
+      // blank and let the placeholder show the level-derived wiki HP.
+      //
+      // v1.5.8 — was placeholder-only on both sides, pushing the wiki
+      // formula (e.g. 1475 at L32 / 1875 at L40) into the sim even when
+      // real HP was hundreds higher. v1.5.9 extended the prefill to OPP
+      // via the profile endpoint's life.maximum capture.
+      const youRealHp = (klass === 'you' && meta.life && meta.life.maximum) || 0;
+      const oppRealHp = (klass === 'opp' && vals.hp && vals.hp > 0) ? vals.hp : 0;
+      const realHp = youRealHp || oppRealHp;
       const hpLabel = el('label', { class: 'hp-label' }, 'HP');
       const hpInp = el('input', {
         type: 'number', min: '1', max: '99999', step: '1',
+        value: realHp > 0 ? String(realHp) : '',
         placeholder: String(testHpForLevel(parseInt(lvlInp.value, 10) || level)),
         class: 'hp-input',
-        title: 'Override max HP. Empty = use level default. Useful for buffed self-HP or opp HP read off the attack screen.',
+        title: youRealHp > 0
+          ? 'Your real max HP from the Torn API (includes merits / education / perks). Clear to fall back to the wiki formula for what-if scenarios.'
+          : oppRealHp > 0
+            ? 'Opponent\'s real max HP from their Torn profile. Clear to fall back to the wiki formula for what-if scenarios.'
+            : 'Override max HP. Empty = use level default. Useful for buffed self-HP or opp HP read off the attack screen.',
       });
       const updateHp = () => {
         const L = parseInt(lvlInp.value, 10) || TEST_DEFAULTS.defaultLevel;
@@ -10199,6 +10764,61 @@
       col.appendChild(grid);
       col.appendChild(totalEl);
       updateTotal();
+
+      // v1.5.2 — Opponent preset dropdown. Pulls a typical opponent's total
+      // from the TornStats calibration (TYPICAL_STATS_BY_LEVEL) at the user-
+      // picked percentile, splits across the four pillars using the L100
+      // typical shape (L100_SHAPE_PRIORS p50: str 27% / def 25% / spd 25% /
+      // dex 22%). Auto-refills when the level changes; any manual stat edit
+      // drops the preset so the user's value wins.
+      if (klass === 'opp') {
+        const presetRow = el('div', { class: 'tech-test-presetrow' });
+        presetRow.appendChild(el('label', {}, 'Preset'));
+        const presetSel = el('select', {
+          class: 'wpn-select',
+          title: 'Auto-fill stats from the TornStats faction-spy calibration (1518 spies). Total comes from this level\'s bucket at the named percentile; pillars are split using the L100 typical shape (str 27% / def 25% / spd 25% / dex 22%). Updates whenever you change the level.',
+        });
+        presetSel.appendChild(el('option', { value: '' },    '(manual)'));
+        presetSel.appendChild(el('option', { value: 'p25' }, 'Weak — p25 bucket'));
+        presetSel.appendChild(el('option', { value: 'p50' }, 'Median — p50 bucket'));
+        presetSel.appendChild(el('option', { value: 'p75' }, 'Strong — p75 bucket'));
+        presetSel.appendChild(el('option', { value: 'p95' }, 'Very strong — p95 bucket'));
+        refs.preset = presetSel;
+        presetRow.appendChild(presetSel);
+        col.insertBefore(presetRow, grid);
+
+        let isPresetFill = false;
+        function applyOpponentPreset() {
+          if (!presetSel.value) return;
+          const lv = parseInt(refs.level.value, 10) || TEST_DEFAULTS.defaultLevel;
+          const bucket = typicalStatsForLevel(lv);
+          if (!bucket) return;
+          const total = bucket[presetSel.value];
+          if (!(total > 0)) return;
+          const split = splitTotalByShape(total, 'p50');
+          if (!split) return;
+          isPresetFill = true;
+          refs.strength.value  = String(split.strength);
+          refs.defense.value   = String(split.defense);
+          refs.speed.value     = String(split.speed);
+          refs.dexterity.value = String(split.dexterity);
+          isPresetFill = false;
+          updateTotal();
+        }
+
+        presetSel.addEventListener('change', applyOpponentPreset);
+        // Re-fill when level changes — "typical opponent at this level"
+        // implies the stats follow whatever level is currently set.
+        lvlInp.addEventListener('input', applyOpponentPreset);
+        // Manual stat edit drops the preset to (manual) so the user always
+        // has the final word. The isPresetFill flag suppresses this when
+        // applyOpponentPreset itself is writing the values.
+        for (const key of ['strength', 'defense', 'speed', 'dexterity']) {
+          refs[key].addEventListener('input', function () {
+            if (!isPresetFill && presetSel.value) presetSel.value = '';
+          });
+        }
+      }
 
       // v0.2: primary-weapon class. Defaults to 'generic' so existing users
       // who haven't touched the dropdown see the same baseline as v0.1.
@@ -10299,7 +10919,7 @@
     const mirrorBtn = el('button', {
       type: 'button',
       class: 'tech-test-mirror',
-      title: 'Copy your level, stats, weapon, drug, and armor to the opponent',
+      title: 'Copy your level, HP, stats, weapon, drug, and armor to the opponent',
       'on:click': () => {
         oppRefs.level.value = youRefs.level.value;
         oppRefs.level.dispatchEvent(new Event('input', { bubbles: true }));
@@ -10307,6 +10927,11 @@
           oppRefs[k].value = youRefs[k].value;
           oppRefs[k].dispatchEvent(new Event('input', { bubbles: true }));
         }
+        // v1.5.8 — also mirror HP so a YOU-side explicit max HP (the
+        // real /bars value, 2027 typical) propagates to OPP. Without
+        // this, mirror would be asymmetric: YOU at 2027, OPP at the
+        // level-derived placeholder (1475 at L32).
+        if (oppRefs.hp && youRefs.hp) oppRefs.hp.value = youRefs.hp.value;
         if (oppRefs.weaponClass) {
           oppRefs.weaponClass.value = youRefs.weaponClass.value;
           // Fire change so the opponent's named-weapon picker repopulates
@@ -11533,6 +12158,12 @@
     // v1.1.0-dev — and the same for FF Scouter. Gated by settings.ffEnabled,
     // 1-hour cache TTL per the author's request.
     maybeFetchFFScouter(id);
+    // v1.5.5 — fetch the opponent's basic profile to capture name + level
+    // + status. Without this, opening a drill on someone with no fight
+    // history (and no pinned-target entry, and no spy) prefills the TEST
+    // tab with level=29 even when the user is literally looking at L40's
+    // profile page. Persisted to targetStatus so the level is sticky.
+    maybeFetchOpponentProfile(id);
   }
   // v0.6.38 — Faction Intel drill open helper. Same shape as the
   // opponent drill but uses kind:'faction' so renderActive routes to
