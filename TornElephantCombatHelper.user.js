@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.5.12
+// @version      1.5.14
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -228,7 +228,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.5.12';
+  const SCRIPT_VERSION    = '1.5.14';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -7170,21 +7170,25 @@
     .tech-targets-energy.has{color:#34d399;border-color:#059669;
       box-shadow:0 0 6px rgba(52,211,153,.25);}
     .tech-targets-energy.low{color:#9ca3af;}
+    /* v1.5.14 — recoloured to the panel's violet theme so the HIT badges
+       on Targets + Scout match the rest of the panel chrome (pill active
+       state, launcher pip glow, drill verdicts) instead of the prior
+       emerald-green palette. */
     .tech-hit-badge{display:inline-flex;align-items:center;padding:1px 7px;
       margin-left:6px;border-radius:3px;
       font:800 9px/1.4 system-ui,sans-serif;letter-spacing:1.2px;
-      color:#0a2e1f;background:linear-gradient(180deg,#34d399 0%,#10b981 100%);
-      border:1px solid #059669;text-shadow:none;text-decoration:none;
-      cursor:pointer;
-      box-shadow:0 0 8px rgba(52,211,153,.55);
+      color:#fff;background:linear-gradient(180deg,#a855f7 0%,#7c3aed 100%);
+      border:1px solid #a855f7;text-shadow:0 1px 0 rgba(0,0,0,.3);
+      text-decoration:none;cursor:pointer;
+      box-shadow:0 0 8px rgba(168,85,247,.55);
       animation:tech-hit-pulse 2s ease-in-out infinite;}
-    .tech-hit-badge:hover{filter:brightness(1.1);text-decoration:none;color:#0a2e1f;}
+    .tech-hit-badge:hover{filter:brightness(1.15);text-decoration:none;color:#fff;}
     @keyframes tech-hit-pulse{
-      0%,100%{box-shadow:0 0 6px rgba(52,211,153,.45);}
-      50%    {box-shadow:0 0 12px rgba(52,211,153,.85);}
+      0%,100%{box-shadow:0 0 6px rgba(168,85,247,.45);}
+      50%    {box-shadow:0 0 12px rgba(168,85,247,.85);}
     }
-    .tech-target-row.hittable{background:rgba(16,185,129,.06);}
-    .tech-target-row.hittable:hover{background:rgba(16,185,129,.12);}
+    .tech-target-row.hittable{background:rgba(168,85,247,.06);}
+    .tech-target-row.hittable:hover{background:rgba(168,85,247,.12);}
 
     /* v0.6.42 — Faction Power Profile summary lines. Each sub-block in
        the section starts with a one-line label/summary; the bars use the
@@ -11937,6 +11941,20 @@
         const rowClasses = 'tech-scout-row clickable verdict-' + vk
           + ((sortKey === 'war_priority' && rowIndex === 0) ? ' war-priority-top' : '');
 
+        // v1.5.13 — HIT badge on hittable Scout rows. Mirrors the Targets
+        // queue pattern: same canHitTarget gate (target Okay + self Okay +
+        // ≥25 energy), same stopPropagation so HIT opens the attack page
+        // while clicking the rest of the row drills into Opponent Intel.
+        let scoutHitLink = null;
+        if (canHitTarget(m)) {
+          scoutHitLink = el('a', {
+            class: 'tech-hit-badge',
+            href: 'https://www.torn.com/page.php?sid=attack&user2ID=' + m.id,
+            title: 'Attack ' + m.name + ' now (' + ATTACK_ENERGY_COST + ' energy)',
+          }, '⚡ HIT');
+          scoutHitLink.addEventListener('click', function (e) { e.stopPropagation(); });
+        }
+
         const memberRow = el('div', {
           class: rowClasses,
           title: 'Open Opponent Intel for ' + m.name + priTitleExtra,
@@ -11949,6 +11967,7 @@
                 target: '_blank', rel: 'noopener',
               }, m.name),
               (m.level != null ? el('span', { class: 'tech-level' }, 'L' + m.level) : null),
+              scoutHitLink,
             ),
             el('div', { class: 'tech-scout-verdict' },
               el('span', { class: 'verdict' }, vlabel),
