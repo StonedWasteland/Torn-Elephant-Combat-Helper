@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.5.11
+// @version      1.5.12
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -228,7 +228,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.5.11';
+  const SCRIPT_VERSION    = '1.5.12';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -10651,7 +10651,6 @@
 
     host.appendChild(el('div', { class: 'tech-section-title' },
       'Battle Simulator',
-      el('span', { class: 'tech-tag', style: { marginLeft: '6px' } }, 'TEST v0.3'),
     ));
     host.appendChild(el('div', { class: 'hint', style: { marginTop: '0', fontSize: '11px' } },
       'Monte Carlo simulator with provisional weapon + armor models. Each landed hit rolls a body region; ',
