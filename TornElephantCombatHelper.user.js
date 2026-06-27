@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.5.14
+// @version      1.5.24
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -228,7 +228,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.5.14';
+  const SCRIPT_VERSION    = '1.5.24';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -829,6 +829,52 @@
     }
   })();
 
+  // v1.5.21 — One-shot reset of the active war throttle so existing
+  // installs immediately re-fetch with the new score parsing
+  // (ourScore / enemyScore / targetScore). Otherwise the cached
+  // pre-v1.5.21 activeWarTarget has those fields undefined and the
+  // War tab shows zeros until the 5-minute throttle elapses.
+  (function forceActiveWarRefreshV1521() {
+    const SENTINEL = SCRIPT_KEY + 'activewar_refreshed_v1521';
+    try {
+      if (GM_getValue(SENTINEL)) return;
+      if (meta.activeWarCheckedAt) {
+        meta.activeWarCheckedAt = 0;
+        store('meta', meta);
+      }
+      GM_setValue(SENTINEL, { ts: Date.now() });
+    } catch (e) {
+      // Sentinel write failed — re-run on next load is harmless.
+    }
+  })();
+
+  // v1.5.22 — v1.5.21's sentinel cleared `meta.activeWarCheckedAt` but
+  // missed the OTHER throttle gate in maybeRefreshActiveWar, which checks
+  // the cached snapshot's own `meta.activeWarTarget.refreshedAt`. If that
+  // was <5 minutes old at upgrade time (the common case for users on the
+  // Dashboard at upgrade), the fetch never re-fires and the War tab keeps
+  // showing zeros from the pre-v1.5.21 snapshot. Clear BOTH gates here so
+  // the next poll unconditionally re-fetches with the new score parser.
+  (function forceActiveWarRefreshV1522() {
+    const SENTINEL = SCRIPT_KEY + 'activewar_refreshed_v1522';
+    try {
+      if (GM_getValue(SENTINEL)) return;
+      let changed = false;
+      if (meta.activeWarTarget && meta.activeWarTarget.refreshedAt) {
+        meta.activeWarTarget.refreshedAt = 0;
+        changed = true;
+      }
+      if (meta.activeWarCheckedAt) {
+        meta.activeWarCheckedAt = 0;
+        changed = true;
+      }
+      if (changed) store('meta', meta);
+      GM_setValue(SENTINEL, { ts: Date.now() });
+    } catch (e) {
+      // Sentinel write failed — re-run on next load is harmless.
+    }
+  })();
+
   // v1.5.1 — Backfill defaults for long-time installs. load() returns the
   // stored settings AS-IS when a saved value exists; new keys added in
   // later versions DON'T get filled in from the defaults object, so users
@@ -858,6 +904,14 @@
   // re-hitting the API. Shape per entry:
   //   { current, max, timeoutAt, modifier, cooldownAt, fetchedAt, error? }
   let factionChainCache = load('factionChainCache', {});
+
+  // v1.5.21 — War score timeline snapshots. Keyed by warId; each entry
+  // is { samples: [{ ts, ourScore, enemyScore }, ...], targetScore }.
+  // Snapshots get appended every time the ranked-war fetch lands fresh
+  // data (~5 min cadence), capped at WAR_TIMELINE_CAP entries per war so
+  // storage stays bounded. Powers the War Tracker tab's timeline chart +
+  // win-projection math.
+  let warScoreHistory = load('warScoreHistory', {});
 
   // v0.6.52 — TornStats spy cache. Per-id snapshot of the latest spy
   // report fetched from tornstats.com. Shape per entry:
@@ -935,6 +989,19 @@
   // release timings count down live during war prep. Same self-cancel-
   // on-disconnect pattern as the chain tickers.
   let scoutCountdownInterval = null;
+  // v1.5.23 — War Tracker pre-war countdown ticker. Updates the "starts
+  // in Xd Yh Zm" text every second while the war is scheduled but not
+  // yet live. Self-cancels via isConnected when the tab is left, and
+  // triggers a renderActive() when the countdown crosses zero so the
+  // banner auto-flips to the active-war state.
+  let warPrewarTickerInterval = null;
+  // v1.5.24 — Background ticker that re-fetches the active war target's
+  // roster every WAR_ROSTER_REFRESH_SEC so member statuses (hospital,
+  // jail, abroad) stay current without manual re-pulls. One API call
+  // covers all 100 members; cheap relative to Torn's 100/min budget.
+  // Started in init() and runs unconditionally — gated internally on
+  // having an active war + cached roster.
+  let warRosterRefreshInterval = null;
 
   // fights: { [code]: rawFightObject } — raw shape preserved so we can recompute
   // derived fields if our normalisation logic changes later.
@@ -1061,13 +1128,33 @@
         }
       }
       if (ffDropped > 0) store('ffCache', ffCache);
-      const totalDropped = spyDropped + scoutDropped + chainDropped + bspDropped + ffDropped;
+      // v1.5.21 — sweep warScoreHistory entries whose newest sample is
+      // older than 30 days. New wars get added regularly so without this
+      // the blob grows unbounded across the install's lifetime.
+      let warHistDropped = 0;
+      const wsh = load('warScoreHistory', {}) || {};
+      for (const wid in wsh) {
+        const entry = wsh[wid];
+        if (!entry || !Array.isArray(entry.samples) || entry.samples.length === 0) {
+          delete wsh[wid];
+          warHistDropped++;
+          continue;
+        }
+        const newest = entry.samples[entry.samples.length - 1].ts || 0;
+        if (newest < cutoff) {
+          delete wsh[wid];
+          warHistDropped++;
+        }
+      }
+      if (warHistDropped > 0) store('warScoreHistory', wsh);
+      const totalDropped = spyDropped + scoutDropped + chainDropped + bspDropped + ffDropped + warHistDropped;
       if (totalDropped > 0) {
         console.log('[TECH] Cache sweep dropped ' + spyDropped + ' spy + '
                   + scoutDropped + ' scout + ' + chainDropped
                   + ' faction-chain + ' + bspDropped
                   + ' BSP + ' + ffDropped
-                  + ' FF Scouter entries older than 30 days.');
+                  + ' FF Scouter + ' + warHistDropped
+                  + ' war-history entries older than 30 days.');
       }
     } catch (e) {
       console.warn('[TECH] Cache sweep skipped:', e);
@@ -2096,11 +2183,59 @@
   //   - API errors out (separate shorter retry throttle)
   const ACTIVE_WAR_REFRESH_SEC = 300;
   const ACTIVE_WAR_ERROR_RETRY_SEC = 120;
+  // v1.5.24 — Cadence for the war-target roster background refresh. One
+  // /faction/{id}?selections=basic call covers all 100 members, so this
+  // costs ~1 call/min — negligible against the 100/min budget. Tuned to
+  // 60s because hospital flips happen on minute-scale timescales and a
+  // tighter cadence would erode the rate-limit cushion shared with other
+  // tools (TornTools, BSP, FF Scouter) running on the same key.
+  const WAR_ROSTER_REFRESH_SEC = 60;
+  // v1.5.24 — Stale-roster guard for the HIT badge. If the cached
+  // roster's `statusState: 'Okay'` is older than this many seconds, the
+  // Scout/Predicted Picks rows suppress the badge as a belt-and-braces
+  // hedge. With the 60s auto-refresh in steady state we shouldn't ever
+  // hit this, but it catches the worst-case window where the user is
+  // viewing a non-war scout (no auto-refresh) or the auto-refresh
+  // errored out.
+  const ROSTER_STALE_SEC = 120;
   // v0.6.77 — when a war ends, keep the snapshot around for one week so the
   // WAR pill can render a final read-only scorecard. Long enough to brag
   // about it, short enough that the next war replaces the snapshot before
   // any "I forgot which war this was" confusion can set in.
   const LAST_WAR_TTL_SEC = 7 * 86400;
+  // v1.5.21 — War score timeline cap. ~500 samples at 5-min cadence ≈ 41h
+  // of coverage, more than long enough for any single ranked war (cap is
+  // 168h but most wars resolve faster).
+  const WAR_TIMELINE_CAP = 500;
+
+  // Append a score snapshot to warScoreHistory for the given war. Idempotent
+  // dedupe: if the most recent sample has identical scores, skip the write
+  // to avoid filling the log with flat-line entries when scores don't move
+  // between polls.
+  function appendWarScoreSnapshot(war) {
+    if (!war || !war.warId) return;
+    const wid = String(war.warId);
+    const entry = warScoreHistory[wid] || { samples: [], targetScore: 0 };
+    entry.targetScore = war.targetScore || entry.targetScore || 0;
+    const last = entry.samples.length ? entry.samples[entry.samples.length - 1] : null;
+    if (last && last.ourScore === war.ourScore && last.enemyScore === war.enemyScore) {
+      // Score unchanged — bump the timestamp on the last sample so the
+      // chart's right edge tracks "now" rather than the last delta. This
+      // keeps a flat line from appearing as a stale stub.
+      last.ts = nowSec();
+    } else {
+      entry.samples.push({
+        ts: nowSec(),
+        ourScore: war.ourScore || 0,
+        enemyScore: war.enemyScore || 0,
+      });
+      if (entry.samples.length > WAR_TIMELINE_CAP) {
+        entry.samples = entry.samples.slice(entry.samples.length - WAR_TIMELINE_CAP);
+      }
+    }
+    warScoreHistory[wid] = entry;
+    store('warScoreHistory', warScoreHistory);
+  }
 
   // v0.6.77 — now returns { active, recentlyEnded } so the caller can also
   // populate meta.lastWarTarget on cold start (when we missed the active →
@@ -2142,6 +2277,19 @@
       }
       if (!enemyFid) continue;
       const warEnd = w.war.end || 0;
+      // v1.5.21 — capture per-faction war scores + win threshold from the
+      // existing ranked_wars payload. The API exposes them as
+      // factions[fid].score and war.target; defensive on field names since
+      // we haven't paired them against a fresh live capture yet (fall
+      // back to 0 rather than crashing the parser).
+      const ourFactionRow = factions[String(ourFactionId)] || {};
+      const enemyFactionRow = factions[String(enemyFid)] || {};
+      const ourScore = (typeof ourFactionRow.score === 'number')
+        ? ourFactionRow.score : 0;
+      const enemyScore = (typeof enemyFactionRow.score === 'number')
+        ? enemyFactionRow.score : 0;
+      const targetScore = (typeof w.war.target === 'number')
+        ? w.war.target : 0;
       const shape = {
         warId: parseInt(warIdStr, 10),
         ourFactionId,
@@ -2150,6 +2298,9 @@
         factionName: enemyName,
         warStart: w.war.start || 0,
         warEnd: warEnd,
+        ourScore: ourScore,
+        enemyScore: enemyScore,
+        targetScore: targetScore,
         refreshedAt: nowSec(),
       };
       if (warEnd === 0) {
@@ -2216,14 +2367,81 @@
       meta.activeWarCheckedAt = nowSec();
       meta.activeWarError = null;
       store('meta', meta);
+      // v1.5.21 — snapshot scores into the timeline log after every fresh
+      // fetch. Bounded by WAR_TIMELINE_CAP per war; older samples drop
+      // off the front so storage doesn't grow unbounded over multi-day
+      // wars (5-min cadence × 48h = 576 snapshots → cap at 500).
+      if (newActive && newActive.warId) {
+        appendWarScoreSnapshot(newActive);
+      } else if (!newActive && prevActive && prevActive.warId) {
+        // active → null transition: capture one final snapshot so the
+        // postwar timeline ends at the final score, not the last poll.
+        appendWarScoreSnapshot(meta.lastWarTarget || prevActive);
+      }
       if (newActive) maybeRefreshFactionChain(newActive.factionId);
-      if (panelEl && contentEl && settings.activeTab === 'dashboard' && !currentDrill) {
+      // v1.5.16 — auto-fetch the enemy faction's roster on war detection so
+      // the Dashboard's Quick Wins panel can surface Predicted Picks even
+      // before the user manually visits the Scout tab. One API call,
+      // fire-and-forget; silent failure leaves Quick Wins in its empty
+      // state with the existing "no fight history yet" hint.
+      if (newActive && !scoutData[newActive.factionId]) {
+        fetchFactionRoster(newActive.factionId).then(function (roster) {
+          scoutData[newActive.factionId] = roster;
+          store('scoutData', scoutData);
+          if (panelEl && contentEl && settings.activeTab === 'dashboard' && !currentDrill) {
+            renderActive();
+          }
+        }).catch(function () { /* silent — Quick Wins fallback handles absence */ });
+      }
+      // v1.5.21 — also re-render when on the War tab so the scoreboard +
+      // timeline pick up the fresh score snapshot we just appended.
+      if (panelEl && contentEl && !currentDrill
+          && (settings.activeTab === 'dashboard' || settings.activeTab === 'war')) {
         renderActive();
       }
     }).catch(function (e) {
       meta.activeWarError = { at: nowSec(), msg: String(e && e.message ? e.message : e) };
       store('meta', meta);
     });
+  }
+
+  // v1.5.24 — Auto-refresh the active war target's faction roster every
+  // WAR_ROSTER_REFRESH_SEC. Without this, member statuses (Okay vs
+  // Hospital/Jail/Federal/Traveling) captured at roster-fetch time go
+  // stale, so the HIT badge on Scout rows could keep showing for someone
+  // who entered hospital ten minutes ago.
+  //
+  // Gated to active war only — other scouts stay on manual refresh so we
+  // don't burn calls on factions the user isn't actively chasing. Reuses
+  // fetchFactionRoster which is already rate-limit-aware.
+  function maybeRefreshWarRoster() {
+    if (!settings.apiKey) return;
+    if (isRateLimited()) return;
+    const war = meta.activeWarTarget;
+    if (!war || !war.factionId) return;
+    const cached = scoutData[war.factionId];
+    // No cache yet means maybeRefreshActiveWar's initial-fetch path
+    // hasn't landed — let it handle the cold start.
+    if (!cached) return;
+    const now = nowSec();
+    if (cached.fetchedAt && (now - cached.fetchedAt) < WAR_ROSTER_REFRESH_SEC) return;
+    fetchFactionRoster(war.factionId).then(function (roster) {
+      scoutData[war.factionId] = roster;
+      store('scoutData', scoutData);
+      // Re-render visible surfaces that surface roster state. Dashboard's
+      // Predicted Picks and Scout rows are the two consumers; both gate
+      // on roster.fetchedAt for HIT-badge freshness.
+      if (panelEl && contentEl && !currentDrill
+          && (settings.activeTab === 'scout' || settings.activeTab === 'dashboard')) {
+        renderActive();
+      }
+    }).catch(function () { /* silent — stale roster is better than crashing the watcher */ });
+  }
+
+  function startWarRosterWatcher() {
+    if (warRosterRefreshInterval) return;
+    warRosterRefreshInterval = setInterval(maybeRefreshWarRoster, WAR_ROSTER_REFRESH_SEC * 1000);
+    maybeRefreshWarRoster();   // fire once immediately so the user doesn't wait 60s on first open
   }
 
   // ─── TORNSTATS SPY (v0.6.52) ────────────────────────────────────────────
@@ -4214,16 +4432,17 @@
       ? overview.respectGained / elapsedHoursForPace
       : 0;
     return {
-      wins:        overview.wins,
-      losses:      overview.losses,
-      respectNet:  overview.respectTotal,
-      koDelivered: overview.wins,
-      koTaken:     overview.losses,
+      wins:           overview.wins,
+      losses:         overview.losses,
+      respectNet:     overview.respectTotal,
+      respectGained:  overview.respectGained,
+      koDelivered:    overview.wins,
+      koTaken:        overview.losses,
       elapsedSec,
       respectPerHour,
       isPostWar,
-      warEndedAt:  isPostWar ? (lastWar.warEnd || null) : null,
-      enemyName:   (anchor && anchor.factionName) || null,
+      warEndedAt:     isPostWar ? (lastWar.warEnd || null) : null,
+      enemyName:      (anchor && anchor.factionName) || null,
     };
   }
 
@@ -4298,6 +4517,7 @@
         row = {
           id: v.opponentId,
           name: v.opponentName || ('Player ' + v.opponentId),
+          factionId: v.opponentFaction || null,
           factionName: v.opponentFactionName || '',
           level: v.opponentLevel,
           fights: 0, wins: 0, losses: 0,
@@ -4315,13 +4535,28 @@
         row.durationSum += v.durationSec;
         row.durationN++;
       }
-      if (v.tsEnded > row.lastTs) row.lastTs = v.tsEnded;
+      if (v.tsEnded > row.lastTs) {
+        row.lastTs = v.tsEnded;
+        // Refresh faction snapshot from the freshest fight so the active-
+        // war filter below sees the opponent's most recent known faction
+        // rather than whatever stuck on the first stored fight.
+        if (v.opponentFaction)     row.factionId   = v.opponentFaction;
+        if (v.opponentFactionName) row.factionName = v.opponentFactionName;
+      }
       // Keep the freshest level we have on file.
       if (v.opponentLevel != null) row.level = v.opponentLevel;
     }
+    // v1.5.15 — when a ranked war is active, restrict Quick Wins to
+    // opponents whose most recent known faction matches the current war
+    // target. Without this filter the leaderboard stays anchored on the
+    // previous war's chain leaders (the Mile High vs Infernum case that
+    // triggered this fix). When no war is active, behavior is unchanged
+    // and the panel surfaces all-time best chain targets.
+    const warFactionId = meta.activeWarTarget && meta.activeWarTarget.factionId;
     const now = nowSec();
     const candidates = [];
     for (const row of map.values()) {
+      if (warFactionId && row.factionId !== warFactionId) continue;
       if (row.fights < QUICK_WIN_MIN_FIGHTS) continue;
       const winRate = row.wins / row.fights;
       if (winRate < QUICK_WIN_MIN_WINRATE) continue;
@@ -6982,6 +7217,20 @@
       text-shadow:0 0 6px rgba(168,85,247,.4);}
     .tech-warscore-ended{color:#9ca3af;font-weight:600;letter-spacing:.5px;
       text-transform:none;font-size:9px;}
+    /* v1.5.20 — Score Added hero. Sits above the 2x2 grid as the headline
+       "what did I put on the board" number. Same ember-glow treatment as
+       the title strip on the active scorecard; muted to gold-glow in
+       postwar mode to mirror the cooler postwar title color. */
+    .tech-warscore-hero{text-align:center;margin-bottom:10px;padding-bottom:9px;
+      border-bottom:1px solid #2a1f2e;}
+    .tech-warscore-hero .big{font:800 32px/1 Impact,'Oswald','Arial Narrow',sans-serif;
+      color:#fde047;letter-spacing:.5px;font-variant-numeric:tabular-nums;
+      text-shadow:0 0 14px rgba(253,224,71,.45);}
+    .tech-warscore-hero .lbl{font:700 10px/1 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:1.5px;color:#fca5a5;margin-top:5px;
+      text-shadow:0 0 6px rgba(220,38,38,.3);}
+    .tech-warscore.postwar .tech-warscore-hero .lbl{color:#a78bfa;
+      text-shadow:0 0 6px rgba(168,85,247,.4);}
     .tech-warscore-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
     .tech-warscore-cell{background:#08070b;border:1px solid #2a1f2e;border-radius:4px;
       padding:7px 10px;}
@@ -6997,6 +7246,108 @@
     .tech-warscore-hosps .bad {color:#f87171;}
     .tech-warscore-hosps .sep {color:#2a1f2e;margin:0 4px;}
     .tech-warscore-hosps strong{font-variant-numeric:tabular-nums;}
+
+    /* ── War Tracker tab (v1.5.21) ─────────────────────────────────────
+       Centralised war intel. Visual language echoes the War Scorecard
+       (red ember for active, violet+gold for postwar) but spreads out
+       across a dedicated tab. */
+    .tech-war-banner{margin-bottom:11px;padding:10px 12px;border-radius:6px;
+      background:linear-gradient(180deg,#1a0f1a 0%,#0f0a12 100%);
+      border:1px solid #2a1f2e;position:relative;overflow:hidden;}
+    .tech-war-banner::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;
+      background:linear-gradient(90deg,#dc2626 0%,#f97316 50%,#dc2626 100%);
+      box-shadow:0 0 8px rgba(220,38,38,.5);}
+    .tech-war-banner.postwar::before{background:linear-gradient(90deg,#7c3aed 0%,#f97316 50%,#7c3aed 100%);
+      box-shadow:0 0 6px rgba(168,85,247,.4);}
+    /* v1.5.23 — prep state: cyan/teal accent to read as "scheduled,
+       not running" rather than "alarm". Cooler palette differentiates
+       it from the red ember (active) and violet+gold (postwar) variants. */
+    .tech-war-banner.prewar::before{background:linear-gradient(90deg,#0891b2 0%,#22d3ee 50%,#0891b2 100%);
+      box-shadow:0 0 6px rgba(34,211,238,.45);}
+    .tech-war-banner-title{font:800 13px/1 Impact,'Oswald','Arial Narrow',sans-serif;
+      letter-spacing:1.5px;color:#fca5a5;text-transform:uppercase;
+      text-shadow:0 0 6px rgba(220,38,38,.4);}
+    .tech-war-banner.postwar .tech-war-banner-title{color:#fde047;
+      text-shadow:0 0 6px rgba(168,85,247,.4);}
+    .tech-war-banner.prewar .tech-war-banner-title{color:#67e8f9;
+      text-shadow:0 0 6px rgba(34,211,238,.4);}
+    .tech-war-countdown{color:#fde047;font-variant-numeric:tabular-nums;
+      font-weight:800;text-shadow:0 0 6px rgba(253,224,71,.4);}
+    .tech-war-scoreboard-vs.prewar .lead,
+    .tech-war-scoreboard-vs .lead{transition:color .2s;}
+    .tech-war-banner-sub{margin-top:4px;font-size:11px;color:#cbd5e1;}
+    .tech-war-banner-sub strong{color:#fde047;}
+
+    /* Scoreboard — two side-by-side faction columns with a VS in the middle. */
+    .tech-war-scoreboard{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;
+      align-items:center;margin-bottom:14px;padding:12px;border-radius:6px;
+      background:#0f0a12;border:1px solid #2a1f2e;}
+    .tech-war-scoreboard-col{text-align:center;}
+    .tech-war-scoreboard-col .lbl{font:700 9px/1 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:1.2px;color:#9ca3af;}
+    .tech-war-scoreboard-col .big{font:800 26px/1 Impact,'Oswald','Arial Narrow',sans-serif;
+      letter-spacing:.5px;font-variant-numeric:tabular-nums;margin-top:4px;
+      text-shadow:0 0 10px rgba(0,0,0,.5);}
+    .tech-war-scoreboard-col.us .big{color:#34d399;text-shadow:0 0 10px rgba(52,211,153,.35);}
+    .tech-war-scoreboard-col.them .big{color:#f87171;text-shadow:0 0 10px rgba(248,113,113,.35);}
+    .tech-war-scoreboard-col .sub{font-size:10px;color:#6b7280;margin-top:4px;}
+    .tech-war-scoreboard-bar{height:6px;border-radius:3px;background:#15101a;
+      border:1px solid #2a1f2e;overflow:hidden;margin-top:6px;}
+    .tech-war-scoreboard-bar .fill{height:100%;border-radius:3px;}
+    .tech-war-scoreboard-col.us .tech-war-scoreboard-bar .fill{
+      background:linear-gradient(90deg,#10b981,#34d399);}
+    .tech-war-scoreboard-col.them .tech-war-scoreboard-bar .fill{
+      background:linear-gradient(90deg,#dc2626,#f87171);}
+    .tech-war-scoreboard-vs{text-align:center;padding:0 8px;}
+    .tech-war-scoreboard-vs .sep{font:700 11px/1 system-ui,sans-serif;
+      color:#6b7280;letter-spacing:2px;}
+    .tech-war-scoreboard-vs .lead{font:700 9px/1.2 system-ui,sans-serif;
+      text-transform:uppercase;letter-spacing:1px;color:#9ca3af;margin-top:5px;
+      max-width:80px;font-variant-numeric:tabular-nums;}
+    .tech-war-scoreboard-vs.good .lead{color:#34d399;
+      text-shadow:0 0 6px rgba(52,211,153,.4);}
+    .tech-war-scoreboard-vs.bad .lead{color:#fca5a5;
+      text-shadow:0 0 6px rgba(220,38,38,.4);}
+
+    /* Win projection */
+    .tech-war-projection{padding:8px 10px;margin-bottom:8px;border-radius:4px;
+      background:#0f0a12;border-left:3px solid #4b5563;font-size:12px;color:#cbd5e1;}
+    .tech-war-projection.good{border-left-color:#34d399;}
+    .tech-war-projection.bad{border-left-color:#dc2626;
+      box-shadow:inset 4px 0 12px -8px rgba(220,38,38,.6);}
+    .tech-war-projection strong{color:#fde047;}
+    .tech-war-projection-grid{display:flex;flex-direction:column;gap:4px;font-size:11px;}
+    .tech-war-projection-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;
+      align-items:center;padding:5px 8px;background:#0f0a12;
+      border:1px solid #2a1f2e;border-radius:3px;
+      font-variant-numeric:tabular-nums;}
+    .tech-war-projection-row.us{border-left:2px solid #34d399;}
+    .tech-war-projection-row.them{border-left:2px solid #f87171;}
+    .tech-war-projection-row .who{color:#e5e7eb;font-weight:600;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .tech-war-projection-row .pace{color:#fde047;font-weight:700;}
+    .tech-war-projection-row .eta{color:#9ca3af;}
+
+    /* Personal contribution */
+    .tech-war-contribution{display:flex;align-items:center;gap:14px;
+      padding:10px 12px;border-radius:5px;
+      background:#0f0a12;border:1px solid #2a1f2e;border-left:3px solid #a855f7;}
+    .tech-war-contribution-big{font:800 26px/1 Impact,'Oswald','Arial Narrow',sans-serif;
+      color:#fde047;letter-spacing:.5px;font-variant-numeric:tabular-nums;
+      text-shadow:0 0 10px rgba(253,224,71,.4);min-width:120px;}
+    .tech-war-contribution-sub{flex:1;font-size:11px;color:#cbd5e1;line-height:1.5;}
+    .tech-war-contribution-meta{margin-top:3px;font-size:10px;color:#9ca3af;
+      letter-spacing:.5px;}
+
+    /* Score timeline SVG */
+    .tech-war-timeline-host{margin:4px 0 6px;border:1px solid #2a1f2e;
+      border-radius:4px;overflow:hidden;background:#08070b;}
+    .tech-war-timeline-svg{display:block;width:100%;height:140px;}
+    .tech-war-timeline-legend{display:flex;gap:14px;font-size:10px;
+      color:#9ca3af;letter-spacing:.5px;padding:2px 4px;}
+    .tech-war-timeline-legend .us{color:#34d399;font-weight:600;}
+    .tech-war-timeline-legend .them{color:#f87171;font-weight:600;}
+    .tech-war-timeline-legend .tgt{color:#fde047;font-style:italic;}
 
     /* ── SCOUT tab (v0.6.34) ─────────────────────────────────────────── */
     .tech-scout-form{display:flex;gap:6px;margin-top:8px;}
@@ -7982,19 +8333,103 @@
     host.appendChild(card);
   }
 
+  // ─── PREDICTED PICKS (v1.5.16) ─────────────────────────────────────────
+  // When there's an active war but no historical Quick Wins entries, fall
+  // back to the Scout tab's War Priority scoring (beatability 40% + speed
+  // 30% + availability 30%) so Quick Wins is never empty during a war.
+  // Reuses buildPriorityContext / getBeatabilityScore / getSpeedScore /
+  // getAvailabilityScore from the Scout side — no duplicated scoring.
+  //
+  // Per-row band + source attribution lets the user read why each pick
+  // landed where it did ("spy says Soft target", "FF says Matched", etc).
+  // When no real source has data on a target, band stays null and the row
+  // ranks by raw availability — still useful as "who's hittable right now".
+  const PREDICTED_PICKS_COUNT = 5;
+  function getPredictedPickInfo(memberId, myTotal) {
+    if (!(myTotal > 0)) return { band: null, source: null };
+    const spy = spyCache[memberId];
+    if (spy && !spy.error && !spy.noData
+        && typeof spy.total === 'number' && spy.total > 0) {
+      return { band: classifyBspBand(myTotal, spy.total), source: 'spy' };
+    }
+    if (settings.bspEnabled && bspSubscriptionActive() !== false) {
+      const bsp = bspCache[memberId];
+      if (bsp && !bsp.error && !bsp.noData
+          && typeof bsp.tbs === 'number' && bsp.tbs > 0) {
+        return { band: classifyBspBand(myTotal, bsp.tbs), source: 'BSP' };
+      }
+    }
+    if (settings.ffEnabled) {
+      const ff = ffCache[memberId];
+      if (ff && !ff.error && !ff.noData) {
+        if (typeof ff.bsEstimate === 'number' && ff.bsEstimate > 0) {
+          return { band: classifyBspBand(myTotal, ff.bsEstimate), source: 'FF' };
+        }
+        if (typeof ff.ff === 'number') {
+          let band = 'out-of-league';
+          if      (ff.ff <= 1.5) band = 'soft';
+          else if (ff.ff <= 2.5) band = 'matched';
+          else if (ff.ff <= 3.5) band = 'dangerous';
+          return { band: band, source: 'FF' };
+        }
+      }
+    }
+    return { band: null, source: null };
+  }
+  function computePredictedPicks(warFactionId, limit) {
+    if (!warFactionId) return [];
+    const roster = scoutData[warFactionId];
+    if (!roster || !Array.isArray(roster.members)) return [];
+    const cap = limit || PREDICTED_PICKS_COUNT;
+    const myId = meta.userId;
+    const members = roster.members.filter(function (m) { return m.id !== myId; });
+    if (members.length === 0) return [];
+    const memberIdSet = new Set(members.map(function (m) { return m.id; }));
+    const priorityCtx = buildPriorityContext(memberIdSet);
+    const myTotal = (meta.battleStats && meta.battleStats.total) || 0;
+    const scored = members.map(function (m) {
+      const oppStats = priorityCtx.get(m.id);
+      const beat  = getBeatabilityScore(m.id, oppStats, myTotal);
+      const speed = getSpeedScore(oppStats);
+      const avail = getAvailabilityScore(m);
+      const info  = getPredictedPickInfo(m.id, myTotal);
+      return {
+        id: m.id, name: m.name, level: m.level, member: m,
+        priority: beat * 0.40 + speed * 0.30 + avail * 0.30,
+        beat: beat, speed: speed, avail: avail,
+        band: info.band, source: info.source,
+      };
+    });
+    scored.sort(function (a, b) { return b.priority - a.priority; });
+    return scored.slice(0, cap);
+  }
+
   // ─── QUICK WINS PANEL (v0.6.60) ────────────────────────────────────────
   // Dashboard panel that surfaces opponents ranked by chain efficiency.
   // Click any row to drill into Opponent Intel; pin from there to add live
   // status tracking. This is the DISCOVERY tool — the Targets panel above
   // is the live-status tool. Two distinct jobs, two distinct panels.
   //
-  // Renders nothing when there's no usable signal (no outgoing fights
-  // yet, or no opponent passes the eligibility floor). Renders a thin-data
-  // hint when the user has SOME outgoing fights but no candidate passes
-  // the 3-fight floor — that's actionable information.
+  // v1.5.16 — During war with no historical entries, falls back to top-5
+  // Predicted Picks from the Scout tab's War Priority scoring. Renders
+  // nothing only when there's no war, no historical wins, AND no
+  // outgoing fight history at all.
   function renderQuickWins(host) {
     if (!meta.userId) return;
     const wins = computeQuickWins(8);
+    const war = meta.activeWarTarget;
+    // v1.5.16 — Predicted Picks fallback. When historical Quick Wins is
+    // empty during an active war, surface the top 5 enemy roster members
+    // by War Priority score (Scout tab's beat/speed/avail blend) instead
+    // of an empty state. Auto-roster-fetch in maybeRefreshActiveWar
+    // populates scoutData on war detection so this path is hot by the
+    // time the user opens Dashboard.
+    let predictedPicks = [];
+    let predictedFallback = false;
+    if (wins.length === 0 && war && war.factionId) {
+      predictedPicks = computePredictedPicks(war.factionId, PREDICTED_PICKS_COUNT);
+      predictedFallback = predictedPicks.length > 0;
+    }
     // Count any outgoing fights so the empty state can distinguish
     // "you've never attacked" (silent) from "you've attacked but no
     // opponent has enough samples yet" (thin-data hint).
@@ -8005,18 +8440,128 @@
         if (outgoingTotal >= 5) break;
       }
     }
-    if (wins.length === 0 && outgoingTotal === 0) return;  // silent
+    // No active war + no fights ever → stay silent. When a war IS active
+    // we always render so the empty-state guidance ("no history vs
+    // FACTION yet — head to Scout") surfaces even on fresh installs.
+    if (wins.length === 0 && !predictedFallback && outgoingTotal === 0 && !war) return;
 
     const sec = el('div', { class: 'tech-section tech-quickwins' });
+    const titleText = war
+      ? 'Quick Wins · vs ' + (war.factionName || 'current war')
+          + (predictedFallback ? ' (predicted)' : '')
+      : 'Quick Wins';
+    const displayCount = predictedFallback ? predictedPicks.length : wins.length;
+    const countWord = predictedFallback ? 'pick' : 'candidate';
     sec.appendChild(el('div', { class: 'tech-section-title tech-targets-title' },
-      el('span', {}, 'Quick Wins'),
+      el('span', {}, titleText),
       el('span', { class: 'tech-targets-count' },
-        wins.length + ' candidate' + (wins.length === 1 ? '' : 's')),
+        displayCount + ' ' + countWord + (displayCount === 1 ? '' : 's')),
     ));
 
-    if (wins.length === 0) {
+    if (wins.length === 0 && !predictedFallback) {
+      const hint = war
+        ? 'Fetching enemy roster for Predicted Picks… if this stays empty, the Scout tab\'s manual fetch will populate it.'
+        : 'Need 3+ outgoing fights against the same opponent (with timing data) to surface a candidate. Keep attacking; the list will fill in as patterns emerge.';
+      sec.appendChild(el('div', { class: 'tech-targets-hint' }, hint));
+      host.appendChild(sec);
+      return;
+    }
+
+    // v1.5.16 — Predicted Picks render path. Inlined so historical Quick
+    // Wins rendering below stays untouched. Each row shows the beatability
+    // band (when a source has data), current status with hospital/jail
+    // countdown when applicable, the raw priority score, and which source
+    // spoke. Click drills into Opponent Intel like historical rows.
+    if (predictedFallback) {
+      const VERDICT_CLASS_BY_BAND = {
+        'soft':          'verdict-fav',
+        'matched':       'verdict-neutral',
+        'dangerous':     'verdict-tank',
+        'out-of-league': 'verdict-danger',
+      };
+      // v1.5.24 — Roster freshness gate, mirroring the Scout tab. If the
+      // bulk fetch backing Predicted Picks is stale, the HIT badges
+      // can't be trusted (member may have entered hospital since the
+      // roster was last pulled). Auto-refresh during war keeps this
+      // from firing in steady state.
+      const ppRoster = war && war.factionId ? scoutData[war.factionId] : null;
+      const ppRosterStale = ppRoster && ppRoster.fetchedAt
+        && (nowSec() - ppRoster.fetchedAt) > ROSTER_STALE_SEC;
+      for (const p of predictedPicks) {
+        const m = p.member;
+        const state    = m.statusState || null;
+        const lastStat = m.lastActionStatus || null;
+        let dotClass = 'offline';
+        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') dotClass = 'locked';
+        else if (state === 'Traveling' || state === 'Abroad') dotClass = 'abroad';
+        else if (lastStat === 'Online') dotClass = 'online';
+        else if (lastStat === 'Idle')   dotClass = 'idle';
+        let stateBit = null;
+        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') {
+          const tag = state === 'Hospital' ? 'Hosp' : state === 'Jail' ? 'Jail' : 'Fed';
+          const cd  = fmtCountdown(m.statusUntil);
+          stateBit = cd ? (tag + ' ' + cd) : state;
+        } else if (state === 'Traveling' || state === 'Abroad') {
+          stateBit = state;
+        } else if (lastStat === 'Online') {
+          stateBit = '⚡ Online';
+        } else if (lastStat === 'Idle') {
+          stateBit = 'Idle';
+        }
+        const subBits = [];
+        if (p.band) subBits.push(BSP_BAND_LABELS[p.band] || p.band);
+        if (stateBit) subBits.push(stateBit);
+        subBits.push('pri ' + p.priority.toFixed(2));
+        if (p.source) subBits.push(p.source);
+
+        const nameDiv = el('div', { class: 'tech-target-name' }, p.name);
+        if (p.level != null) {
+          nameDiv.appendChild(el('span', { class: 'tech-level' }, 'L' + p.level));
+        }
+        // v1.5.17 — HIT badge on Predicted Picks rows. Same gate as the
+        // Targets queue and Scout tab (target Okay + self Okay + ≥25
+        // energy). stopPropagation keeps the row's drill-into-intel click
+        // from firing, so HIT → attack page and elsewhere on the row →
+        // Opponent Intel.
+        const canHit = canHitTarget(m) && !ppRosterStale;
+        if (canHit) {
+          const hitLink = el('a', {
+            class: 'tech-hit-badge',
+            href: 'https://www.torn.com/page.php?sid=attack&user2ID=' + p.id,
+            title: 'Attack ' + p.name + ' now (' + ATTACK_ENERGY_COST + ' energy)',
+          }, '⚡ HIT');
+          hitLink.addEventListener('click', function (e) { e.stopPropagation(); });
+          nameDiv.appendChild(hitLink);
+        }
+        const verdictClass = (p.band && VERDICT_CLASS_BY_BAND[p.band])
+          ? VERDICT_CLASS_BY_BAND[p.band]
+          : 'verdict-nohistory';
+        const row = el('div', {
+          class: 'tech-target-row ' + verdictClass + (canHit ? ' hittable' : ''),
+          title: 'Open Opponent Intel for ' + p.name
+            + '\nPriority: ' + p.priority.toFixed(2)
+            + '\n  Beatability: ' + p.beat.toFixed(2)
+            + '\n  Speed:       ' + p.speed.toFixed(2)
+            + '\n  Availability:' + p.avail.toFixed(2),
+        },
+          el('span', { class: 'tech-target-dot ' + dotClass }),
+          el('div', { class: 'tech-target-main' },
+            nameDiv,
+            el('div', { class: 'tech-target-sub' },
+              el('span', { class: 'tech-target-meta' }, subBits.join(' · ')),
+            ),
+          ),
+        );
+        row.addEventListener('click', function () {
+          openOpponentDrill(p.id, p.name);
+        });
+        sec.appendChild(row);
+      }
       sec.appendChild(el('div', { class: 'tech-targets-hint' },
-        'Need 3+ outgoing fights against the same opponent (with timing data) to surface a candidate. Keep attacking; the list will fill in as patterns emerge.'));
+        'Top ' + predictedPicks.length + ' picks from War Priority scoring '
+          + '(beatability + speed + availability). No fight history vs '
+          + (war.factionName || 'this faction')
+          + ' yet — historical Quick Wins take over once you build a pattern.'));
       host.appendChild(sec);
       return;
     }
@@ -8068,7 +8613,10 @@
     }
 
     sec.appendChild(el('div', { class: 'tech-targets-hint' },
-      'Ranked from your fight history. Click a row to drill into Opponent Intel; pin from there to add live status tracking.'));
+      war
+        ? 'Ranked from your fight history vs ' + (war.factionName || 'this faction')
+          + '. Click a row to drill into Opponent Intel; pin from there to add live status tracking.'
+        : 'Ranked from your fight history. Click a row to drill into Opponent Intel; pin from there to add live status tracking.'));
 
     host.appendChild(sec);
   }
@@ -8284,6 +8832,14 @@
         host.appendChild(el('div', { class: 'tech-warscore' + (sc.isPostWar ? ' postwar' : '') },
           el('div', { class: 'tech-warscore-title' }, titleText,
             subtitle ? el('span', { class: 'tech-warscore-ended' }, ' · ' + subtitle) : null,
+          ),
+          // v1.5.20 — hero stat: respect you've personally added to the
+          // war score. Uses respectGained (positive only) not respectNet,
+          // because losses don't subtract from war score in Torn — the
+          // net metric muddied "what did I put on the board."
+          el('div', { class: 'tech-warscore-hero' },
+            el('div', { class: 'big' }, fmtRespect(sc.respectGained)),
+            el('div', { class: 'lbl' }, 'Score Added'),
           ),
           el('div', { class: 'tech-warscore-grid' },
             el('div', { class: 'tech-warscore-cell ' + winLossClass },
@@ -10625,6 +11181,318 @@
     ));
   }
 
+  // ─── TAB: WAR TRACKER (v1.5.21) ────────────────────────────────────────
+  // Centralised war command view. Renders only when a ranked war is
+  // active or the last-war snapshot is still within LAST_WAR_TTL_SEC.
+  // Sections (top to bottom):
+  //   1. Scoreboard hero — our score / target, enemy score / target, lead
+  //   2. Win projection — points/hour pace + ETA for both factions
+  //   3. Personal contribution — your war respect + % of faction total
+  //   4. Score timeline — SVG line chart of both scores over time
+  //   5. Recent war hits — last 12 ranked_war fights from your log
+  function renderWarTrackerTab(host) {
+    if (!settings.apiKey) return renderNoKey(host);
+    if (!meta.userId)     return renderWaiting(host, 'Identifying account…');
+
+    // Kick a war refresh (throttled internally to 5 min) so the tab
+    // shows fresh scores when reopened — drives the timeline snapshot
+    // append on the next successful fetch.
+    maybeRefreshActiveWar();
+
+    const war = meta.activeWarTarget || meta.lastWarTarget;
+    if (!war) {
+      // Visibility filter should keep us out of here, but render a
+      // graceful placeholder if we land here anyway.
+      host.appendChild(el('div', { class: 'tech-empty' },
+        el('strong', {}, 'No active or recent war'),
+        'TECH will open this tab automatically the moment a ranked war begins.',
+      ));
+      return;
+    }
+
+    const isPostWar = !meta.activeWarTarget && !!meta.lastWarTarget;
+    // v1.5.23 — Torn schedules ranked wars in advance: war.start is in the
+    // future during the prep window (matchup locked, no hits possible
+    // yet). Detect that state so we can render a countdown banner and
+    // skip sections that are meaningless until the war actually fires.
+    const isPreWar = !isPostWar && war.warStart && war.warStart > nowSec();
+    const ourScore = war.ourScore || 0;
+    const enemyScore = war.enemyScore || 0;
+    const target = war.targetScore || 0;
+    const lead = ourScore - enemyScore;
+    const ourFractionOfTarget = target > 0 ? Math.min(1, ourScore / target) : 0;
+    const enemyFractionOfTarget = target > 0 ? Math.min(1, enemyScore / target) : 0;
+
+    // Banner — pre-war / active / post-war state. Clear any prior prep
+    // ticker so a re-render (poll, tab open, etc.) doesn't stack callbacks.
+    if (warPrewarTickerInterval) {
+      clearInterval(warPrewarTickerInterval);
+      warPrewarTickerInterval = null;
+    }
+    let bannerCls = 'tech-war-banner';
+    if (isPostWar) bannerCls += ' postwar';
+    else if (isPreWar) bannerCls += ' prewar';
+
+    function fmtPreWarCountdown(sec) {
+      if (sec <= 0) return 'now';
+      const days = Math.floor(sec / 86400);
+      const hours = Math.floor((sec % 86400) / 3600);
+      const mins = Math.floor((sec % 3600) / 60);
+      const secs = sec % 60;
+      if (days > 0) return days + 'd ' + hours + 'h ' + mins + 'm';
+      if (hours > 0) return hours + 'h ' + mins + 'm';
+      if (mins > 0) return mins + 'm ' + secs + 's';
+      return secs + 's';
+    }
+
+    let bannerTitleChildren;
+    if (isPostWar) {
+      bannerTitleChildren = ['War ended'];
+    } else if (isPreWar) {
+      const initial = fmtPreWarCountdown(war.warStart - nowSec());
+      bannerTitleChildren = [
+        '⏳ War starts in ',
+        el('span', {
+          class: 'tech-war-countdown',
+          'data-target': String(war.warStart),
+        }, initial),
+      ];
+    } else {
+      bannerTitleChildren = ['⚔ Ranked war in progress'];
+    }
+
+    const banner = el('div', { class: bannerCls },
+      el('div', { class: 'tech-war-banner-title' }, ...bannerTitleChildren),
+      el('div', { class: 'tech-war-banner-sub' },
+        (war.ourFactionName || 'You') + ' vs ' + (war.factionName || 'Enemy'),
+        isPostWar && war.warEnd
+          ? el('span', {}, ' · ended ' + fmtAgo(war.warEnd))
+          : null,
+        isPreWar && war.warStart
+          ? el('span', {}, ' · starts ' + new Date(war.warStart * 1000).toLocaleString())
+          : null,
+      ),
+    );
+    host.appendChild(banner);
+
+    // Live countdown — every second, rewrite the span text in place. When
+    // the countdown crosses zero we cancel + renderActive() so the banner
+    // auto-flips from prewar to active state without waiting for the next
+    // poll cycle (~5 min).
+    if (isPreWar) {
+      const countdownEl = banner.querySelector('.tech-war-countdown');
+      const targetTs = war.warStart;
+      warPrewarTickerInterval = setInterval(function () {
+        if (!countdownEl || !countdownEl.isConnected) {
+          clearInterval(warPrewarTickerInterval);
+          warPrewarTickerInterval = null;
+          return;
+        }
+        const remaining = targetTs - nowSec();
+        if (remaining <= 0) {
+          clearInterval(warPrewarTickerInterval);
+          warPrewarTickerInterval = null;
+          countdownEl.textContent = 'now!';
+          // Force a refetch so meta.activeWarTarget gets the live scores
+          // immediately rather than waiting the throttle out.
+          maybeRefreshActiveWar(true);
+          renderActive();
+          return;
+        }
+        countdownEl.textContent = fmtPreWarCountdown(remaining);
+      }, 1000);
+    }
+
+    // ── 1. Scoreboard hero ───────────────────────────────────────────────
+    function scoreColumn(label, score, isUs) {
+      const klass = isUs ? 'us' : 'them';
+      const pct = target > 0 ? Math.min(100, (score / target) * 100) : 0;
+      return el('div', { class: 'tech-war-scoreboard-col ' + klass },
+        el('div', { class: 'lbl' }, label),
+        el('div', { class: 'big' }, score.toLocaleString()),
+        target > 0
+          ? el('div', { class: 'tech-war-scoreboard-bar' },
+              el('div', { class: 'fill', style: { width: pct.toFixed(1) + '%' } }),
+            )
+          : null,
+        target > 0
+          ? el('div', { class: 'sub' },
+              pct.toFixed(1) + '% of ' + target.toLocaleString())
+          : el('div', { class: 'sub' }, 'Target unknown'),
+      );
+    }
+    const leadClass = lead > 0 ? 'good' : (lead < 0 ? 'bad' : '');
+    const leadText = isPreWar ? 'NOT YET STARTED'
+                  : lead === 0 ? 'TIED'
+                  : (lead > 0 ? 'LEADING by ' : 'TRAILING by ') + Math.abs(lead).toLocaleString();
+    host.appendChild(el('div', { class: 'tech-war-scoreboard' },
+      scoreColumn(war.ourFactionName || 'You', ourScore, true),
+      el('div', { class: 'tech-war-scoreboard-vs ' + leadClass },
+        el('div', { class: 'sep' }, 'VS'),
+        el('div', { class: 'lead' }, leadText),
+      ),
+      scoreColumn(war.factionName || 'Enemy', enemyScore, false),
+    ));
+
+    // v1.5.23 — Sections below this point (projection / contribution /
+    // timeline / recent hits) are meaningless before the war actually
+    // fires. Render a single "what's next" hint instead so the tab
+    // doesn't look broken with a parade of empty cards. Once the
+    // countdown ticker crosses zero it triggers a renderActive() and
+    // these sections show up automatically.
+    if (isPreWar) {
+      host.appendChild(el('div', { class: 'tech-section' },
+        el('div', { class: 'tech-section-title' }, 'What to expect'),
+        el('div', { class: 'tech-war-projection' },
+          'Win projection, your contribution, the score timeline, and recent war hits will populate once the war starts. The countdown above ticks live — TECH auto-refreshes the moment the clock hits zero.',
+        ),
+      ));
+      return;
+    }
+
+    // ── 2. Win projection ────────────────────────────────────────────────
+    // Pace = (latest score - earliest score) / elapsed hours over the
+    // timeline samples. ETA to target uses the current pace. Only renders
+    // when we have at least 2 samples AND a known target.
+    const hist = warScoreHistory[String(war.warId)];
+    const samples = hist && Array.isArray(hist.samples) ? hist.samples : [];
+    if (samples.length >= 2 && target > 0 && !isPostWar) {
+      const first = samples[0];
+      const last = samples[samples.length - 1];
+      const elapsedHours = Math.max(1 / 60, (last.ts - first.ts) / 3600);
+      const ourPace = Math.max(0, (last.ourScore - first.ourScore) / elapsedHours);
+      const enemyPace = Math.max(0, (last.enemyScore - first.enemyScore) / elapsedHours);
+      function fmtHours(hours) {
+        if (!isFinite(hours) || hours < 0) return '—';
+        if (hours < 1)  return Math.max(1, Math.round(hours * 60)) + 'm';
+        if (hours < 24) return Math.floor(hours) + 'h ' + Math.round((hours % 1) * 60) + 'm';
+        return Math.floor(hours / 24) + 'd ' + Math.round(hours % 24) + 'h';
+      }
+      function fmtEta(score, pace) {
+        if (pace <= 0.01) return '—';
+        const remaining = target - score;
+        if (remaining <= 0) return 'won';
+        return fmtHours(remaining / pace);
+      }
+      let projection;
+      if (ourPace > 0 && enemyPace > 0) {
+        const ourEta = (target - ourScore) / ourPace;
+        const enemyEta = (target - enemyScore) / enemyPace;
+        projection = ourEta < enemyEta
+          ? { winner: war.ourFactionName || 'You', margin: enemyEta - ourEta, klass: 'good' }
+          : { winner: war.factionName || 'Enemy', margin: ourEta - enemyEta, klass: 'bad' };
+      }
+      host.appendChild(el('div', { class: 'tech-section' },
+        el('div', { class: 'tech-section-title' }, 'Win projection'),
+        projection
+          ? el('div', { class: 'tech-war-projection ' + projection.klass },
+              el('strong', {}, projection.winner),
+              ' projected to win by ',
+              el('strong', {}, fmtHours(projection.margin) + ' margin'),
+              ' at current pace',
+            )
+          : el('div', { class: 'hint' }, 'Not enough pace data on both sides to project yet.'),
+        el('div', { class: 'tech-war-projection-grid' },
+          el('div', { class: 'tech-war-projection-row us' },
+            el('span', { class: 'who' }, war.ourFactionName || 'You'),
+            el('span', { class: 'pace' }, Math.round(ourPace).toLocaleString() + ' / hr'),
+            el('span', { class: 'eta' }, 'ETA ' + fmtEta(ourScore, ourPace)),
+          ),
+          el('div', { class: 'tech-war-projection-row them' },
+            el('span', { class: 'who' }, war.factionName || 'Enemy'),
+            el('span', { class: 'pace' }, Math.round(enemyPace).toLocaleString() + ' / hr'),
+            el('span', { class: 'eta' }, 'ETA ' + fmtEta(enemyScore, enemyPace)),
+          ),
+        ),
+      ));
+    } else if (!isPostWar && target > 0) {
+      host.appendChild(el('div', { class: 'tech-section' },
+        el('div', { class: 'tech-section-title' }, 'Win projection'),
+        el('div', { class: 'hint' },
+          'Waiting for at least 2 score snapshots. Polls every 5 minutes — projection appears once we have pace data.'),
+      ));
+    }
+
+    // ── 3. Your contribution ─────────────────────────────────────────────
+    const warViews = fightViewsInWindow('war');
+    const warOverview = computeOverview(warViews);
+    const yourContribution = warOverview.respectGained || 0;
+    const sharePct = ourScore > 0 ? Math.min(100, (yourContribution / ourScore) * 100) : 0;
+    host.appendChild(el('div', { class: 'tech-section' },
+      el('div', { class: 'tech-section-title' }, 'Your contribution'),
+      el('div', { class: 'tech-war-contribution' },
+        el('div', { class: 'tech-war-contribution-big' },
+          fmtRespect(yourContribution)),
+        el('div', { class: 'tech-war-contribution-sub' },
+          ourScore > 0
+            ? (sharePct.toFixed(1) + '% of ' + (war.ourFactionName || 'faction') + ' score')
+            : 'Faction score not yet known',
+          el('div', { class: 'tech-war-contribution-meta' },
+            warOverview.wins + ' / ' + warOverview.losses + ' · '
+              + warOverview.hospThem + ' hosp\'d',
+          ),
+        ),
+      ),
+    ));
+
+    // ── 4. Score timeline ────────────────────────────────────────────────
+    if (samples.length >= 2) {
+      const W = 360, H = 140, PAD = 20;
+      const first = samples[0];
+      const last = samples[samples.length - 1];
+      const tsMin = first.ts;
+      const tsMax = (last.ts > tsMin ? last.ts : tsMin + 60);
+      const tsRange = tsMax - tsMin;
+      let yMax = Math.max(ourScore, enemyScore, target || 0, 1);
+      yMax = yMax * 1.05;
+      function xCoord(ts) {
+        return PAD + ((ts - tsMin) / tsRange) * (W - 2 * PAD);
+      }
+      function yCoord(score) {
+        return (H - PAD) - (score / yMax) * (H - 2 * PAD);
+      }
+      function polyPoints(field) {
+        return samples.map(s => xCoord(s.ts) + ',' + yCoord(s[field])).join(' ');
+      }
+      const targetY = target > 0 ? yCoord(target) : null;
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" '
+        + 'viewBox="0 0 ' + W + ' ' + H + '" '
+        + 'class="tech-war-timeline-svg" preserveAspectRatio="none">'
+        + '<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#08070b"/>'
+        + (targetY != null
+            ? '<line x1="' + PAD + '" y1="' + targetY.toFixed(1) + '" '
+              + 'x2="' + (W - PAD) + '" y2="' + targetY.toFixed(1) + '" '
+              + 'stroke="#fde047" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>'
+              + '<text x="' + (W - PAD) + '" y="' + (targetY - 4).toFixed(1) + '" '
+              + 'fill="#fde047" font-size="9" text-anchor="end">target</text>'
+            : '')
+        + '<polyline points="' + polyPoints('ourScore') + '" '
+        + 'fill="none" stroke="#34d399" stroke-width="2"/>'
+        + '<polyline points="' + polyPoints('enemyScore') + '" '
+        + 'fill="none" stroke="#f87171" stroke-width="2"/>'
+        + '</svg>';
+      const card = el('div', { class: 'tech-section' });
+      card.appendChild(el('div', { class: 'tech-section-title' }, 'Score timeline'));
+      card.appendChild(el('div', { class: 'tech-war-timeline-host', html: svg }));
+      card.appendChild(el('div', { class: 'tech-war-timeline-legend' },
+        el('span', { class: 'us' }, '— ' + (war.ourFactionName || 'You')),
+        el('span', { class: 'them' }, '— ' + (war.factionName || 'Enemy')),
+        target > 0 ? el('span', { class: 'tgt' }, '· · target') : null,
+      ));
+      host.appendChild(card);
+    }
+
+    // ── 5. Recent war hits ───────────────────────────────────────────────
+    const recent = warViews.slice(0, 12);
+    if (recent.length > 0) {
+      const sec = el('div', { class: 'tech-section' },
+        el('div', { class: 'tech-section-title' }, 'Recent war hits'),
+      );
+      for (const v of recent) sec.appendChild(renderFightRow(v, { compact: true }));
+      host.appendChild(sec);
+    }
+  }
+
   // ─── TAB: TEST (Battle Simulator) ───────────────────────────────────────
   function renderTestTab(host) {
     const stats = meta.battleStats || {};
@@ -11764,6 +12632,15 @@
         ));
       }
 
+      // v1.5.24 — Roster freshness gate. If the bulk fetch landed more
+      // than ROSTER_STALE_SEC ago, a member's captured "Okay" state may
+      // not reflect reality (they could have entered hospital since).
+      // Suppress the HIT badge in that window so we don't surface a
+      // bogus attack link. Auto-refresh keeps this from triggering
+      // during war; only fires on stale non-war scouts.
+      const rosterStale = roster.fetchedAt
+        && (nowSec() - roster.fetchedAt) > ROSTER_STALE_SEC;
+
       // Member rows
       for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
         const row = rows[rowIndex];
@@ -11946,7 +12823,7 @@
         // ≥25 energy), same stopPropagation so HIT opens the attack page
         // while clicking the rest of the row drills into Opponent Intel.
         let scoutHitLink = null;
-        if (canHitTarget(m)) {
+        if (canHitTarget(m) && !rosterStale) {
           scoutHitLink = el('a', {
             class: 'tech-hit-badge',
             href: 'https://www.torn.com/page.php?sid=attack&user2ID=' + m.id,
@@ -12071,9 +12948,36 @@
     { key: 'dashboard', label: 'Dashboard', render: renderDashboard },
     { key: 'fights',    label: 'Fights',    render: renderFightsTab  },
     { key: 'scout',     label: 'Scout',     render: renderScoutTab   },
+    { key: 'war',       label: 'War',       render: renderWarTrackerTab,
+      // v1.5.21 — visible only when there's an active war or a last-war
+      // snapshot still within the 7-day TTL. Keeps the chrome quiet for
+      // users not in a war.
+      visible: () => !!(meta.activeWarTarget || meta.lastWarTarget) },
     { key: 'test',      label: 'TEST',      render: renderTestTab    },
     { key: 'settings',  label: 'Settings',  render: renderSettings   },
   ];
+
+  function getVisibleTabs() {
+    return TABS.filter(t => !t.visible || t.visible());
+  }
+
+  function rebuildTabStrip() {
+    if (!panelEl) return;
+    const tabsBar = panelEl.querySelector('#tech-tabs-bar');
+    if (!tabsBar) return;
+    tabsBar.innerHTML = '';
+    for (const t of getVisibleTabs()) {
+      tabsBar.appendChild(el('div', {
+        class: 'tech-tab' + (settings.activeTab === t.key ? ' active' : ''),
+        'on:click': () => {
+          currentDrill = null;
+          settings.activeTab = t.key;
+          store('settings', settings);
+          renderActive();
+        },
+      }, t.label));
+    }
+  }
 
   function createPanel() {
     if (panelEl) return panelEl;
@@ -12102,19 +13006,9 @@
     );
     panelEl.appendChild(header);
 
-    const tabsBar = el('div', { class: 'tech-tabs' });
-    for (const t of TABS) {
-      tabsBar.appendChild(el('div', {
-        class: 'tech-tab' + (settings.activeTab === t.key ? ' active' : ''),
-        'on:click': () => {
-          currentDrill = null;
-          settings.activeTab = t.key;
-          store('settings', settings);
-          renderActive();
-        },
-      }, t.label));
-    }
+    const tabsBar = el('div', { class: 'tech-tabs', id: 'tech-tabs-bar' });
     panelEl.appendChild(tabsBar);
+    rebuildTabStrip();
 
     contentEl = el('div', { class: 'tech-content' });
     panelEl.appendChild(contentEl);
@@ -12204,11 +13098,16 @@
 
   function renderActive() {
     if (!panelEl || !contentEl) return;
-    // Refresh tab strip active state
-    const tabs = panelEl.querySelectorAll('.tech-tab');
-    tabs.forEach((node, i) => {
-      node.classList.toggle('active', TABS[i].key === settings.activeTab);
-    });
+    // v1.5.21 — resolve the active tab BEFORE rebuilding the strip so
+    // the highlighted tab matches what we're about to render. Handles
+    // the active-tab-vanished case (e.g. user on War tab when the war
+    // ends + TTL elapses): falls back to Dashboard cleanly.
+    const visibleTabs = getVisibleTabs();
+    if (!visibleTabs.find(t => t.key === settings.activeTab)) {
+      settings.activeTab = visibleTabs[0].key;
+      store('settings', settings);
+    }
+    rebuildTabStrip();
     contentEl.innerHTML = '';
     try {
       if (currentDrill && currentDrill.kind === 'opponent') {
@@ -12220,7 +13119,7 @@
         // visible from every tab. The renderer is a no-op when the URL
         // doesn't name an opponent, so non-Torn-player pages stay clean.
         renderActivePageBanner(contentEl);
-        const tab = TABS.find(t => t.key === settings.activeTab) || TABS[0];
+        const tab = visibleTabs.find(t => t.key === settings.activeTab) || visibleTabs[0];
         tab.render(contentEl);
       }
     } catch (e) {
@@ -12568,6 +13467,11 @@
     // watcher can run unconditionally — toggling Settings doesn't need
     // to start/stop the interval.
     startChainWatcher();
+
+    // v1.5.24 — Background war-target roster refresher. Gated internally
+    // on having an active war + cached roster, so unconditionally
+    // starting it is a no-op during peacetime.
+    startWarRosterWatcher();
   }
 
   if (document.readyState === 'loading') {
