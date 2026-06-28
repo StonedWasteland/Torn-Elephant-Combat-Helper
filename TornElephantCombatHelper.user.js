@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         TECH — Torn Elephant Combat Helper
 // @namespace    https://torn.com
-// @version      1.5.24
+// @version      1.5.26
 // @description  TECH (Torn Elephant Combat Helper) — passive fight-log capture and a personal combat dashboard. Your own data, your own conclusions. Sibling to TEEM. Designed to run alongside TornTools.
 // @author       John Haloguy
 // @icon         https://raw.githubusercontent.com/StonedWasteland/Torn-Elephant-Combat-Helper/main/assets/tech-mascot.png
@@ -228,7 +228,7 @@
   const SCRIPT_KEY        = 'tech_';
   const SCRIPT_NAME       = 'TECH';
   const SCRIPT_LONG_NAME  = 'Torn Elephant Combat Helper';
-  const SCRIPT_VERSION    = '1.5.24';
+  const SCRIPT_VERSION    = '1.5.26';
 
   // Full TECH mascot artwork (by Wasteland, the script author) hosted in
   // the Torn-Elephant-Combat-Helper GitHub repo under /assets/. Loaded over
@@ -1002,6 +1002,12 @@
   // Started in init() and runs unconditionally — gated internally on
   // having an active war + cached roster.
   let warRosterRefreshInterval = null;
+  // v1.5.25 — Re-render trigger that catches lockup expirations between
+  // auto-refresh cycles. Without this, a target whose hospital countdown
+  // ticks past zero locally still wouldn't get the HIT badge until the
+  // next 60s roster refresh — too slow when the user is staring at the
+  // Dashboard waiting to chain.
+  let lockupTickInterval = null;
 
   // fights: { [code]: rawFightObject } — raw shape preserved so we can recompute
   // derived fields if our normalisation logic changes later.
@@ -2442,6 +2448,26 @@
     if (warRosterRefreshInterval) return;
     warRosterRefreshInterval = setInterval(maybeRefreshWarRoster, WAR_ROSTER_REFRESH_SEC * 1000);
     maybeRefreshWarRoster();   // fire once immediately so the user doesn't wait 60s on first open
+  }
+
+  // v1.5.25 — Lockup-expiry tick. Every 10s, check whether any cached
+  // status lockup has expired locally; if so, re-render the active
+  // panel so the HIT badge can appear without waiting on the 60s roster
+  // refresh. anyLockupExpiredLocally() gates the render — when nothing
+  // is stale (peacetime, no pinned targets) the ticker is effectively
+  // free. Only renders Dashboard / Scout (the two surfaces showing HIT
+  // badges) so we don't churn TEST or Settings.
+  const LOCKUP_TICK_MS = 10000;
+  function startLockupTick() {
+    if (lockupTickInterval) return;
+    lockupTickInterval = setInterval(function () {
+      if (!panelEl || !contentEl) return;
+      if (currentDrill) return;
+      const tab = settings.activeTab;
+      if (tab !== 'dashboard' && tab !== 'scout') return;
+      if (!anyLockupExpiredLocally()) return;
+      renderActive();
+    }, LOCKUP_TICK_MS);
   }
 
   // ─── TORNSTATS SPY (v0.6.52) ────────────────────────────────────────────
@@ -3924,8 +3950,26 @@
   // must hold: target is Okay (not hospitalized/jailed/abroad), I'm Okay,
   // and I have at least one standard attack worth of energy. Returns false
   // when self-state hasn't loaded yet (cautious default).
+  // v1.5.25 — Normalise a status snapshot to its effective state. When
+  // statusUntil has passed locally (Torn-side they're out of hospital /
+  // jail / federal but our cached statusState hasn't been refreshed yet),
+  // treat the target as 'Okay'. Without this, the HIT badge stays
+  // suppressed for up to one auto-refresh cycle (60s) after a lockup
+  // expires — long enough that the user gives up waiting and switches
+  // tabs to confirm.
+  function effectiveStatusState(obj) {
+    if (!obj) return null;
+    const s = obj.statusState;
+    if ((s === 'Hospital' || s === 'Jail' || s === 'Federal')
+        && obj.statusUntil && obj.statusUntil <= nowSec()) {
+      return 'Okay';
+    }
+    return s;
+  }
+
   function canHitTarget(s) {
-    if (!s || s.statusState !== 'Okay') return false;
+    if (!s) return false;
+    if (effectiveStatusState(s) !== 'Okay') return false;
     if (!meta.energy || meta.energy.current == null) return false;
     if (meta.energy.current < ATTACK_ENERGY_COST) return false;
     // selfStatusState is null until the first fetchSelfState completes.
@@ -3933,6 +3977,35 @@
     // badge entirely — by the time the user clicks they'll know either way.
     if (meta.selfStatusState && meta.selfStatusState !== 'Okay') return false;
     return true;
+  }
+
+  // v1.5.25 — Lightweight detector for "someone's cached lockup has
+  // expired but the auto-refresh hasn't caught it yet." Used to gate
+  // the periodic re-render ticker so we don't churn cycles when
+  // nothing's about to flip.
+  function anyLockupExpiredLocally() {
+    const now = nowSec();
+    function check(obj) {
+      if (!obj) return false;
+      const s = obj.statusState;
+      return (s === 'Hospital' || s === 'Jail' || s === 'Federal')
+          && obj.statusUntil && obj.statusUntil <= now;
+    }
+    if (Array.isArray(settings.targetIds)) {
+      for (const id of settings.targetIds) {
+        if (check(targetStatus[id])) return true;
+      }
+    }
+    const war = meta.activeWarTarget;
+    if (war && war.factionId) {
+      const roster = scoutData[war.factionId];
+      if (roster && Array.isArray(roster.members)) {
+        for (const m of roster.members) {
+          if (check(m)) return true;
+        }
+      }
+    }
+    return false;
   }
 
   // Refresh some or all pinned targets. `opts.ids` limits to a subset (used
@@ -8142,14 +8215,20 @@
       const verdictKey   = verdict ? verdict.key   : 'nohistory';
       const verdictLabel = verdict ? verdict.label : 'NO HIST';
 
+      // v1.5.25 — Honor effective state. When statusUntil has passed,
+      // treat the target as Okay for dot color, state text, and the
+      // HIT-badge gate alike. Without this the row shows "Hospital" +
+      // HIT badge side-by-side — confusing.
+      const effState = effectiveStatusState(s) || state;
+
       // Status dot priority: locked > abroad > online > idle > offline.
       let dotClass = 'offline';
-      if (state === 'Hospital' || state === 'Jail' || state === 'Federal') dotClass = 'locked';
-      else if (state === 'Traveling' || state === 'Abroad') dotClass = 'abroad';
+      if (effState === 'Hospital' || effState === 'Jail' || effState === 'Federal') dotClass = 'locked';
+      else if (effState === 'Traveling' || effState === 'Abroad') dotClass = 'abroad';
       else if (lastStat === 'Online') dotClass = 'online';
       else if (lastStat === 'Idle')   dotClass = 'idle';
 
-      const dotTitle = (state && state !== 'Okay' ? state + ' · ' : '')
+      const dotTitle = (effState && effState !== 'Okay' ? effState + ' · ' : '')
                      + (lastStat || 'Unknown')
                      + (lastTs ? ' (' + fmtAgo(lastTs) + ')' : '');
 
@@ -8157,12 +8236,12 @@
       // instead of the bare state label. We rebuild on every render +
       // poll, so accuracy is ~poll cadence (60s) — fine for chain prep.
       let stateBit = null;
-      if (state === 'Hospital' || state === 'Jail' || state === 'Federal') {
+      if (effState === 'Hospital' || effState === 'Jail' || effState === 'Federal') {
         const cd = fmtCountdown(s.statusUntil);
-        const tag = state === 'Hospital' ? 'Hosp' : state === 'Jail' ? 'Jail' : 'Fed';
-        stateBit = cd ? (tag + ' ' + cd) : state;
-      } else if (state === 'Traveling' || state === 'Abroad') {
-        stateBit = state;
+        const tag = effState === 'Hospital' ? 'Hosp' : effState === 'Jail' ? 'Jail' : 'Fed';
+        stateBit = cd ? (tag + ' ' + cd) : effState;
+      } else if (effState === 'Traveling' || effState === 'Abroad') {
+        stateBit = effState;
       }
 
       const subBits = [];
@@ -8491,18 +8570,21 @@
         const m = p.member;
         const state    = m.statusState || null;
         const lastStat = m.lastActionStatus || null;
+        // v1.5.25 — Honor effective state so an expired-locally lockup
+        // doesn't keep showing "Hospital" alongside the HIT badge.
+        const effState = effectiveStatusState(m) || state;
         let dotClass = 'offline';
-        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') dotClass = 'locked';
-        else if (state === 'Traveling' || state === 'Abroad') dotClass = 'abroad';
+        if (effState === 'Hospital' || effState === 'Jail' || effState === 'Federal') dotClass = 'locked';
+        else if (effState === 'Traveling' || effState === 'Abroad') dotClass = 'abroad';
         else if (lastStat === 'Online') dotClass = 'online';
         else if (lastStat === 'Idle')   dotClass = 'idle';
         let stateBit = null;
-        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') {
-          const tag = state === 'Hospital' ? 'Hosp' : state === 'Jail' ? 'Jail' : 'Fed';
+        if (effState === 'Hospital' || effState === 'Jail' || effState === 'Federal') {
+          const tag = effState === 'Hospital' ? 'Hosp' : effState === 'Jail' ? 'Jail' : 'Fed';
           const cd  = fmtCountdown(m.statusUntil);
-          stateBit = cd ? (tag + ' ' + cd) : state;
-        } else if (state === 'Traveling' || state === 'Abroad') {
-          stateBit = state;
+          stateBit = cd ? (tag + ' ' + cd) : effState;
+        } else if (effState === 'Traveling' || effState === 'Abroad') {
+          stateBit = effState;
         } else if (lastStat === 'Online') {
           stateBit = '⚡ Online';
         } else if (lastStat === 'Idle') {
@@ -11379,16 +11461,24 @@
         const ourEta = (target - ourScore) / ourPace;
         const enemyEta = (target - enemyScore) / enemyPace;
         projection = ourEta < enemyEta
-          ? { winner: war.ourFactionName || 'You', margin: enemyEta - ourEta, klass: 'good' }
-          : { winner: war.factionName || 'Enemy', margin: ourEta - enemyEta, klass: 'bad' };
+          ? { winner: war.ourFactionName || 'You',  winnerEta: ourEta,
+              margin: enemyEta - ourEta, klass: 'good' }
+          : { winner: war.factionName || 'Enemy', winnerEta: enemyEta,
+              margin: ourEta - enemyEta, klass: 'bad' };
       }
       host.appendChild(el('div', { class: 'tech-section' },
         el('div', { class: 'tech-section-title' }, 'Win projection'),
         projection
+          // v1.5.26 — Headline shows just the WINNER'S ETA (when they
+          // hit the target). Previous "projected to win by 2d 5h margin"
+          // read as "it'll take 2d 5h to win" — confusing when our own
+          // ETA is 3h. Margin dropped per user: both sides can't win,
+          // so the gap between projected finishes is irrelevant once
+          // we know who wins and when.
           ? el('div', { class: 'tech-war-projection ' + projection.klass },
               el('strong', {}, projection.winner),
-              ' projected to win by ',
-              el('strong', {}, fmtHours(projection.margin) + ' margin'),
+              ' projected to win in ',
+              el('strong', {}, fmtHours(projection.winnerEta)),
               ' at current pace',
             )
           : el('div', { class: 'hint' }, 'Not enough pace data on both sides to project yet.'),
@@ -12663,28 +12753,31 @@
         // 1s ticker can rewrite the label in-place without a full rerender.
         const state = m.statusState || null;
         const lastStat = m.lastActionStatus || null;
+        // v1.5.25 — Honor effective state so a locally-expired lockup
+        // doesn't keep painting the row as "Hospital" + HIT badge.
+        const effState = effectiveStatusState(m) || state;
         let dotClass = 'offline';
-        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') dotClass = 'locked';
-        else if (state === 'Traveling' || state === 'Abroad') dotClass = 'abroad';
+        if (effState === 'Hospital' || effState === 'Jail' || effState === 'Federal') dotClass = 'locked';
+        else if (effState === 'Traveling' || effState === 'Abroad') dotClass = 'abroad';
         else if (lastStat === 'Online') dotClass = 'online';
         else if (lastStat === 'Idle')   dotClass = 'idle';
-        const dotTitle = (state && state !== 'Okay' ? state + ' · ' : '')
+        const dotTitle = (effState && effState !== 'Okay' ? effState + ' · ' : '')
                        + (lastStat || 'Unknown')
                        + (m.lastActionTs ? ' (' + fmtAgo(m.lastActionTs) + ')' : '');
         let statusEl = null;
-        if (state === 'Hospital' || state === 'Jail' || state === 'Federal') {
-          const tag = state === 'Hospital' ? 'Hosp' : state === 'Jail' ? 'Jail' : 'Fed';
+        if (effState === 'Hospital' || effState === 'Jail' || effState === 'Federal') {
+          const tag = effState === 'Hospital' ? 'Hosp' : effState === 'Jail' ? 'Jail' : 'Fed';
           const cd = fmtCountdown(m.statusUntil);
           statusEl = el('span', {
             class: 'tech-scout-countdown',
             'data-until': String(m.statusUntil || 0),
             'data-tag': tag,
-            title: state + (m.statusUntil
+            title: effState + (m.statusUntil
               ? ' until ' + new Date(m.statusUntil * 1000).toLocaleString()
               : ''),
-          }, cd ? (tag + ' ' + cd) : state);
-        } else if (state === 'Traveling' || state === 'Abroad') {
-          statusEl = el('span', { class: 'tech-scout-status-tag' }, state);
+          }, cd ? (tag + ' ' + cd) : effState);
+        } else if (effState === 'Traveling' || effState === 'Abroad') {
+          statusEl = el('span', { class: 'tech-scout-status-tag' }, effState);
         }
         // v0.6.54 — spy total badge. Populated rows show "spy 1.2M";
         // no-data rows show "spy —" (greyed via fontStyle italic in CSS
@@ -13472,6 +13565,12 @@
     // on having an active war + cached roster, so unconditionally
     // starting it is a no-op during peacetime.
     startWarRosterWatcher();
+
+    // v1.5.25 — Lockup-expiry tick. Re-renders Dashboard / Scout within
+    // 10s of any cached hospital/jail/federal countdown elapsing so the
+    // HIT badge appears promptly instead of waiting for the 60s roster
+    // auto-refresh.
+    startLockupTick();
   }
 
   if (document.readyState === 'loading') {
